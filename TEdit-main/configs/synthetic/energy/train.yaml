@@ -1,0 +1,15 @@
+### Dataset ###
+data:
+  name: synthetic_pretrain
+  folder: datasets/synthetic/pretrain
+
+
+### Train ###
+train:
+  epochs: 50
+  batch_size: 256
+  lr: 1.0e-5
+  model_path: ""
+  output_folder: pretrain
+  val_epoch_interval: 1
+  display_interval: 1

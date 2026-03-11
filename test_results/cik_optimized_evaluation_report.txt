@@ -1,0 +1,70 @@
+======================================================================
+BetterTSE 时间序列编辑测试评估报告 (CiK风格优化版)
+======================================================================
+
+测试时间: 2026-03-08 12:18:16
+数据文件: C:\Users\ghb\Desktop\李老师科研\BetterTSE-main\data\ETTh1.csv
+样本数量: 3
+框架版本: BetterTSE-CiK Optimized
+
+----------------------------------------------------------------------
+一、整体评估指标
+----------------------------------------------------------------------
+平均 t-IoU:           0.0000
+t-IoU 标准差:         0.0000
+平均特征准确率:       66.7%
+平均 Editability:     0.7804
+平均 Preservability:  1.0000
+
+----------------------------------------------------------------------
+二、CiK风格任务分布
+----------------------------------------------------------------------
+  Scheduled_Shutdown: 3
+
+干扰项样本数: 0 (0%)
+
+----------------------------------------------------------------------
+三、样本详情（前5个）
+----------------------------------------------------------------------
+
+样本 1: TSE_CiK_Opt_001
+  任务类型: Scheduled_Shutdown
+  目标特征: HUFL
+  编辑区间: [14, 18]
+  因果上下文: planned shutdown -> gradual power down -> near-zero reading
+  包含干扰项: 否
+  CiK Prompt: [Context] A planned system shutdown was executed starting at the afternoon (arou...
+  模糊提示词: 下午系统维护时，高压侧有效负荷要平稳地降下来，最后接近零。
+  t-IoU: 0.0000
+  Edit区MSE: 9.1056
+  保留区MSE: 0.0000
+  Editability: 0.6843
+  Preservability: 1.0000
+
+样本 2: TSE_CiK_Opt_002
+  任务类型: Scheduled_Shutdown
+  目标特征: HUFL
+  编辑区间: [14, 16]
+  因果上下文: planned shutdown -> gradual power down -> near-zero reading
+  包含干扰项: 否
+  CiK Prompt: [Context] A planned system shutdown was executed starting at the afternoon (arou...
+  模糊提示词: 在下午系统维护时，让高压侧有效负荷从高到低平稳降下来，最后接近零。
+  t-IoU: 0.0000
+  Edit区MSE: 28.0955
+  保留区MSE: 0.0000
+  Editability: 0.8184
+  Preservability: 1.0000
+
+样本 3: TSE_CiK_Opt_003
+  任务类型: Scheduled_Shutdown
+  目标特征: HUFL
+  编辑区间: [15, 19]
+  因果上下文: planned shutdown -> gradual power down -> near-zero reading
+  包含干扰项: 否
+  CiK Prompt: [Context] A planned system shutdown was executed starting at the afternoon (arou...
+  模糊提示词: 从下午开始执行计划内的系统关机，让高压侧有效负荷随着关机过程平稳地降下来，到接近半夜的时候基本归零。
+  t-IoU: 0.0000
+  Edit区MSE: 36.9886
+  保留区MSE: 0.0000
+  Editability: 0.8385
+  Preservability: 1.0000

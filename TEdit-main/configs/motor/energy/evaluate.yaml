@@ -1,0 +1,13 @@
+### Dataset ###
+data:
+  name: synthetic_pretrain
+  folder: datasets/motor/pretrain
+
+
+### Evaluate ###
+eval:
+  n_samples: 100
+  model_path: ""
+  batch_size: 2048
+  display_interval: 1
+  output_folder: eval

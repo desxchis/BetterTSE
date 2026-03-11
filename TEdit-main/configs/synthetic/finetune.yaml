@@ -1,0 +1,18 @@
+### Dataset ###
+data:
+  name: synthetic
+  folder: ./tse/datasets/synthetic/direction
+
+
+### Finetune ###
+train:
+  epochs: 50
+  batch_size: 64
+  lr: 1.0e-5
+  itr_per_epoch: 1.0e+8
+  model_path: 
+  output_folder: finetune
+  val_epoch_interval: 1
+  display_interval: 1
+  include_self: True
+  ctrl_attrs: [[trend_types], [trend_directions], [season_cycles], [trend_types, trend_directions], [trend_types, season_cycles], [trend_directions, season_cycles]]

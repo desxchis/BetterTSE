@@ -1,0 +1,16 @@
+### Dataset ###
+data:
+  name: synthetic
+  folder: ./datasets/synthetic/trend_types
+
+
+### Evaluate ###
+eval:
+  n_samples: 10
+  model_path: ""
+  batch_size: 256
+  display_interval: 1
+  output_folder: eval
+  device: cuda:0
+  attr_list: [trend_types, trend_directions, season_cycles]
+  ctap_folder: save/synthetic/energy/0

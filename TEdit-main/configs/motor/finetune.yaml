@@ -1,0 +1,17 @@
+### Dataset ###
+data:
+  name: synthetic
+  folder: datasets/motor/id
+
+### Finetune ###
+train:
+  epochs: 5
+  batch_size: 32
+  lr: 1.0e-5
+  itr_per_epoch: 1.0e+8
+  model_path: 
+  output_folder: finetune
+  val_epoch_interval: 1
+  display_interval: 1
+  include_self: True
+  ctrl_attrs: [[motor],[id]]

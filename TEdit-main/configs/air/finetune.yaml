@@ -1,0 +1,17 @@
+### Dataset ###
+data:
+  name: synthetic
+  folder: ./datasets/air
+
+
+### Finetune ###
+train:
+  epochs: 50
+  batch_size: 32
+  lr: 1.0e-5
+  model_path: 
+  output_folder: finetune
+  val_epoch_interval: 1
+  display_interval: 1
+  include_self: True
+  ctrl_attrs: [[season],[city]]

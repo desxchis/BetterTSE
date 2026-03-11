@@ -1,0 +1,26 @@
+device: cuda:0
+  
+attrs:
+  num_attr_ops: [4, 2, 4]
+  attr_emb: 128
+
+patch_len: 64
+stride: 8
+seq_len: 128
+n_var: 1
+n_attrs: 3 ####
+
+d_model: 128
+e_layers: 1
+d_ff: 256
+output_attention: True
+n_heads: 8
+activation: gelu
+
+factor: 1
+dropout: 0.1
+
+num_steps: 50  # diffusion
+
+instance_norm: False
+norm_in_loss: True

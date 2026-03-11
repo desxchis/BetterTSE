@@ -1,0 +1,78 @@
+# Tool Catalog
+
+## Composer tools
+- **repeat_last_value_forecast** — Generate a naïve forecast by repeating the last finite value of a series for the specified number of future steps.
+- **repeat_last_season_forecast** — Repeat the most recent seasonal pattern from a time series to produce a seasonal naïve forecast.
+- **linear_drift_forecast** — Perform a drift forecast by fitting a straight line between the first and last finite observations and extrapolating that trend forward.
+- **trailing_mean_forecast** — Generate a flat forecast equal to the mean of the most recent window of observations.
+- **simple_exp_smoothing_forecast** — Compute a constant forecast using simple exponential smoothing; uses a default smoothing factor of 2/(n+1) when none is provided.
+- **constant_signal** — Create a constant signal equal to a specified value for every time point.
+- **linear_trend** — Generate a linear trend by computing intercept + slope * t element‑wise.
+- **changepoint_linear_trend** — Construct a piecewise linear trend with changepoints; the slope adjusts by the specified deltas after each knot, and an optional offset can shift the baseline.
+- **sigmoid_transition** — Generate a smooth logistic transition between two levels, controlled by the centre point and width parameters.
+- **sine_wave** — Compute a sinusoidal wave y(t) = amplitude * sin(2π * t / period + phase) and optionally shift it by a constant offset.
+- **fourier_series_seasonality** — Generate a seasonal signal by summing a series of cosine and sine harmonics given their coefficients and fundamental period, with an optional constant offset.
+- **sum_of_sinusoids** — Sum multiple sinusoids with arbitrary frequencies, amplitudes and phases, then optionally add a constant offset.
+- **periodic_pulse_train** — Generate a repeating rectangular pulse of fixed amplitude and width within each period, with optional phase shift and baseline.
+- **delayed_step_signal** — Generate a step function that is zero before a threshold and equal to the given amplitude afterwards, with an optional constant offset.
+- **delayed_ramp_signal** — Produce a ramp that remains zero before a specified time and increases linearly with a given slope thereafter, optionally shifted by a constant baseline.
+- **unit_boxcar_pulse** — Return a unit-height rectangular (boxcar) pulse centred at a specified time with a given width, optionally adding a constant offset.
+- **unit_gaussian_pulse** — Compute a Gaussian bell‑shaped pulse centred at a given mean with specified standard deviation and unit peak height, optionally shifting the baseline.
+- **unit_exponential_decay_pulse** — Generate an exponentially decaying pulse that starts at a specified time and has unit value at onset before decaying with the given time constant, with an optional baseline shift.
+- **kernel_shot_noise_signal** — Sum delayed kernels at fixed event times to produce a shot noise signal; the supplied kernel function is applied to the delay t−e for each event, and an optional offset can shif...
+- **apply_amplitude_envelope** — Apply amplitude modulation by multiplying a base signal elementwise with an envelope of the same shape.
+- **periodic_duty_cycle_mask** — Create a deterministic on/off mask that is 1 for a fraction of each period defined by duty_cycle and 0 otherwise, optionally shifted by a phase offset and a constant baseline.
+- **calendar_rule_mask** — Return a 0/1 mask based on calendar rules (weekend, weekday, month_end, month_start, or holiday).
+- **moving_average_filter** — Compute a simple moving average (boxcar filter) over a fixed window to smooth a 1‑D signal.
+- **exponential_smoothing_filter** — Apply exponential smoothing to a signal using a specified smoothing factor alpha, returning a smoothed series.
+- **convolve_1d_signal** — Perform linear convolution of an input signal with a kernel using numpy's convolve; the mode can be 'full', 'valid', or 'same'.
+- **difference_signal** — Compute discrete differences of a signal a specified number of times; equivalent to repeated application of numpy.diff.
+- **cumulative_sum_signal** — Compute the cumulative sum of a sequence, effectively performing discrete integration.
+- **blockwise_aggregate** — Downsample a signal by grouping consecutive samples into blocks and applying an aggregation function (mean, sum, max, or min). The final partial block (if any) is included.
+- **resample_to_time_index** — Interpolate or extrapolate a signal onto a new set of time points using linear, nearest‑neighbour or zero‑order hold methods.
+- **apply_time_warp** — Apply a (typically monotonic) time reparameterisation by passing the time vector through a user-supplied warp function. Monotonicity is not enforced.
+- **piecewise_linear_time_warp** — Warp time using segment-specific linear rates defined by ordered knots, yielding a deterministic irregular cadence.
+- **apply_signal_mask** — Multiply a signal elementwise by a mask (binary 0/1 or fractional weights) to zero out or attenuate inactive segments.
+- **apply_nan_mask** — Insert NaNs wherever the supplied mask is inactive (≤ 0.5), preserving values where it is active.
+- **winsorize_signal** — Winsorize a signal by clipping it to the specified lower and upper quantiles.
+- **lag_weighted_filter** — Apply a finite impulse response (FIR) filter by summing lagged versions of the signal weighted by the provided coefficients.
+
+## Describer tools
+- **length** — Return the number of observations in the series (including missing values).
+- **summary_stats** — Return (mean, std, min, max) for a numeric series, ignoring missing values. Non-numeric inputs are coerced to numeric (invalid entries become NaN).
+- **time_span** — Return the elapsed time between the minimum and maximum timestamp in seconds.
+- **mean_gap** — Return the mean interval in seconds between consecutive timestamps.
+- **median_gap** — Return the median interval in seconds between consecutive timestamps.
+- **gap_cv** — Coefficient of variation of sampling gaps: standard deviation divided by mean gap.
+- **max_gap** — Return the maximum interval in seconds between consecutive timestamps.
+- **gap_entropy** — Shannon entropy (base 2) of binned gap sizes.
+- **missing_rate** — Return the proportion of missing values (NaN or None) in the series.
+- **missing_runs** — Number of contiguous runs of missing values in the series.
+- **longest_missing_run** — Return the length (number of points) of the longest run of missing values.
+- **alphabet_size** — Number of unique states after applying default quantile symbolisation to numeric values.
+- **mode_probability** — Maximum probability of any state in the symbolised series.
+- **shannon_entropy** — Shannon entropy (base 2) of the symbolised value distribution.
+- **gini_simpson_index** — Gini–Simpson diversity index 1 − ∑ p_i^2 over states.
+- **evenness** — Pielou's evenness: Shannon entropy divided by log2(K).
+- **change_rate** — Fraction of adjacent non‑missing observations that differ (X_t != X_{t-1}).
+- **persistence** — Probability that adjacent non‑missing values are equal (1 − change_rate).
+- **mean_run_length** — Average length of runs of identical non‑missing values.
+- **longest_run** — Maximum length of any run of identical non‑missing values.
+- **transition_matrix** — Empirical first‑order transition matrix of the symbolised series.
+- **entropy_rate** — First‑order entropy rate of the symbolised series in bits.
+- **lagged_mutual_information** — Mutual information (in bits) between X_t and X_{t-k} for a symbolised series.
+- **dominant_period** — Estimate the dominant period of a numeric series using the peak of its power spectrum.
+- **seasonal_strength** — Relative strength of the dominant seasonal frequency in the power spectrum.
+- **spectral_entropy** — Normalized Shannon entropy of the power spectral density.
+- **spectral_flatness** — Spectral flatness, the ratio of geometric to arithmetic mean of the power spectrum.
+- **distributional_change_points** — Detect distributional change points using a sliding window chi‑square test on the symbolised series.
+- **rare_state_rate** — Fraction of observations in states whose empirical probability falls below the default rarity threshold tau = 1/(K^2).
+- **trend_strength** — Fit a simple linear regression to the series and return the slope and coefficient of determination (R²).
+- **fourier_coefficients** — Solve for the DC offset and cosine/sine coefficients of the first N harmonics for a specified period.
+- **autocorrelation_profile** — Compute Pearson autocorrelation coefficients for the requested lags.
+- **spike_index** — Detect spikes using a rolling MAD heuristic and report their frequency and average magnitude.
+- **missing_segments** — Identify contiguous runs of missing values and return them as [start, length] pairs.
+- **pairwise_error** — Compare two aligned series and compute MAE, RMSE, bias and Pearson correlation.
+- **lempel_ziv_complexity** — Normalized Lempel–Ziv complexity: number of distinct substrings divided by series length.
+- **normalized_compression_ratio** — Ratio of compressed size to raw size for the string representation of the series.
+- **block_entropy_growth** — Slope of the block entropy growth curve using blocks of length 1–5 after default symbolisation.

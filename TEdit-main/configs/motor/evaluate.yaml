@@ -1,0 +1,17 @@
+### Dataset ###
+data:
+  name: synthetic
+  folder: ./datasets/motor/id
+
+
+### Evaluate ###
+eval:
+  n_samples: 10
+  model_path: ""
+  batch_size: 256
+  display_interval: 1
+  output_folder: eval
+
+  device: cuda:0
+  attr_list: [id, motor]
+  ctap_folder: ./save/motor/energy/0

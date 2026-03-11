@@ -1,0 +1,14 @@
+python run_finetune.py \
+    --save_folder ./save/synthetic/finetune_multi_weaver \
+    --pretrained_dir ./save/synthetic/pretrain_multi_weaver \
+    --model_config_path model_configs.yaml \
+    --pretrained_model_path ckpts/model_best.pth \
+    --finetune_config_path configs/synthetic/finetune.yaml \
+    --evaluate_config_path configs/synthetic/evaluate.yaml \
+    --data_folder ./datasets/synthetic \
+    --n_runs 3 \
+    --bootstrap_ratio 0.5 \
+    --include_self 1 \
+    --lr 0.0000001 \
+    --epochs 70 \
+    --only_evaluate True \

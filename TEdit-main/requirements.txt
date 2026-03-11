@@ -1,0 +1,6 @@
+torch==2.2.1
+pandas==2.0.3
+pyyaml==6.0.2
+linear_attention_transformer==0.19.1
+tensorboard==2.14.0
+scikit-learn==1.3.2
