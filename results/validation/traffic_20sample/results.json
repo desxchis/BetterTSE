@@ -1,0 +1,645 @@
+{
+  "dataset": "Traffic",
+  "results": [
+    {
+      "sample_id": "001",
+      "target_feature": "102",
+      "task_type": "market_trend",
+      "prompt": "本市遭遇极端高温天气，自今日清晨起，居民及商业用电需求激增，随后电网调度系统介入，负荷已恢复至常规水平。",
+      "gt_region": [
+        38,
+        58
+      ],
+      "llm_region": [
+        50,
+        60
+      ],
+      "tool_name": "spike_inject",
+      "edit_log": "[spike_inject] region=[50,60], center=55, amplitude=0.00, width=3.0",
+      "metrics": {
+        "t_iou": 0.391304347826087,
+        "feature_accuracy": 1.0,
+        "mse_edit_region": 0.0001898864284157753,
+        "mae_edit_region": 0.010796161368489265,
+        "mse_preserve_region": 9.80721459598044e-09,
+        "mae_preserve_region": 7.573119091830449e-06,
+        "editability_score": 0.8433067938376666,
+        "preservability_score": 0.9998900853487971
+      },
+      "bg_fidelity": {
+        "pass": true,
+        "max_err": 0.0,
+        "left_err": 0.0,
+        "right_err": 0.0
+      }
+    },
+    {
+      "sample_id": "002",
+      "target_feature": "614",
+      "task_type": "facility_shutdown",
+      "prompt": "电力调度中心发布通知，从今天中午开始，614号线路按计划进入全面检修状态，相关区域供电服务暂时中断。",
+      "gt_region": [
+        98,
+        108
+      ],
+      "llm_region": [
+        96,
+        108
+      ],
+      "tool_name": "spike_inject",
+      "edit_log": "[spike_inject] region=[96,108], center=102, amplitude=-3.00, width=2.0",
+      "metrics": {
+        "t_iou": 0.8461538461538461,
+        "feature_accuracy": 1.0,
+        "mse_edit_region": 2.7574024200439453,
+        "mae_edit_region": 1.3082064390182495,
+        "mse_preserve_region": 0.00010212580673396587,
+        "mae_preserve_region": 0.0009123633499257267,
+        "editability_score": -3.498646546205026,
+        "preservability_score": 0.9968625745061249
+      },
+      "bg_fidelity": {
+        "pass": true,
+        "max_err": 0.0,
+        "left_err": 0.0,
+        "right_err": 0.0
+      }
+    },
+    {
+      "sample_id": "003",
+      "target_feature": "87",
+      "task_type": "device_switch",
+      "prompt": "预计在今晚深夜，因设备切换调整运行模式，相关系统将经历短暂波动后逐步回归稳定状态。",
+      "gt_region": [
+        127,
+        138
+      ],
+      "llm_region": [
+        50,
+        70
+      ],
+      "tool_name": "volatility_increase",
+      "edit_log": "[volatility_increase] region=[50,70], amplify_factor=2.0",
+      "metrics": {
+        "t_iou": 0.0,
+        "feature_accuracy": 1.0,
+        "mse_edit_region": 0.020843273028731346,
+        "mae_edit_region": 0.13482312858104706,
+        "mse_preserve_region": 0.00034326367313042283,
+        "mae_preserve_region": 0.004393511451780796,
+        "editability_score": 0.5139757735281478,
+        "preservability_score": 0.9841618198055436
+      },
+      "bg_fidelity": {
+        "pass": true,
+        "max_err": 0.0,
+        "left_err": 0.0,
+        "right_err": 0.0
+      }
+    },
+    {
+      "sample_id": "004",
+      "target_feature": "769",
+      "task_type": "market_trend",
+      "prompt": "受极端高温天气影响，从今天中午开始，本市电网经历了短时用电高峰后已逐步恢复平稳运行。",
+      "gt_region": [
+        61,
+        82
+      ],
+      "llm_region": [
+        10,
+        25
+      ],
+      "tool_name": "spike_inject",
+      "edit_log": "[spike_inject] region=[10,25], center=17, amplitude=0.11, width=3.0",
+      "metrics": {
+        "t_iou": 0.0,
+        "feature_accuracy": 1.0,
+        "mse_edit_region": 0.0011224738555029035,
+        "mae_edit_region": 0.02672641910612583,
+        "mse_preserve_region": 0.0003670484584290534,
+        "mae_preserve_region": 0.004735081922262907,
+        "editability_score": 0.9067140716888866,
+        "preservability_score": 0.9834726638464552
+      },
+      "bg_fidelity": {
+        "pass": true,
+        "max_err": 0.0,
+        "left_err": 0.0,
+        "right_err": 0.0
+      }
+    },
+    {
+      "sample_id": "005",
+      "target_feature": "160",
+      "task_type": "market_trend",
+      "prompt": "受极端高温天气影响，自今日清晨起，全市用电需求出现显著波动，午后随着气温回落，电力供应已逐步恢复稳定。",
+      "gt_region": [
+        45,
+        62
+      ],
+      "llm_region": [
+        40,
+        70
+      ],
+      "tool_name": "spike_inject",
+      "edit_log": "[spike_inject] region=[40,70], center=55, amplitude=0.19, width=5.0",
+      "metrics": {
+        "t_iou": 0.5806451612903226,
+        "feature_accuracy": 1.0,
+        "mse_edit_region": 0.009304594248533249,
+        "mae_edit_region": 0.09013406187295914,
+        "mse_preserve_region": 3.441960143391043e-05,
+        "mae_preserve_region": 0.0011339852353557944,
+        "editability_score": 0.6691113634267507,
+        "preservability_score": 0.9958370584812882
+      },
+      "bg_fidelity": {
+        "pass": true,
+        "max_err": 0.0,
+        "left_err": 0.0,
+        "right_err": 0.0
+      }
+    },
+    {
+      "sample_id": "006",
+      "target_feature": "474",
+      "task_type": "sensor_offline",
+      "prompt": "电力调度中心通报，从今天中午开始，474号线路监测信号因通信中断出现持续异常波动，现场已启动应急排查。",
+      "gt_region": [
+        65,
+        87
+      ],
+      "llm_region": [
+        80,
+        140
+      ],
+      "tool_name": "volatility_increase",
+      "edit_log": "[volatility_increase] region=[80,140], amplify_factor=2.0",
+      "metrics": {
+        "t_iou": 0.10526315789473684,
+        "feature_accuracy": 1.0,
+        "mse_edit_region": 0.0038738292641937733,
+        "mae_edit_region": 0.05007306858897209,
+        "mse_preserve_region": 0.00018900625582318753,
+        "mae_preserve_region": 0.0057236324064433575,
+        "editability_score": 0.6347697303172339,
+        "preservability_score": 0.9582521330072685
+      },
+      "bg_fidelity": {
+        "pass": true,
+        "max_err": 0.0,
+        "left_err": 0.0,
+        "right_err": 0.0
+      }
+    },
+    {
+      "sample_id": "007",
+      "target_feature": "105",
+      "task_type": "market_trend",
+      "prompt": "受气温骤变影响，从今天中午开始，全市制冷与供暖系统负荷出现短暂剧烈调整，现已逐步恢复平稳运行。",
+      "gt_region": [
+        67,
+        80
+      ],
+      "llm_region": [
+        50,
+        60
+      ],
+      "tool_name": "spike_inject",
+      "edit_log": "[spike_inject] region=[50,60], center=55, amplitude=-3.00, width=2.0",
+      "metrics": {
+        "t_iou": 0.0,
+        "feature_accuracy": 1.0,
+        "mse_edit_region": 0.0008951839408837259,
+        "mae_edit_region": 0.023540634661912918,
+        "mse_preserve_region": 0.1791263222694397,
+        "mae_preserve_region": 0.08329159021377563,
+        "editability_score": 0.8844914843297248,
+        "preservability_score": 0.5913071974658374
+      },
+      "bg_fidelity": {
+        "pass": true,
+        "max_err": 0.0,
+        "left_err": 0.0,
+        "right_err": 0.0
+      }
+    },
+    {
+      "sample_id": "008",
+      "target_feature": "269",
+      "task_type": "market_trend",
+      "prompt": "本市遭遇极端高温天气，从今天中午开始，居民区及商业中心空调设备集中启动，随后电网调度系统介入，负荷已逐步恢复平稳。",
+      "gt_region": [
+        85,
+        101
+      ],
+      "llm_region": [
+        80,
+        94
+      ],
+      "tool_name": "spike_inject",
+      "edit_log": "[spike_inject] region=[80,94], center=87, amplitude=0.07, width=3.0",
+      "metrics": {
+        "t_iou": 0.45454545454545453,
+        "feature_accuracy": 1.0,
+        "mse_edit_region": 0.01035974733531475,
+        "mae_edit_region": 0.08889278024435043,
+        "mse_preserve_region": 1.5014685232017655e-05,
+        "mae_preserve_region": 0.0005453688791021705,
+        "editability_score": 0.7723033248979935,
+        "preservability_score": 0.9986030509999313
+      },
+      "bg_fidelity": {
+        "pass": true,
+        "max_err": 0.0,
+        "left_err": 0.0,
+        "right_err": 0.0
+      }
+    },
+    {
+      "sample_id": "009",
+      "target_feature": "337",
+      "task_type": "device_switch",
+      "prompt": "自今日清晨起，337号机组响应调度指令调整运行模式，初期出现短暂波动后已逐步趋于稳定。",
+      "gt_region": [
+        49,
+        64
+      ],
+      "llm_region": [
+        10,
+        70
+      ],
+      "tool_name": "ensemble_smooth",
+      "edit_log": "[ensemble_smooth_soft] region=[10,70], n_samples=15",
+      "metrics": {
+        "t_iou": 0.26229508196721313,
+        "feature_accuracy": 1.0,
+        "mse_edit_region": 0.057409778237342834,
+        "mae_edit_region": 0.2355910688638687,
+        "mse_preserve_region": 0.01972963660955429,
+        "mae_preserve_region": 0.06372144818305969,
+        "editability_score": -0.9374265204882386,
+        "preservability_score": 0.47597494154112807
+      },
+      "bg_fidelity": {
+        "pass": true,
+        "max_err": 0.0,
+        "left_err": 0.0,
+        "right_err": 0.0
+      }
+    },
+    {
+      "sample_id": "010",
+      "target_feature": "492",
+      "task_type": "heatwave_overload",
+      "prompt": "受持续极端高温天气影响，自今日清晨起，全市用电需求急剧增加，部分区域供电系统已启动应急响应预案。",
+      "gt_region": [
+        38,
+        58
+      ],
+      "llm_region": [
+        0,
+        48
+      ],
+      "tool_name": "hybrid_up",
+      "edit_log": "[hybrid_up_soft] region=[0,48], math_shift=0.022",
+      "metrics": {
+        "t_iou": 0.1864406779661017,
+        "feature_accuracy": 1.0,
+        "mse_edit_region": 0.0019639418460428715,
+        "mae_edit_region": 0.039522603154182434,
+        "mse_preserve_region": 0.004525989759713411,
+        "mae_preserve_region": 0.031591638922691345,
+        "editability_score": -0.10398336564172972,
+        "preservability_score": 0.11755195557455889
+      },
+      "bg_fidelity": {
+        "pass": true,
+        "max_err": 0.0,
+        "left_err": 0.0,
+        "right_err": 0.0
+      }
+    },
+    {
+      "sample_id": "011",
+      "target_feature": "838",
+      "task_type": "heatwave_overload",
+      "prompt": "自今日清晨起，本市体育中心举办大型国际赛事，场馆及周边区域用电需求显著增加，电力供应系统已进入高负荷运行状态。",
+      "gt_region": [
+        24,
+        39
+      ],
+      "llm_region": [
+        50,
+        98
+      ],
+      "tool_name": "hybrid_up",
+      "edit_log": "[hybrid_up_soft] region=[50,98], math_shift=0.030",
+      "metrics": {
+        "t_iou": 0.0,
+        "feature_accuracy": 1.0,
+        "mse_edit_region": 0.002141423523426056,
+        "mae_edit_region": 0.04318499565124512,
+        "mse_preserve_region": 0.0036066370084881783,
+        "mae_preserve_region": 0.029007507488131523,
+        "editability_score": 0.38130382590491996,
+        "preservability_score": 0.5844196894709213
+      },
+      "bg_fidelity": {
+        "pass": true,
+        "max_err": 0.0,
+        "left_err": 0.0,
+        "right_err": 0.0
+      }
+    },
+    {
+      "sample_id": "012",
+      "target_feature": "62",
+      "task_type": "sensor_offline",
+      "prompt": "运维部门报告，从今天中午开始，62号设备因长期服役出现测量信号异常，读数呈现无规律波动。",
+      "gt_region": [
+        104,
+        114
+      ],
+      "llm_region": [
+        96,
+        191
+      ],
+      "tool_name": "volatility_increase",
+      "edit_log": "[volatility_increase] region=[96,191], amplify_factor=2.0",
+      "metrics": {
+        "t_iou": 0.11458333333333333,
+        "feature_accuracy": 1.0,
+        "mse_edit_region": 0.007040694355964661,
+        "mae_edit_region": 0.06123635917901993,
+        "mse_preserve_region": 0.0005338292685337365,
+        "mae_preserve_region": 0.014086891897022724,
+        "editability_score": 0.5374897554521478,
+        "preservability_score": 0.8936035403874347
+      },
+      "bg_fidelity": {
+        "pass": true,
+        "max_err": 0.0,
+        "left_err": 0.0,
+        "right_err": 0.0
+      }
+    },
+    {
+      "sample_id": "013",
+      "target_feature": "725",
+      "task_type": "sensor_offline",
+      "prompt": "电力调度中心发布预警，预计在今晚深夜，受强电磁干扰影响，725号线路的监测读数将出现无规律波动。",
+      "gt_region": [
+        124,
+        134
+      ],
+      "llm_region": [
+        140,
+        160
+      ],
+      "tool_name": "volatility_increase",
+      "edit_log": "[volatility_increase] region=[140,160], amplify_factor=2.0",
+      "metrics": {
+        "t_iou": 0.0,
+        "feature_accuracy": 1.0,
+        "mse_edit_region": 0.0012400937266647816,
+        "mae_edit_region": 0.027027137577533722,
+        "mse_preserve_region": 5.087424142402597e-06,
+        "mae_preserve_region": 0.0006041540182195604,
+        "editability_score": 0.32262808697274303,
+        "preservability_score": 0.9848582943010338
+      },
+      "bg_fidelity": {
+        "pass": true,
+        "max_err": 0.0,
+        "left_err": 0.0,
+        "right_err": 0.0
+      }
+    },
+    {
+      "sample_id": "014",
+      "target_feature": "170",
+      "task_type": "device_switch",
+      "prompt": "自今日清晨起，因区域电网负荷调度调整，部分工业用户的生产线切换至备用电源，系统运行状态出现短暂波动后逐步趋于平稳。",
+      "gt_region": [
+        36,
+        47
+      ],
+      "llm_region": [
+        5,
+        15
+      ],
+      "tool_name": "spike_inject",
+      "edit_log": "[spike_inject] region=[5,15], center=10, amplitude=-2.50, width=1.67",
+      "metrics": {
+        "t_iou": 0.0,
+        "feature_accuracy": 1.0,
+        "mse_edit_region": 0.004985480103641748,
+        "mae_edit_region": 0.06593785434961319,
+        "mse_preserve_region": 0.10277308523654938,
+        "mae_preserve_region": 0.057934485375881195,
+        "editability_score": 0.7243400691732846,
+        "preservability_score": 0.757798970125414
+      },
+      "bg_fidelity": {
+        "pass": true,
+        "max_err": 0.0,
+        "left_err": 0.0,
+        "right_err": 0.0
+      }
+    },
+    {
+      "sample_id": "015",
+      "target_feature": "85",
+      "task_type": "market_trend",
+      "prompt": "交通管理部门通报，从今天中午开始，受节假日集中出行影响，多条主干道车流量出现显著波动后逐渐恢复常态。",
+      "gt_region": [
+        68,
+        77
+      ],
+      "llm_region": [
+        80,
+        140
+      ],
+      "tool_name": "volatility_increase",
+      "edit_log": "[volatility_increase] region=[80,140], amplify_factor=2.0",
+      "metrics": {
+        "t_iou": 0.0,
+        "feature_accuracy": 1.0,
+        "mse_edit_region": 0.0009748978773131967,
+        "mae_edit_region": 0.024185504764318466,
+        "mse_preserve_region": 0.00044980310485698283,
+        "mae_preserve_region": 0.009959392249584198,
+        "editability_score": 0.8612420840252798,
+        "preservability_score": 0.9428606296873364
+      },
+      "bg_fidelity": {
+        "pass": true,
+        "max_err": 0.0,
+        "left_err": 0.0,
+        "right_err": 0.0
+      }
+    },
+    {
+      "sample_id": "016",
+      "target_feature": "795",
+      "task_type": "market_trend",
+      "prompt": "自今日中午起，本市体育中心因承办国际马拉松赛事，周边区域用电需求呈现典型活动日特征。",
+      "gt_region": [
+        67,
+        86
+      ],
+      "llm_region": [
+        96,
+        108
+      ],
+      "tool_name": "spike_inject",
+      "edit_log": "[spike_inject] region=[96,108], center=102, amplitude=0.17, width=3.0",
+      "metrics": {
+        "t_iou": 0.0,
+        "feature_accuracy": 1.0,
+        "mse_edit_region": 0.004079962614923716,
+        "mae_edit_region": 0.050832830369472504,
+        "mse_preserve_region": 0.00093776301946491,
+        "mae_preserve_region": 0.007272676564753056,
+        "editability_score": 0.8227586091875323,
+        "preservability_score": 0.9746419921948672
+      },
+      "bg_fidelity": {
+        "pass": true,
+        "max_err": 0.0,
+        "left_err": 0.0,
+        "right_err": 0.0
+      }
+    },
+    {
+      "sample_id": "017",
+      "target_feature": "639",
+      "task_type": "facility_shutdown",
+      "prompt": "运维部门发布通知，从今天中午开始，639号设备按计划进入全面检修阶段，系统已暂停服务，恢复工作正在有序进行。",
+      "gt_region": [
+        115,
+        129
+      ],
+      "llm_region": [
+        50,
+        60
+      ],
+      "tool_name": "spike_inject",
+      "edit_log": "[spike_inject] region=[50,60], center=55, amplitude=0.15, width=3.0",
+      "metrics": {
+        "t_iou": 0.0,
+        "feature_accuracy": 1.0,
+        "mse_edit_region": 0.000816875312011689,
+        "mae_edit_region": 0.019907066598534584,
+        "mse_preserve_region": 0.0006794124492444098,
+        "mae_preserve_region": 0.005818997509777546,
+        "editability_score": 0.9235813222963689,
+        "preservability_score": 0.9776621988449742
+      },
+      "bg_fidelity": {
+        "pass": true,
+        "max_err": 0.0,
+        "left_err": 0.0,
+        "right_err": 0.0
+      }
+    },
+    {
+      "sample_id": "018",
+      "target_feature": "230",
+      "task_type": "heatwave_overload",
+      "prompt": "受持续极端高温影响，预计在今晚深夜，全市空调设备将进入高峰运行时段，电网调度中心已启动应急预案。",
+      "gt_region": [
+        144,
+        152
+      ],
+      "llm_region": [
+        80,
+        140
+      ],
+      "tool_name": "hybrid_up",
+      "edit_log": "[hybrid_up_soft] region=[80,140], math_shift=0.191",
+      "metrics": {
+        "t_iou": 0.0,
+        "feature_accuracy": 1.0,
+        "mse_edit_region": 0.0175667405128479,
+        "mae_edit_region": 0.10887753963470459,
+        "mse_preserve_region": 0.020035523921251297,
+        "mae_preserve_region": 0.07170252501964569,
+        "editability_score": 0.6687631954834659,
+        "preservability_score": 0.7818602868602678
+      },
+      "bg_fidelity": {
+        "pass": true,
+        "max_err": 0.0,
+        "left_err": 0.0,
+        "right_err": 0.0
+      }
+    },
+    {
+      "sample_id": "019",
+      "target_feature": "627",
+      "task_type": "device_switch",
+      "prompt": "自今日清晨起，因电网调度中心执行负荷切换操作，627号线路出现短暂波动，现已逐步恢复平稳运行。",
+      "gt_region": [
+        26,
+        42
+      ],
+      "llm_region": [
+        10,
+        25
+      ],
+      "tool_name": "spike_inject",
+      "edit_log": "[spike_inject] region=[10,25], center=17, amplitude=-3.00, width=3.0",
+      "metrics": {
+        "t_iou": 0.0,
+        "feature_accuracy": 1.0,
+        "mse_edit_region": 0.011351565830409527,
+        "mae_edit_region": 0.10059003531932831,
+        "mse_preserve_region": 0.27336594462394714,
+        "mae_preserve_region": 0.12736305594444275,
+        "editability_score": 0.7417457320892821,
+        "preservability_score": 0.6730088356427519
+      },
+      "bg_fidelity": {
+        "pass": true,
+        "max_err": 0.0,
+        "left_err": 0.0,
+        "right_err": 0.0
+      }
+    },
+    {
+      "sample_id": "020",
+      "target_feature": "648",
+      "task_type": "device_switch",
+      "prompt": "电力调度中心通报，从今天中午开始，受区域负荷转移影响，系统运行状态出现短暂波动，现已逐步趋于平稳。",
+      "gt_region": [
+        74,
+        82
+      ],
+      "llm_region": [
+        91,
+        101
+      ],
+      "tool_name": "spike_inject",
+      "edit_log": "[spike_inject] region=[91,101], center=96, amplitude=-3.00, width=1.67",
+      "metrics": {
+        "t_iou": 0.0,
+        "feature_accuracy": 1.0,
+        "mse_edit_region": 0.004638825077563524,
+        "mae_edit_region": 0.06323754787445068,
+        "mse_preserve_region": 0.1455671340227127,
+        "mae_preserve_region": 0.06838169693946838,
+        "editability_score": 0.660195885005637,
+        "preservability_score": 0.6325540317208158
+      },
+      "bg_fidelity": {
+        "pass": true,
+        "max_err": 0.0,
+        "left_err": 0.0,
+        "right_err": 0.0
+      }
+    }
+  ]
+}

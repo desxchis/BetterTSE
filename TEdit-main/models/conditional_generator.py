@@ -338,112 +338,92 @@ class ConditionalGenerator(nn.Module):
     def _edit_soft(self, src_x, side_emb, src_attr_emb, tgt_attr_emb, sampler, soft_mask):
         """
         Core Innovation: Latent Blending (State-Space Mixing) for Ground-Truth Preservation.
-        
+
         Math formula:
         z_{t-1} = M ⊙ z_{t-1}^{pred} + (1-M) ⊙ z_{t-1}^{GT}
-        
+
         Key Mechanism:
         - Foreground (z^{pred}): Denoised from TEdit conditioned on edit prompt.
-        - Background (z^{GT}): Forward-diffused directly from original time series (Ground Truth).
-        - Blending: Soft-mask fusion ensures seamless transition without 'cliff effect'.
-        
-        Why Latent Blending (NOT Noise Blending):
-        - Noise Blending: ε_blend = M ⊙ ε_tgt + (1-M) ⊙ ε_src
-          → Background is "predicted", causes reconstruction error
-        - Latent Blending: z_blend = M ⊙ z^{pred} + (1-M) ⊙ z^{GT}
-          → Background is "physical truth" (forward-diffused from original data)
-          → Ensures 100% background fidelity (zero reconstruction error)
-        
-        Physical Intuition:
-        - Like cutting and stitching two "films" (states), not averaging "brush strokes" (gradients)
-        - For in-painting/editing: stitching films is correct because we already have the background film
-        
-        Attention Injection (NEW):
-        - Extract keys_null and values_null from original sequence
-        - Inject into attention layers for semantic isolation
-        - Formula: A_inj = Λ ⊙ A(Q, K_edit) + (I - Λ) ⊙ A(Q, K_null)
-        
+        - Background (z^{GT}): Forward-diffused DIRECTLY from original time series x_0:
+              z_{t-1}^{GT} = sqrt(ᾱ_{t-1}) * x_0 + sqrt(1-ᾱ_{t-1}) * ε_fixed
+          This is the PHYSICAL TRUTH (closed-form, no model involved), guaranteeing
+          zero reconstruction error outside the edit region.
+
+        Bug fixed: Previous version used a model prediction with src_attr_emb as the
+        "background GT", which introduced reconstruction errors outside the edit region.
+        The correct approach is to directly forward-diffuse src_x to step t-1.
+
         Args:
             src_x: Source time series (B, K, L) - Ground Truth
             side_emb: Side information embedding
-            src_attr_emb: Source attribute embedding (for background preservation)
+            src_attr_emb: Source attribute embedding (unused for background, kept for signature)
             tgt_attr_emb: Target attribute embedding (for foreground generation)
             sampler: Sampler type
             soft_mask: Soft boundary mask (numpy array, shape: [L])
-        
+
         Returns:
             torch.Tensor: Edited time series (B, K, L)
         """
         B, K, L = src_x.shape
 
-        # Convert numpy mask to tensor with correct dimensions: (1, 1, L)
+        # Convert numpy mask to tensor: (1, 1, L)
         mask_tensor = torch.from_numpy(soft_mask).to(self.device).float()
         mask_tensor = mask_tensor.view(1, 1, L)
-        
+
         # Prepare soft_mask for attention injection: (B, L)
         soft_mask_attn = torch.from_numpy(soft_mask).to(self.device).float()
         soft_mask_attn = soft_mask_attn.unsqueeze(0).expand(B, -1)  # (B, L)
 
-        # ==================== Step 1: Forward Diffusion (获取背景真值) ====================
-        # z_t^{GT} = sqrt(α_bar_t) * x_orig + sqrt(1-α_bar_t) * ε
-        # This is the PHYSICAL TRUTH, not model prediction
-        xt_gt = src_x
+        # ==================== Step 1: Forward Diffusion to obtain starting noisy latent ====================
+        # Pre-sample a FIXED background noise (reused every step to keep the trajectory consistent)
+        noise_bg = torch.randn_like(src_x)
+
+        xt = src_x.clone()
         if sampler[:4] == "ddpm":
-            noise_gt = torch.randn_like(src_x)
-            xt_gt = self.ddpm.forward(xt_gt, self.edit_steps - 1, noise=noise_gt)
+            xt = self.ddpm.forward(xt, self.edit_steps - 1, noise=noise_bg)
         else:
-            # DDIM Inversion: deterministic forward
+            # DDIM Inversion: deterministic forward pass
             for t in range(-1, self.edit_steps - 1):
                 if t == -1:
                     pred_noise = 0
                     t_tensor = (torch.ones(B, device=self.device) * 0).long()
                 else:
                     t_tensor = (torch.ones(B, device=self.device) * t).long()
-                    pred_noise = self.predict_noise(xt_gt, side_emb, src_attr_emb, t_tensor)
-                xt_gt = self.ddim.forward(xt_gt, pred_noise, t_tensor)
+                    pred_noise = self.predict_noise(xt, side_emb, src_attr_emb, t_tensor)
+                xt = self.ddim.forward(xt, pred_noise, t_tensor)
 
-        # ==================== Step 2: Extract Background Features for Attention Injection ====================
-        # We need to extract keys_null and values_null from the original sequence
-        # This will be used in the attention layers for semantic isolation
-        # Note: The actual extraction happens inside the attention layers
-        # Here we just prepare the context by storing the original latent
-        xt_orig = xt_gt.clone()  # Store original latent for attention injection
+        xt_orig = xt.clone()  # Store noisy latent for attention injection
 
-        # ==================== Step 3: Reverse Denoising with Latent Blending ====================
-        # z_{t-1}^{next} = M ⊙ z_{t-1}^{pred} + (1-M) ⊙ z_{t-1}^{GT}
-        xt = xt_gt.clone()  # Start from the noisy latent
-        
+        # ==================== Step 2: Reverse Denoising with Latent Blending ====================
+        # At every step t:
+        #   z_{t-1}^{GT} = sqrt(ᾱ_{t-1}) * x_0 + sqrt(1-ᾱ_{t-1}) * ε_fixed   (direct formula)
+        #   z_{t-1}      = M ⊙ z_{t-1}^{pred} + (1-M) ⊙ z_{t-1}^{GT}
         for t in range(self.edit_steps - 1, -1, -1):
             noise = torch.randn_like(xt)
             t_tensor = (torch.ones(B, device=self.device) * t).long()
-            
-            # Trajectory A: Background (Ground Truth) - forward diffused from original
-            # z_{t-1}^{GT} comes from the forward process above
-            # We need to compute it step by step for proper blending
-            
-            # Trajectory B: Foreground (Model Prediction) - denoised with target condition
-            # NEW: Pass attention injection parameters
+
+            # Foreground: model prediction with target attributes
             pred_noise_tgt = self.predict_noise(
                 xt, side_emb, tgt_attr_emb, t_tensor,
                 soft_mask=soft_mask_attn, keys_null=xt_orig, values_null=xt_orig
             )
-            
             if sampler[-4:] == "ddpm":
                 xt_pred = self.ddpm.reverse(xt, pred_noise_tgt, t_tensor, noise)
             else:
                 xt_pred = self.ddim.reverse(xt, pred_noise_tgt, t_tensor, noise, is_determin=True)
-            
-            # Compute z_{t-1}^{GT} for this step (background trajectory)
-            # This is the key: we use src_attr_emb for background, not predicted noise
-            pred_noise_src = self.predict_noise(xt, side_emb, src_attr_emb, t_tensor)
-            if sampler[-4:] == "ddpm":
-                xt_gt_step = self.ddpm.reverse(xt, pred_noise_src, t_tensor, noise)
+
+            # Background (GROUND TRUTH): direct forward diffusion of original src_x to step t-1
+            # Using the closed-form q(x_{t-1} | x_0) = N(sqrt(ᾱ_{t-1}) * x_0, (1-ᾱ_{t-1}) * I)
+            # This guarantees ZERO reconstruction error outside the edit region.
+            if t > 0:
+                t_prev_tensor = (torch.ones(B, device=self.device) * (t - 1)).long()
+                xt_gt_step = self.ddpm.forward(src_x, t_prev_tensor, noise=noise_bg)
             else:
-                xt_gt_step = self.ddim.reverse(xt, pred_noise_src, t_tensor, noise, is_determin=True)
-            
+                # At t=0: background is exactly the original signal (no noise)
+                xt_gt_step = src_x
+
             # ==================== CORE: Latent Blending ====================
             # z_{t-1} = M ⊙ z_{t-1}^{pred} + (1-M) ⊙ z_{t-1}^{GT}
-            # This ensures background is 100% faithful to original data
             xt = mask_tensor * xt_pred + (1.0 - mask_tensor) * xt_gt_step
-                
+
         return xt

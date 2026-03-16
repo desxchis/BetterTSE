@@ -1,0 +1,164 @@
+{
+  "results": [
+    {
+      "sample_id": "001",
+      "target_feature": "HULL",
+      "task_type": "sensor_offline",
+      "prompt": "电力调度中心通报，从今天中午开始，高压侧监测系统因通信中断出现信号丢失，相关参数呈现无规律波动。",
+      "gt_region": [
+        101,
+        117
+      ],
+      "llm_region": [
+        64,
+        192
+      ],
+      "tool_name": "volatility_increase",
+      "edit_log": "[volatility_increase] region=[64,192], amplify_factor=2.0",
+      "metrics": {
+        "t_iou": 0.13178294573643412,
+        "feature_accuracy": 1.0,
+        "mse_edit_region": 9.603019714355469,
+        "mae_edit_region": 2.636105537414551,
+        "mse_preserve_region": 0.44946545362472534,
+        "mae_preserve_region": 0.4046899080276489,
+        "editability_score": 0.6287175000191407,
+        "preservability_score": 0.9430014168109155
+      },
+      "bg_fidelity": {
+        "pass": true,
+        "max_err": 0.0,
+        "left_err": 0.0,
+        "right_err": 0.0
+      }
+    },
+    {
+      "sample_id": "002",
+      "target_feature": "OT",
+      "task_type": "heatwave_overload",
+      "prompt": "本市正面临历史罕见的极端高温天气，预计在今晚深夜，所有工业及商用制冷设备均已开启满负荷运转模式。",
+      "gt_region": [
+        125,
+        146
+      ],
+      "llm_region": [
+        105,
+        115
+      ],
+      "tool_name": "spike_inject",
+      "edit_log": "[spike_inject] region=[105,115], center=110, amplitude=5.02, width=3.0",
+      "metrics": {
+        "t_iou": 0.0,
+        "feature_accuracy": 1.0,
+        "mse_edit_region": 4437.63720703125,
+        "mae_edit_region": 64.1063232421875,
+        "mse_preserve_region": 0.7725034952163696,
+        "mae_preserve_region": 0.2002137154340744,
+        "editability_score": -1.712117461103388,
+        "preservability_score": 0.9915296481514043
+      },
+      "bg_fidelity": {
+        "pass": true,
+        "max_err": 0.0,
+        "left_err": 0.0,
+        "right_err": 0.0
+      }
+    },
+    {
+      "sample_id": "003",
+      "target_feature": "MULL",
+      "task_type": "market_trend",
+      "prompt": "本市遭遇罕见极端高温，自今日清晨起，部分区域空调设备集中启动，随后电网调度中心及时介入，负荷已恢复平稳。",
+      "gt_region": [
+        36,
+        57
+      ],
+      "llm_region": [
+        10,
+        25
+      ],
+      "tool_name": "spike_inject",
+      "edit_log": "[spike_inject] region=[10,25], center=17, amplitude=1.84, width=3.0",
+      "metrics": {
+        "t_iou": 0.0,
+        "feature_accuracy": 1.0,
+        "mse_edit_region": 0.2518976926803589,
+        "mae_edit_region": 0.4003729522228241,
+        "mse_preserve_region": 0.10599073767662048,
+        "mae_preserve_region": 0.08046364784240723,
+        "editability_score": 0.9189364283533051,
+        "preservability_score": 0.9837085131610058
+      },
+      "bg_fidelity": {
+        "pass": true,
+        "max_err": 0.0,
+        "left_err": 0.0,
+        "right_err": 0.0
+      }
+    },
+    {
+      "sample_id": "004",
+      "target_feature": "MUFL",
+      "task_type": "device_switch",
+      "prompt": "电力调度中心通报，从今天中午开始，中压侧系统因执行计划性负载转移操作，运行状态出现瞬时调整，目前已进入平稳恢复阶段。",
+      "gt_region": [
+        60,
+        81
+      ],
+      "llm_region": [
+        10,
+        20
+      ],
+      "tool_name": "spike_inject",
+      "edit_log": "[spike_inject] region=[10,20], center=15, amplitude=-3.00, width=1.67",
+      "metrics": {
+        "t_iou": 0.0,
+        "feature_accuracy": 1.0,
+        "mse_edit_region": 74.7658920288086,
+        "mae_edit_region": 8.14608097076416,
+        "mse_preserve_region": 0.15669873356819153,
+        "mae_preserve_region": 0.07361088693141937,
+        "editability_score": 0.4422020734253468,
+        "preservability_score": 0.9949595394090693
+      },
+      "bg_fidelity": {
+        "pass": true,
+        "max_err": 0.0,
+        "left_err": 0.0,
+        "right_err": 0.0
+      }
+    },
+    {
+      "sample_id": "005",
+      "target_feature": "HUFL",
+      "task_type": "market_trend",
+      "prompt": "受强冷空气突袭影响，从今天中午开始，全市工商业及居民用电需求出现显著变化，电网调度中心已启动相应预案。",
+      "gt_region": [
+        102,
+        111
+      ],
+      "llm_region": [
+        80,
+        120
+      ],
+      "tool_name": "hybrid_up",
+      "edit_log": "[hybrid_up_soft] region=[80,120], math_shift=10.564",
+      "metrics": {
+        "t_iou": 0.24390243902439024,
+        "feature_accuracy": 1.0,
+        "mse_edit_region": 14.345973014831543,
+        "mae_edit_region": 3.2120258808135986,
+        "mse_preserve_region": 3.129822015762329,
+        "mae_preserve_region": 0.5107579231262207,
+        "editability_score": 0.8396152288265926,
+        "preservability_score": 0.9744965340675107
+      },
+      "bg_fidelity": {
+        "pass": true,
+        "max_err": 0.0,
+        "left_err": 0.0,
+        "right_err": 0.0
+      }
+    }
+  ]
+}

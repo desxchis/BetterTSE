@@ -390,7 +390,9 @@ class Diff_CSDI_MultiPatch_Parallel(nn.Module):
         all_out = all_out.reshape(B, K, L)
         return all_out
     
-    def get_mask(self, attr_len, len_list, device="cuda:0"):
+    def get_mask(self, attr_len, len_list, device=None):
+        if device is None:
+            device = self.output_projection1.weight.device
         total_len = sum(len_list) + attr_len
         mask = torch.zeros(total_len, total_len, device=device) - np.inf
         mask[:attr_len, :] = 0

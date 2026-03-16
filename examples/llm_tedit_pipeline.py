@@ -179,7 +179,7 @@ for i, result in enumerate(results):
 
 plt.tight_layout()
 
-output_dir = "outputs"
+output_dir = "results/figures/examples"
 os.makedirs(output_dir, exist_ok=True)
 output_path = os.path.join(output_dir, "llm_tedit_pipeline.png")
 plt.savefig(output_path, dpi=150, bbox_inches='tight')

@@ -1,739 +1,505 @@
-# BetterTSE 项目代码结构与方法说明文档
+# BetterTSE 项目架构文档
+
+> 更新时间：2026-03-12
+
+---
 
 ## 一、项目概述
 
-**BetterTSE** (Better Time Series Editing) 是一个基于扩散模型的时间序列编辑框架，实现了 **Training-free** 的软边界编辑功能，解决了传统方法中的"悬崖效应"问题。
+**BetterTSE** (Better Time Series Editing) 是一个结合**扩散模型**与**大语言模型（LLM）**的时间序列智能编辑框架，核心目标是：
 
-### 核心创新
+> 给定一段真实时间序列（Base TS）和一条模糊的事件性自然语言指令（Vague Prompt），让系统自动理解编辑意图、定位时间区间、调用编辑工具，产出符合预期的 Target TS，并以多维指标量化评估效果。
 
-1. **潜空间融合 (Latent Blending)**: 背景区域零重建误差
-2. **注意力注入 (Attention Injection)**: 语义隔离，编辑指令不泄漏到背景
-3. **软边界处理 (Soft Boundary)**: 平滑过渡，避免悬崖效应
+### 核心技术
+
+| 组件 | 技术方案 |
+|------|---------|
+| 时间序列编辑模型 | TEdit — NeurIPS 2024 扩散模型，Training-free 软边界潜空间融合 |
+| LLM 意图解析 | DeepSeek Chat（OpenAI 兼容接口），支持 vLLM 本地部署 |
+| Agent 工作流 | LangGraph `StateGraph`，4 节点有向图 |
+| 测试集范式 | CiK (Context is Key) 物理注入 + LLM 反向生成模糊 Prompt |
+| 评估指标 | t-IoU · Editability MSE/MAE · Preservability MSE/MAE · Feature Accuracy |
+
+### 潜空间融合公式（软边界编辑核心）
+
+```
+z_{t-1} = M ⊙ z_{t-1}^{pred} + (1 - M) ⊙ z_{t-1}^{GT}
+```
+
+M 为高斯平滑软掩码，消除编辑边界的"悬崖效应"。
 
 ---
 
-## 二、项目目录结构
+## 二、目录结构
 
 ```
 BetterTSE-main/
-├── TEdit-main/                    # 核心模型代码
-│   ├── models/                    # 模型模块
-│   │   ├── conditional_generator.py    # 条件生成器（核心入口）
-│   │   ├── diffusion/                  # 扩散模型
-│   │   │   ├── diff_csdi.py                 # CSDI基础扩散模型
-│   │   │   ├── diff_csdi_multipatch.py      # 多Patch扩散模型
-│   │   │   ├── diff_csdi_multipatch_weaver.py # 多Patch编织器（核心）
-│   │   │   └── diff_csdi_time_weaver.py     # 时间编织器
-│   │   ├── encoders/                   # 编码器
-│   │   │   ├── attr_encoder.py             # 属性编码器
-│   │   │   └── side_encoder.py             # 侧信息编码器
-│   │   └── energy/                     # 能量模型
-│   │       ├── energy_model.py             # 能量预测模型
-│   │       └── layers/                     # 网络层
-│   │           ├── SelfAttention_Family.py     # 注意力层（含注入机制）
-│   │           ├── Transformer_EncDec.py       # Transformer编解码器
-│   │           └── Embed.py                    # 嵌入层
-│   ├── samplers.py                     # DDPM/DDIM采样器
-│   ├── evaluation/                     # 评估模块
-│   │   ├── base_evaluator.py           # 基础评估器
-│   │   ├── basic_metrics.py            # 基础指标
-│   │   └── energy_model.py             # 能量模型评估
-│   ├── configs/                        # 配置文件
-│   │   ├── air/                        # 空气质量数据集配置
-│   │   ├── motor/                      # 电机数据集配置
-│   │   └── synthetic/                  # 合成数据集配置
-│   ├── datasets/                       # 数据集
-│   ├── data/                           # 数据加载模块
-│   ├── run_pretrain.py                 # 预训练脚本
-│   ├── run_finetune.py                 # 微调脚本
-│   └── tests/                          # 测试文件
-│       └── test_attention_injection.py # 注意力注入测试
 │
-├── test_scripts/                   # 测试集构建工具
-│   ├── build_testset.py            # 测试集构建主脚本
-│   └── bettertse_cik_official.py   # CiK范式实现
+├── config.py                       # 全局配置（API Key、模型路径）
+├── run_pipeline.py                 # 端到端 Pipeline 入口脚本
+├── requirements.txt                # Python 依赖
+├── .env / .env.example             # 环境变量（API Key 等）
 │
-├── test_sets/                      # 生成的测试集
-│   └── testset_ETTh1_*.json        # ETTh1测试集
+├── agent/                          # LangGraph Agent 模块
+│   ├── agent.py                    #   A1 类：主 Agent + AgentState 定义
+│   ├── nodes.py                    #   4 个工作流节点函数
+│   ├── prompts.py                  #   Prompt 模板（含 EVENT_DRIVEN_AGENT_PROMPT）
+│   ├── llm_instruction_decomposer.py  # LLM 编辑意图结构化分解器
+│   └── instruction_decomposer.py   #   规则型分解器（备用）
 │
-├── data/                           # 原始数据
-│   └── ETTh1.csv                   # ETTh1数据集
+├── modules/                        # 通用工具模块
+│   ├── llm.py                      #   CustomLLMClient + get_event_driven_plan()
+│   └── utils.py                    #   工具函数（绘图、解析、格式化）
 │
-├── SKILL.md                        # 技术规范文档
-├── TEDIT_CONFIG.md                 # 配置说明文档
-└── README.md                       # 项目说明
+├── tool/                           # 时间序列编辑工具
+│   ├── tedit_wrapper.py            #   TEditWrapper：TEdit 模型封装 + 单例
+│   ├── ts_editors.py               #   execute_llm_tool() + 3 种编辑工具实现
+│   ├── ts_composers.py             #   合成工具
+│   ├── ts_describers.py            #   描述工具
+│   ├── ts_processor.py             #   预处理工具
+│   ├── ts_synthesizer.py           #   合成器
+│   ├── region_selector.py          #   时间区间选择器
+│   └── tool_description/           #   工具文档字符串（供 LLM Prompt 使用）
+│       ├── ts_editors.py
+│       ├── ts_composers.py
+│       ├── ts_describers.py
+│       ├── tedit_tools.py
+│       └── ts_processor.py
+│
+├── test_scripts/                   # 测试集构建与评估
+│   ├── build_event_driven_testset.py  # ★ 主用：事件驱动测试集生成器
+│   ├── bettertse_cik_official.py      #   CiK 范式完整 Pipeline + TSEditEvaluator
+│   ├── result_evaluator.py            #   结果评估器（ResultEvaluator）
+│   ├── build_mini_benchmark.py        #   小型基准集构建（旧版）
+│   ├── build_testset.py               #   通用测试集构建（旧版）
+│   ├── data_loader.py                 #   数据加载模块
+│   ├── config.py                      #   test_scripts 内部枚举（ChangeType 等）
+│   ├── change_injector.py             #   物理注入器集合
+│   ├── llm_interface.py               #   LLM 接口封装
+│   ├── test_pipeline.py               #   测试 Pipeline
+│   ├── main.py                        #   入口脚本
+│   ├── data/ETTh1.csv                 #   本地测试数据
+│   └── test_results/                  #   评估结果输出
+│
+├── event_driven_testset_ultimate/  # ★ 当前正式测试集（保留）
+│   ├── event_driven_testset_ETTh1_5.json   # 5 条样本
+│   ├── event_driven_testset_ETTh1_5.csv    # 数据摘要
+│   └── event_driven_report.txt             # 生成报告
+│
+├── data/
+│   └── ETTh1.csv                   # 原始时间序列数据
+│
+├── examples/                       # 示例脚本（开发历史记录）
+│   ├── llm_tedit_pipeline_v9_full_validation.py  # 最新完整验证版
+│   ├── llm_tedit_pipeline_v8_soft_boundary.py    # 软边界版
+│   └── ...                         # v1–v7 历史版本
+│
+├── TEdit-main/                     # TEdit 核心模型代码（子项目）
+│   ├── models/
+│   │   ├── conditional_generator.py        # ConditionalGenerator（核心入口）
+│   │   ├── diffusion/diff_csdi_multipatch_weaver.py  # 多Patch扩散模型
+│   │   └── encoders/ · energy/             # 编码器 + 能量模型
+│   ├── samplers.py                         # DDPM / DDIM 采样器
+│   ├── save/                               # 预训练权重
+│   │   └── synthetic/pretrain_multi_weaver/0/ckpts/model_best.pth
+│   └── configs/                            # 数据集配置（synthetic/air/motor）
+│
+├── PROJECT_ARCHITECTURE.md         # 本文档
+├── SKILL.md                        # 技术规范
+├── TEDIT_CONFIG.md                 # TEdit 配置详解
+└── coding plan.md                  # 开发计划
 ```
 
 ---
 
-## 三、核心模块详解
+## 三、全流程 Pipeline
 
-### 3.1 条件生成器 (conditional_generator.py)
-
-**职责**: 整合编码器和扩散模型，提供统一的生成/编辑接口
-
-#### 关键类: `ConditionalGenerator`
-
-```python
-class ConditionalGenerator(nn.Module):
-    def __init__(self, configs: Dict)
-```
-
-**初始化参数**:
-| 参数 | 类型 | 说明 |
-|------|------|------|
-| `configs` | Dict | 配置字典，包含device、attrs、side、diffusion等配置 |
-
-**核心属性**:
-| 属性 | 类型 | 说明 |
-|------|------|------|
-| `attr_en` | AttributeEncoder | 属性编码器 |
-| `side_en` | SideEncoder | 侧信息编码器 |
-| `diff_model` | Diff_CSDI_* | 扩散模型 |
-| `ddpm` | DDPMSampler | DDPM采样器 |
-| `ddim` | DDIMSampler | DDIM采样器 |
-| `edit_steps` | int | 编辑步数 |
-| `bootstrap_ratio` | float | 引导比例 |
-
-#### 核心方法
-
-##### 1. `predict_noise()` - 噪声预测
-
-```python
-def predict_noise(
-    self, 
-    xt: torch.Tensor,           # [B, K, L] 噪声潜在变量
-    side_emb: torch.Tensor,     # 侧信息嵌入
-    src_attr_emb: torch.Tensor, # 属性嵌入
-    t: torch.Tensor,            # 扩散时间步
-    soft_mask: torch.Tensor = None,     # [B, L] 软边界掩码
-    keys_null: torch.Tensor = None,     # [B, L, D] 背景Key
-    values_null: torch.Tensor = None    # [B, L, D] 背景Value
-) -> torch.Tensor:              # [B, K, L] 预测噪声
-```
-
-**功能**: 预测当前时间步的噪声，支持注意力注入
-
-##### 2. `edit_soft()` - 软边界编辑入口
-
-```python
-def edit_soft(
-    self,
-    batch: Dict,                # 数据批次
-    n_samples: int,             # 生成样本数
-    sampler: str = "ddim",      # 采样器类型
-    soft_mask: np.ndarray = None,   # 软边界掩码
-    hard_mask: np.ndarray = None,   # 硬边界掩码
-    smooth_width: int = 5,      # 平滑宽度
-    smooth_type: str = "gaussian"   # 平滑类型
-) -> torch.Tensor:              # [n_samples, B, K, L]
-```
-
-**功能**: 执行软边界编辑，支持硬掩码自动转换
-
-##### 3. `_edit_soft()` - 核心编辑逻辑
-
-```python
-def _edit_soft(
-    self,
-    src_x: torch.Tensor,        # [B, K, L] 源序列
-    side_emb: torch.Tensor,     # 侧信息嵌入
-    src_attr_emb: torch.Tensor, # 源属性嵌入
-    tgt_attr_emb: torch.Tensor, # 目标属性嵌入
-    sampler: str,               # 采样器类型
-    soft_mask: np.ndarray       # 软边界掩码
-) -> torch.Tensor:              # [B, K, L] 编辑后序列
-```
-
-**核心公式**:
-```
-潜空间融合: z_{t-1} = M ⊙ z_{t-1}^{pred} + (1-M) ⊙ z_{t-1}^{GT}
-```
-
-##### 4. `create_soft_mask()` - 软边界掩码创建
-
-```python
-@staticmethod
-def create_soft_mask(
-    hard_mask: np.ndarray,      # [L] 硬边界掩码
-    smooth_width: int = 5,      # 平滑宽度
-    smooth_type: str = "gaussian"   # 平滑类型
-) -> np.ndarray:                # [L] 软边界掩码
-```
-
-**功能**: 将硬边界掩码转换为软边界掩码，实现平滑过渡
-
----
-
-### 3.2 扩散模型 (diff_csdi_multipatch_weaver.py)
-
-**职责**: 实现多分辨率Patch扩散模型，支持注意力注入
-
-#### 关键类
-
-##### 1. `AttentionInjectionLayer` - 注意力注入层
-
-```python
-class AttentionInjectionLayer(nn.Module):
-    def __init__(
-        self,
-        d_model: int,           # 模型维度
-        nhead: int,             # 注意力头数
-        dim_feedforward: int = 64,  # FFN维度
-        dropout: float = 0.1,   # Dropout率
-        activation: str = "gelu"    # 激活函数
-    )
-```
-
-**核心公式**:
-```
-A_inj = Λ ⊙ A(Q, K_edit) + (I - Λ) ⊙ A(Q, K_null)
-V_inj = Λ ⊙ (A_edit @ V_edit) + (I - Λ) ⊙ (A_null @ V_null)
-```
-
-##### 2. `ResidualBlock` - 残差块
-
-```python
-class ResidualBlock(nn.Module):
-    def __init__(
-        self,
-        side_dim: int,          # 侧信息维度
-        attr_dim: int,          # 属性维度
-        channels: int,          # 通道数
-        diffusion_embedding_dim: int,  # 扩散嵌入维度
-        nheads: int,            # 注意力头数
-        is_linear: bool = False,    # 是否使用线性注意力
-        is_attr_proj: bool = False  # 是否使用属性投影
-    )
-    
-    def forward(
-        self,
-        x: torch.Tensor,        # [B, C, K, L]
-        side_emb: torch.Tensor, # [B, side_dim, K, L]
-        attr_emb: torch.Tensor, # [B, n_attrs, attr_dim]
-        diffusion_emb: torch.Tensor,  # [B, diffusion_embedding_dim]
-        attention_mask: torch.Tensor = None,
-        soft_mask: torch.Tensor = None,   # [B, L]
-        keys_null: torch.Tensor = None,   # [B, L, D]
-        values_null: torch.Tensor = None  # [B, L, D]
-    ) -> Tuple[torch.Tensor, torch.Tensor]
-```
-
-##### 3. `Diff_CSDI_MultiPatch_Weaver_Parallel` - 主扩散模型
-
-```python
-class Diff_CSDI_MultiPatch_Weaver_Parallel(nn.Module):
-    def __init__(
-        self,
-        config: Dict,           # 模型配置
-        inputdim: int = 2       # 输入维度
-    )
-    
-    def forward(
-        self,
-        x_raw: torch.Tensor,        # [B, inputdim, K, L]
-        side_emb_raw: torch.Tensor, # [B, side_dim, K, L]
-        attr_emb_raw: torch.Tensor, # [B, n_attrs, attr_dim]
-        diffusion_step: torch.Tensor,  # [B]
-        soft_mask: torch.Tensor = None,    # [B, L]
-        keys_null: torch.Tensor = None,    # [B, L, D]
-        values_null: torch.Tensor = None   # [B, L, D]
-    ) -> torch.Tensor:            # [B, K, L]
-```
-
----
-
-### 3.3 注意力层 (SelfAttention_Family.py)
-
-**职责**: 实现多种注意力机制，包括软边界注入
-
-#### 关键类
-
-##### 1. `FullAttention` - 全注意力（含注入）
-
-```python
-class FullAttention(nn.Module):
-    def forward(
-        self,
-        queries: torch.Tensor,  # [B, L, H, E]
-        keys: torch.Tensor,     # [B, S, H, E]
-        values: torch.Tensor,   # [B, S, H, D]
-        attn_mask: torch.Tensor,
-        tau: float = None,      # 去平稳因子
-        delta: float = None,    # 去平稳偏移
-        soft_mask: torch.Tensor = None,  # [B, L] 软边界掩码
-        keys_null: torch.Tensor = None,  # [B, S, H, E] 背景Key
-        values_null: torch.Tensor = None # [B, S, H, D] 背景Value
-    ) -> Tuple[torch.Tensor, torch.Tensor]
-```
-
-**语义隔离公式**:
-```python
-# 编辑区域注意力
-A_edit = softmax(Q @ K_edit^T / sqrt(d))
-# 背景区域注意力
-A_null = softmax(Q @ K_null^T / sqrt(d))
-# 最终输出
-V = Λ ⊙ (A_edit @ V_edit) + (I - Λ) ⊙ (A_null @ V_null)
-```
-
-##### 2. `DSAttention` - 去平稳注意力
-
-```python
-class DSAttention(nn.Module):
-    def forward(
-        self,
-        queries: torch.Tensor,
-        keys: torch.Tensor,
-        values: torch.Tensor,
-        attn_mask: torch.Tensor,
-        tau: float = None,
-        delta: float = None,
-        soft_mask: torch.Tensor = None,
-        keys_null: torch.Tensor = None,
-        values_null: torch.Tensor = None
-    ) -> Tuple[torch.Tensor, torch.Tensor]
-```
-
-**特点**: 在注意力计算中加入去平稳因子 τ 和偏移 δ
-
-##### 3. `AttentionLayer` - 注意力层封装
-
-```python
-class AttentionLayer(nn.Module):
-    def __init__(
-        self,
-        attention: nn.Module,   # 内部注意力模块
-        d_model: int,           # 模型维度
-        n_heads: int,           # 注意力头数
-        d_keys: int = None,     # Key维度
-        d_values: int = None    # Value维度
-    )
-```
-
----
-
-### 3.4 采样器 (samplers.py)
-
-**职责**: 实现DDPM和DDIM采样过程
-
-#### 关键类
-
-##### 1. `DDPMSampler` - DDPM采样器
-
-```python
-class DDPMSampler:
-    def __init__(
-        self,
-        num_steps: int,         # 扩散步数
-        beta_start: float = 0.0001,  # β起始值
-        beta_end: float = 0.02,      # β结束值
-        schedule: str = "linear",    # 噪声调度
-        device: str = "cuda"         # 设备
-    )
-    
-    def forward(self, x: torch.Tensor, t: torch.Tensor, noise: torch.Tensor = None) -> torch.Tensor:
-        """前向扩散：添加噪声"""
-        
-    def reverse(self, xt: torch.Tensor, pred_noise: torch.Tensor, t: torch.Tensor, noise: torch.Tensor = None) -> torch.Tensor:
-        """反向去噪：去除噪声"""
-```
-
-##### 2. `DDIMSampler` - DDIM采样器
-
-```python
-class DDIMSampler:
-    def forward(self, x: torch.Tensor, pred_noise: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
-        """DDIM前向（确定性）"""
-        
-    def reverse(self, xt: torch.Tensor, pred_noise: torch.Tensor, t: torch.Tensor, noise: torch.Tensor = None, is_determin: bool = True) -> torch.Tensor:
-        """DDIM反向去噪"""
-```
-
----
-
-### 3.5 编码器
-
-#### 3.5.1 属性编码器 (attr_encoder.py)
-
-```python
-class AttributeEncoder(nn.Module):
-    def __init__(self, configs: Dict)
-    
-    def forward(self, attrs: torch.Tensor) -> torch.Tensor:
-        """
-        将离散属性索引转换为嵌入向量
-        
-        Args:
-            attrs: [B, n_attrs] 属性索引
-            
-        Returns:
-            [B, n_attrs, emb_dim] 属性嵌入
-        """
-```
-
-#### 3.5.2 侧信息编码器 (side_encoder.py)
-
-```python
-class SideEncoder(nn.Module):
-    def __init__(self, configs: Dict)
-    
-    def forward(self, tp: torch.Tensor) -> torch.Tensor:
-        """
-        编码时间点信息
-        
-        Args:
-            tp: [B, L, tp_dim] 时间点特征
-            
-        Returns:
-            [B, total_emb_dim, K, L] 侧信息嵌入
-        """
-```
-
----
-
-### 3.6 测试集构建工具 (build_testset.py)
-
-**职责**: 基于真实数据集构建时间序列编辑测试集
-
-#### 关键类
-
-##### 1. `CSVDataLoader` - CSV数据加载器
-
-```python
-class CSVDataLoader:
-    def __init__(self, csv_path: str, dataset_name: str = "ETTh1")
-    
-    def get_sequence(self, start_idx: int, seq_len: int, feature: str) -> Tuple[np.ndarray, List[str]]:
-        """获取指定特征的1D时间序列"""
-```
-
-##### 2. 物理注入器
-
-```python
-class MultiplierInjector(PhysicalInjector):
-    """乘法倍数注入器 - 数值放大/缩小"""
-
-class HardZeroInjector(PhysicalInjector):
-    """强制归零注入器 - 数值置零"""
-
-class NoiseInjector(PhysicalInjector):
-    """底噪替换注入器 - 替换为噪声"""
-
-class TrendInjector(PhysicalInjector):
-    """趋势注入器 - 添加上升/下降趋势"""
-
-class StepChangeInjector(PhysicalInjector):
-    """阶跃变化注入器 - 突然跳变"""
-```
-
-##### 3. `MultiLevelVaguePromptGenerator` - 多模糊程度提示词生成器
-
-```python
-class MultiLevelVaguePromptGenerator:
-    def generate_multiple_prompts(
-        self,
-        feature_name: str,
-        feature_desc: str,
-        injection_type: str,
-        start_step: int,
-        end_step: int,
-        seq_len: int,
-        causal_scenario: str,
-        injection_config: Dict,
-        num_prompts: int = 4
-    ) -> List[VaguePromptItem]
-```
-
-**模糊程度分级**:
-| 等级 | 标签 | 特点 |
-|------|------|------|
-| 1 | 轻微模糊 | 保留技术细节，仅模糊数值 |
-| 2 | 中度模糊 | 使用相对时间，模糊数值比例 |
-| 3 | 高度模糊 | 完全自然语言，无技术参数 |
-| 4 | 极度模糊 | 仅描述业务场景 |
-
-##### 4. `TestSetBuilder` - 测试集构建器
-
-```python
-class TestSetBuilder:
-    def build_single_sample(
-        self,
-        sample_id: str,
-        start_idx: int,
-        feature: str = None,
-        injection_type: str = None
-    ) -> TestSetSample:
-        """构建单个测试样本"""
-    
-    def build_batch(
-        self,
-        num_samples: int = 10,
-        features: List[str] = None,
-        injection_types: List[str] = None
-    ) -> List[TestSetSample]:
-        """批量构建测试样本"""
-    
-    def save_testset(self, filename: str = None) -> str:
-        """保存测试集为JSON"""
-```
-
----
-
-## 四、模块依赖关系
+### 3.1 流程总览
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                      ConditionalGenerator                        │
-│                    (models/conditional_generator.py)             │
-└─────────────────────────────────────────────────────────────────┘
-         │                    │                    │
-         ▼                    ▼                    ▼
-┌─────────────────┐  ┌─────────────────┐  ┌─────────────────────┐
-│ AttributeEncoder│  │   SideEncoder   │  │ Diff_CSDI_MultiPatch│
-│ (encoders/)     │  │ (encoders/)     │  │ _Weaver_Parallel    │
-└─────────────────┘  └─────────────────┘  └─────────────────────┘
-                                                    │
-                    ┌───────────────────────────────┼───────────────────────────────┐
-                    ▼                               ▼                               ▼
-          ┌─────────────────┐             ┌─────────────────┐             ┌─────────────────┐
-          │ ResidualBlock   │             │ DiffusionEmbed  │             │ AttrProjector   │
-          │                 │             │                 │             │                 │
-          └─────────────────┘             └─────────────────┘             └─────────────────┘
-                    │
-                    ▼
-          ┌─────────────────────────────────────────────────────────────────────────┐
-          │                    AttentionInjectionLayer                              │
-          │                    (SelfAttention_Family.py)                            │
-          │                                                                           │
-          │  核心公式:                                                                │
-          │  A_inj = Λ ⊙ A(Q, K_edit) + (I - Λ) ⊙ A(Q, K_null)                      │
-          │  V_inj = Λ ⊙ (A_edit @ V_edit) + (I - Λ) ⊙ (A_null @ V_null)            │
-          └─────────────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────┐
+│  Phase 0: 测试集构建（离线，一次性）                        │
+│  build_event_driven_testset.py                          │
+│    CSV数据 → 物理注入(CiK) → LLM反向生成Prompt → JSON     │
+└────────────────────────┬────────────────────────────────┘
+                         │ event_driven_testset_ultimate/*.json
+                         ▼
+┌─────────────────────────────────────────────────────────┐
+│  Phase 1: LLM 意图解析                                    │
+│  modules/llm.py :: get_event_driven_plan()              │
+│    Vague Prompt → { tool_name, region:[s,e], math_shift }│
+└────────────────────────┬────────────────────────────────┘
+                         │
+                         ▼
+┌─────────────────────────────────────────────────────────┐
+│  Phase 2: 时间序列编辑                                    │
+│  tool/ts_editors.py :: execute_llm_tool()               │
+│    hybrid_up_soft / hybrid_down_soft / ensemble_smooth  │
+│    → TEditWrapper.edit_region_soft() + 数学锚定          │
+└────────────────────────┬────────────────────────────────┘
+                         │
+                         ▼
+┌─────────────────────────────────────────────────────────┐
+│  Phase 3: 指标评估                                        │
+│  test_scripts/bettertse_cik_official.py :: TSEditEvaluator│
+│    t-IoU · Editability · Preservability · Feature Acc   │
+└─────────────────────────────────────────────────────────┘
+                         │
+                         ▼
+             run_pipeline.py 汇总结果 → JSON 报告
 ```
 
----
-
-## 五、数据交互流程
-
-### 5.1 训练流程
+### 3.2 测试集构建（`build_event_driven_testset.py`）
 
 ```
-输入数据 (batch)
+ETTh1.csv
     │
-    ├── src_x: [B, K, L] ─────────────────────────────┐
-    ├── tp: [B, L, tp_dim] ──► SideEncoder ──► side_emb │
-    └── attrs: [B, n_attrs] ─► AttrEncoder ──► attr_emb │
-                                                       │
-                                                       ▼
-                                              ┌───────────────┐
-                                              │  DDPM.forward │
-                                              │  (加噪声)      │
-                                              └───────────────┘
-                                                       │
-                                                       ▼
-                                              noisy_x: [B, K, L]
-                                                       │
-                                                       ▼
-                                              ┌───────────────┐
-                                              │ Diff_CSDI     │
-                                              │ (预测噪声)     │
-                                              └───────────────┘
-                                                       │
-                                                       ▼
-                                              pred_noise: [B, K, L]
-                                                       │
-                                                       ▼
-                                              MSE(pred, gt_noise)
+    ▼  CSVDataLoader.get_sequence()
+真实1D时间序列 (Base TS, seq_len=192)
+    │
+    ▼  随机选取注入器（五选一）+ 随机区间
+┌──────────────────────────────────────────────┐
+│ MultiplierInjector   乘法放大 ×2.0~4.0        │
+│ HardZeroInjector     强制归零                 │
+│ NoiseInjector        底噪替换                 │
+│ TrendInjector        上升/下降趋势             │
+│ StepChangeInjector   阶跃跳变                 │
+└──────────────────────────────────────────────┘
+    │
+    ▼  inject() → (base_ts, target_ts, gt_mask, gt_config)
+    │
+    ▼  DeepSeek LLM 反向生成 3 级模糊 Prompt
+┌──────────────────────────────────────────────────┐
+│ Level 1 (低模糊)  调度员视角：直接业务指令          │
+│ Level 2 (中模糊)  新闻主播视角：宏观事件描述        │
+│ Level 3 (高模糊)  社交媒体视角：无关联线索          │
+└──────────────────────────────────────────────────┘
+    │
+    ▼  EventDrivenSample 序列化 → JSON
 ```
 
-### 5.2 编辑流程
+**EventDrivenSample 数据结构**：
 
-```
-输入: src_x, src_attrs, tgt_attrs, soft_mask
-    │
-    ├── Forward Diffusion (DDIM) ──► xt_gt (背景真值)
-    │
-    ├── Reverse Denoising Loop:
-    │   │
-    │   ├── predict_noise(xt, tgt_attr) ──► pred_noise_tgt (前景)
-    │   │
-    │   ├── predict_noise(xt, src_attr) ──► pred_noise_src (背景)
-    │   │
-    │   ├── DDIM.reverse(xt, pred_noise_tgt) ──► xt_pred
-    │   │
-    │   ├── DDIM.reverse(xt, pred_noise_src) ──► xt_gt_step
-    │   │
-    │   └── Latent Blending:
-    │       xt = M ⊙ xt_pred + (1-M) ⊙ xt_gt_step
-    │
-    └── 输出: edited_x (编辑后序列)
-```
-
-### 5.3 测试集构建流程
-
-```
-CSV数据 (ETTh1.csv)
-    │
-    ▼
-┌─────────────────┐
-│  CSVDataLoader  │ ──► 加载真实时间序列
-└─────────────────┘
-    │
-    ▼
-┌─────────────────┐
-│ PhysicalInjector│ ──► 注入确定的物理变化
-│ (5种注入器)      │     - multiplier: 数值放大
-└─────────────────┘     - hard_zero: 强制归零
-    │                   - noise_injection: 底噪替换
-    ▼                   - trend_injection: 趋势注入
-┌─────────────────┐     - step_change: 阶跃变化
-│  TestSetSample  │ ──► 四元组: {Base_TS, Target_TS, Mask_GT, Config}
-└─────────────────┘
-    │
-    ▼
-┌─────────────────────┐
-│ LLMVaguePromptGen   │ ──► 生成3-5条不同模糊程度的指令
-│ (DeepSeek API)      │
-└─────────────────────┘
-    │
-    ▼
-输出: testset_ETTh1_*.json
-```
-
----
-
-## 六、配置文件说明
-
-### 6.1 模型配置 (model.yaml)
-
-```yaml
-diffusion:
-  type: "CSDI_MultiPatch_Weaver_Parallel"
-  channels: 64
-  diffusion_embedding_dim: 128
-  num_steps: 100
-  layers: 4
-  nheads: 8
-  is_linear: false
-  L_patch_len: 4
-  multipatch_num: 3
-  attention_mask_type: "full"
-  edit_steps: 50
-  bootstrap_ratio: 0.5
-
-attrs:
-  dim: 128
-  num_attrs: 3
-
-side:
-  dim: 128
-```
-
-### 6.2 训练配置 (train.yaml)
-
-```yaml
-batch_size: 16
-num_epochs: 100
-learning_rate: 1e-4
-weight_decay: 1e-6
-```
-
----
-
-## 七、使用示例
-
-### 7.1 加载模型进行编辑
-
-```python
-from models.conditional_generator import ConditionalGenerator
-import torch
-import numpy as np
-
-# 加载配置
-configs = load_config("configs/synthetic/model_multi_weaver.yaml")
-
-# 初始化模型
-model = ConditionalGenerator(configs)
-model.load_state_dict(torch.load("save/synthetic/pretrain_multi_weaver/0/ckpts/model_best.pth"))
-model.eval()
-
-# 准备数据
-batch = {
-    "src_x": torch.randn(1, 7, 192),  # [B, K, L]
-    "src_attrs": torch.randint(0, 3, (1, 3)),  # [B, n_attrs]
-    "tgt_attrs": torch.randint(0, 3, (1, 3)),
-    "tp": torch.randn(1, 192, 4)
+```json
+{
+  "sample_id": "001",
+  "target_feature": "OT",
+  "task_type": "market_trend",
+  "gt_start": 38,
+  "gt_end": 58,
+  "event_prompts": [
+    { "level": 1, "perspective": "调度员", "prompt": "..." },
+    { "level": 2, "perspective": "新闻主播", "prompt": "..." },
+    { "level": 3, "perspective": "社交媒体路人", "prompt": "..." }
+  ],
+  "base_ts": [...],
+  "target_ts": [...],
+  "gt_mask": [...],
+  "gt_config": { "injection_type": "trend_injection", "multiplier": null, "trend_slope": 0.03 }
 }
+```
 
-# 创建软边界掩码
-hard_mask = np.zeros(192)
-hard_mask[60:100] = 1  # 编辑区域
+---
 
-# 执行编辑
-edited_samples = model.edit_soft(
-    batch,
-    n_samples=1,
-    hard_mask=hard_mask,
-    smooth_width=5,
-    smooth_type="gaussian"
+## 四、核心模块详解
+
+### 4.1 全局配置（`config.py`）
+
+| 函数 | 说明 |
+|------|------|
+| `get_api_config()` | 返回 `{api_key, base_url, model_name}`，从环境变量读取 |
+| `get_model_config(dataset)` | 返回 TEdit 模型权重与配置绝对路径 |
+| `get_openai_client()` | 构造 OpenAI 兼容客户端 |
+| `setup_environment()` | 将配置写入环境变量（兼容旧代码） |
+
+> **注意**：API Key 通过 `.env` 文件或环境变量注入，不得硬编码。
+
+---
+
+### 4.2 Agent 工作流（`agent/`）
+
+#### AgentState（节点间共享状态）
+
+```python
+class AgentState(TypedDict):
+    context_messages: list[BaseMessage]   # 对话历史
+    pipeline_outputs: list[dict]          # 工作流事件日志
+    next_step: str | None                 # 路由控制
+    step_content: dict | str | None       # 当前步骤解析结果
+    input: dict | None                    # 用户输入
+    forecast: dict | None                 # 预测结果
+    cnt_retry_planner: int                # Planner 重试计数
+    editing_mode: bool                    # 是否进入编辑模式
+    edit_task: dict | None                # 编辑任务参数
+```
+
+#### LangGraph 工作流（`agent/agent.py :: A1`）
+
+```
+START
+  │
+  ▼
+[describer]  ──────────────────────────────────────────────────→ END
+  │  route_main()
+  ▼
+[planner]  ─── retry(cnt_retry_planner ≥ 3) ──────────────────→ END
+  │  route_main()
+  ├─ "compose" ──→ [composer] ─────────────────────────────────→ END
+  └─ "edit"    ──→ [editor]  ─────────────────────────────────→ END
+```
+
+| 节点 | 文件 | 职责 |
+|------|------|------|
+| `node_describer` | `nodes.py:20` | 分析输入时序，生成统计摘要，判断任务类型 |
+| `node_planner` | `nodes.py:147` | 调用 LLM 生成结构化编辑计划 |
+| `node_composer` | `nodes.py:428` | 调用数学工具完成合成类任务 |
+| `node_editor` | `nodes.py:770` | 调用 TEdit + 数学工具完成编辑任务 |
+
+#### LLM 意图分解器（`agent/llm_instruction_decomposer.py`）
+
+将自然语言编辑指令分解为结构化参数：
+```python
+{
+    "operation": "increase",
+    "region": [start, end],       # 时间步范围
+    "magnitude": 2.5,             # 倍数/量级
+    "smooth": True
+}
+```
+
+---
+
+### 4.3 LLM 模块（`modules/llm.py`）
+
+#### `CustomLLMClient`
+
+OpenAI 兼容客户端，支持 DeepSeek / vLLM 本地部署：
+- 优先使用 `/responses` 端点，fallback 至 Chat Completions
+- 支持 function calling（tools 参数）
+
+#### `get_event_driven_plan(news_text, instruction_text, llm/client)`
+
+Pipeline 核心解析函数，返回：
+```python
+{
+    "thought": "分析过程...",
+    "tool_name": "hybrid_up",          # hybrid_up | hybrid_down | ensemble_smooth
+    "parameters": {
+        "region": [38, 58],            # [start_step, end_step]
+        "math_shift": 0.5              # 数学平移量
+    }
+}
+```
+
+---
+
+### 4.4 编辑工具（`tool/`）
+
+#### `execute_llm_tool(plan, ts, tedit, n_ensemble, use_soft_boundary)`（`ts_editors.py:26`）
+
+统一编辑入口，根据 `plan["tool_name"]` 分发：
+
+| tool_name | 函数 | 实现逻辑 |
+|-----------|------|---------|
+| `hybrid_up` | `hybrid_up_soft()` | TEdit 生成上升趋势 + 线性数学锚定 |
+| `hybrid_down` | `hybrid_down_soft()` | TEdit 生成下降趋势 + 线性数学锚定 |
+| `ensemble_smooth` | `ensemble_smooth_soft()` | 多样本 DDPM 平均 + 软边界融合 |
+
+返回值：`(edited_ts: np.ndarray, edit_log: dict)`
+
+#### `TEditWrapper`（`tool/tedit_wrapper.py:24`）
+
+TEdit 扩散模型的 Python 封装：
+
+| 方法 | 说明 |
+|------|------|
+| `edit_time_series(ts, src_attrs, tgt_attrs, mask)` | 基础编辑接口 |
+| `edit_region(ts, start, end, operation)` | 区间编辑 |
+| `edit_region_soft(ts, start, end, operation, smooth_width)` | 软边界编辑（推荐） |
+| `_generate_soft_mask(hard_mask, smooth_width)` | 硬→软掩码（高斯平滑） |
+
+全局单例通过 `get_tedit_instance(model_path, config_path, device)` 获取（非线程安全）。
+
+---
+
+### 4.5 评估器（`test_scripts/bettertse_cik_official.py`）
+
+#### `TSEditEvaluator.evaluate(base_ts, target_ts, generated_ts, gt_mask, gt_config, llm_prediction)`
+
+| 指标 | 计算方式 | 含义 |
+|------|---------|------|
+| `t_iou` | `|P∩G| / |P∪G|` | LLM 预测区间 vs GT 区间的时间重叠度 |
+| `feature_accuracy` | 特征名匹配率 | LLM 是否识别出正确的目标特征 |
+| `mse_edit_region` | MSE(generated, target) in mask | 编辑区域与目标的均方误差（越小越好） |
+| `mae_edit_region` | MAE(generated, target) in mask | 编辑区域绝对误差 |
+| `mse_preserve_region` | MSE(generated, source) in ~mask | 背景保留区域的保真度（越小越好） |
+| `mae_preserve_region` | MAE(generated, source) in ~mask | 背景保留绝对误差 |
+| `editability_score` | 1 / (1 + mse_edit) | 编辑能力综合分（0~1，越高越好） |
+| `preservability_score` | 1 / (1 + mse_preserve) | 背景保真综合分（0~1，越高越好） |
+
+`gt_config` 必须包含键：`start_step`、`end_step`、`target_feature`。
+
+---
+
+### 4.6 Pipeline 集成脚本（`run_pipeline.py`）
+
+端到端评估入口，串联所有阶段：
+
+```python
+run_pipeline(
+    testset_path,          # 测试集 JSON 路径
+    tedit_model_path=None, # TEdit 权重路径（None = 纯数学模式）
+    tedit_config_path=None,
+    tedit_device="cpu",
+    output_path="test_results/pipeline_results.json",
+    max_samples=None
 )
+```
+
+**格式兼容**：通过 `_normalize_gt_config()` 统一两种 gt_config 字段命名：
+- `build_mini_benchmark.py` 产出：`gt_start` / `gt_end`
+- `bettertse_cik_official.py` 产出：`start_step` / `end_step`
+
+**数学-only fallback**（`_math_only_edit()`）：无 TEdit 时，基于 LLM 预测区间做线性平移，仅评估区间定位能力。
+
+CLI 用法：
+```bash
+python run_pipeline.py \
+    --testset event_driven_testset_ultimate/event_driven_testset_ETTh1_5.json \
+    --tedit-model TEdit-main/save/synthetic/pretrain_multi_weaver/0/ckpts/model_best.pth \
+    --tedit-config TEdit-main/save/synthetic/pretrain_multi_weaver/0/model_configs.yaml \
+    --device cpu \
+    --output results.json
+```
+
+---
+
+## 五、模块依赖关系
+
+```
+run_pipeline.py
+    ├── config.py                    # API Key、模型路径
+    ├── modules/llm.py               # get_event_driven_plan()
+    ├── tool/ts_editors.py           # execute_llm_tool()
+    │       └── tool/tedit_wrapper.py    # TEditWrapper → TEdit-main/
+    └── test_scripts/bettertse_cik_official.py  # TSEditEvaluator
+
+agent/agent.py (A1)
+    ├── agent/nodes.py               # node_* 函数
+    │       ├── modules/llm.py
+    │       ├── tool/ts_editors.py
+    │       └── tool/tedit_wrapper.py
+    ├── agent/prompts.py             # EVENT_DRIVEN_AGENT_PROMPT 等
+    └── agent/llm_instruction_decomposer.py
+
+test_scripts/build_event_driven_testset.py
+    ├── test_scripts/data_loader.py  # CSVDataLoader
+    ├── test_scripts/change_injector.py # 5 种注入器
+    └── modules/llm.py               # DeepSeek LLM（反向生成 Prompt）
+```
+
+---
+
+## 六、已知问题与注意事项
+
+| 问题 | 位置 | 说明 |
+|------|------|------|
+| `sys.modules` 命名冲突 | `test_scripts/config.py` vs 根 `config.py` | `test_scripts/__init__.py` 已清空导入，各子模块自行管理 `sys.path` |
+| 单例非线程安全 | `tedit_wrapper.py:415`、`llm_instruction_decomposer.py` | 单进程单线程使用无问题，并发场景需加锁 |
+| `torch.load(weights_only=False)` | `tedit_wrapper.py:95` | 存在反序列化 RCE 风险，仅加载可信模型权重 |
+| `plot_series()` 绘图 bug | `modules/utils.py` | `output_ts` 被重复绘制，`predicted_ts` 参数未使用 |
+| `node_composer` 空参数 bug | `agent/nodes.py:428` | `spec.get("required_parameters")` 返回 None 时迭代报错 |
+| LangGraph 图 PNG 副作用 | `agent/agent.py:218` | 每次 `_configure_workflow()` 写盘，网络不可用时崩溃 |
+
+---
+
+## 七、快速上手
+
+### 7.1 环境配置
+
+```bash
+# 安装依赖
+pip install -r requirements.txt
+
+# 配置 API Key（复制 .env.example 并填写）
+cp .env.example .env
+# 编辑 .env，设置 DEEPSEEK_API_KEY=sk-...
 ```
 
 ### 7.2 构建测试集
 
+```bash
+python test_scripts/build_event_driven_testset.py \
+    --csv data/ETTh1.csv \
+    --num-samples 20 \
+    --output event_driven_testset_ultimate/
+```
+
+### 7.3 运行完整评估 Pipeline
+
+```bash
+python run_pipeline.py \
+    --testset event_driven_testset_ultimate/event_driven_testset_ETTh1_5.json \
+    --output results.json
+```
+
+### 7.4 直接使用 Agent
+
 ```python
-from test_scripts.build_testset import TestSetBuilder
+from agent.agent import A1
 
-# 初始化构建器
-builder = TestSetBuilder(
-    csv_path="data/ETTh1.csv",
-    dataset_name="ETTh1",
-    api_key="your-deepseek-api-key",
-    seq_len=192,
-    num_prompts_per_sample=4
-)
-
-# 批量构建
-builder.build_batch(
-    num_samples=100,
-    features=["HUFL", "OT"],
-    injection_types=["multiplier", "hard_zero"]
-)
-
-# 保存测试集
-builder.save_testset()
+agent = A1(model_name="deepseek-chat", base_url="https://api.deepseek.com/v1")
+agent.set_editing_mode(True)
+result = agent.go("过去一周用电需求激增，变压器油温在午高峰时段出现明显上升")
 ```
 
 ---
 
-## 八、评估指标
+## 八、评估结果格式
 
-| 指标 | 公式 | 说明 |
-|------|------|------|
-| **t-IoU** | $\frac{|P \cap G|}{|P \cup G|}$ | 时间区间交并比 |
-| **Editability** | MSE(pred, target) in edit region | 编辑区域精度 |
-| **Preservability** | MSE(pred, source) in preserve region | 保留区域保真度 |
-| **Feature Accuracy** | 正确预测特征的比例 | 特征识别准确率 |
+`run_pipeline.py` 输出的 JSON 结构：
+
+```json
+{
+  "metadata": {
+    "testset_path": "...",
+    "total_samples": 5,
+    "tedit_available": true,
+    "timestamp": "2026-03-12T..."
+  },
+  "summary": {
+    "valid_samples": 5,
+    "avg_t_iou": 0.62,
+    "avg_editability_score": 0.78,
+    "avg_preservability_score": 0.91,
+    "avg_feature_accuracy": 0.80
+  },
+  "results": [
+    {
+      "sample_id": "001",
+      "metrics": {
+        "t_iou": 0.71,
+        "editability_score": 0.82,
+        "preservability_score": 0.94,
+        "feature_accuracy": 1.0,
+        "mse_edit_region": 0.018,
+        "mse_preserve_region": 0.003
+      },
+      "llm_prediction": { "tool_name": "hybrid_up", "region": [40, 56] }
+    }
+  ]
+}
+```
 
 ---
 
-## 九、版本历史
+## 九、参考文献
 
-| 版本 | 日期 | 更新内容 |
-|------|------|----------|
-| v2.0 | 2026-03 | 添加注意力注入机制、多模糊程度提示词生成 |
-| v1.0 | 2025-12 | 初始版本，实现基础编辑功能 |
-
----
-
-## 十、参考文献
-
-1. TEdit: Time Series Editing via Diffusion Models
-2. CSDI: Conditional Score-based Diffusion Models for Time Series Imputation
-3. Context is Key (CiK): Benchmark for Time Series Editing
+1. **TEdit**: Jiang et al., *Time Series Editing via Diffusion Models*, NeurIPS 2024
+2. **CSDI**: Tashiro et al., *Conditional Score-based Diffusion Models for Probabilistic Time Series Imputation*, NeurIPS 2021
+3. **CiK**: Goswami et al., *Context is Key: A Benchmark for Forecasting with Essential Textual Information*, NeurIPS 2024
+4. **LangGraph**: LangChain documentation, *Building Stateful Multi-Actor Applications*
 
 ---
 
-*文档生成时间: 2026-03-11*
-*BetterTSE Team*
+*BetterTSE Team · 2026-03-12*

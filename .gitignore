@@ -59,5 +59,10 @@ outputs/
 *.jpg
 *.jpeg
 
+# Local datasets and notebook caches
+data/traffic.csv
+.ipynb_checkpoints/
+**/.ipynb_checkpoints/
+
 # Trae IDE
 .trae/

@@ -6,51 +6,169 @@ import inspect
 import json
 
 from tool import ts_describers as tsd
+from tool.ts_editors import get_prompt_tool_catalog
 
 
-EVENT_DRIVEN_AGENT_PROMPT = """
-You are an expert Time-Series Planning Agent for an Event-Driven Forecasting System.
-Your task is to analyze real-world breaking news or instructions and map their physical/economic impact into specific tool calls for a time-series diffusion model.
+def get_event_driven_agent_prompt(ts_length: int = 100) -> str:
+    """Generate EVENT_DRIVEN_AGENT_PROMPT with the correct sequence length."""
+    max_idx = ts_length - 1
+    early_end = max(1, ts_length // 3)
+    mid_end = max(early_end + 1, (2 * ts_length) // 3)
+    tool_catalog = json.dumps(get_prompt_tool_catalog(), ensure_ascii=False, indent=2)
+    return f"""
+You are an expert Time-Series Planning Agent for BetterTSE.
+Your job is to read a vague event or instruction, infer the intended time-series effect,
+localize the affected region, and then map that effect to exactly one execution tool.
 
-The sequence length is exactly 100 points (Index 0 to 99).
-You MUST evaluate the event and choose exactly ONE of the following three tools:
+The sequence length is exactly {ts_length} points (index 0 to {max_idx}).
 
-1. Tool: `hybrid_up`
-   - Applicability: Use when news indicates a surge, panic buying, or strong upward trend.
-   - Mechanism: Implicitly maps to geometric attrs [1,1,1] with a positive mathematical shift.
-   - Required Parameters:
-     - `region`: [start_index, end_index]
-     - `math_shift`: A positive float (e.g., 10.0 to 20.0)
+You must reason in TWO STAGES, but output ONE JSON object:
+1. LOCALIZE the target region like a temporal bounding box.
+2. Infer the local edit intent and map it to ONE execution tool.
 
-2. Tool: `hybrid_down`
-   - Applicability: Use when news indicates a crash, crisis, product recall, or severe drop.
-   - Mechanism: Implicitly maps to geometric attrs [1,0,1] with a negative mathematical shift.
-   - Required Parameters:
-     - `region`: [start_index, end_index]
-     - `math_shift`: A negative float (e.g., -10.0 to -20.0)
+━━━━━━━━━━━━━━━━━  STAGE 1: TEMPORAL LOCALIZATION  ━━━━━━━━━━━━━━━━━
 
-3. Tool: `ensemble_smooth`
-   - Applicability: Use when news indicates policy intervention, stabilization, or reduced volatility.
-   - Mechanism: Implicitly maps to geometric attrs [0,0,0] using multi-sample noise cancellation.
-   - Required Parameters:
-     - `region`: [start_index, end_index]
+First identify the time anchor phrase and map it to a coarse bucket before deciding the exact region.
+
+Bucket guide:
+- early: indices `[0, {early_end})`
+- middle: indices `[{early_end}, {mid_end})`
+- late: indices `[{mid_end}, {ts_length})`
+
+Typical phrase mapping:
+- `自今日清晨起`, `在早班交接后`, `大清早的时候` -> usually `early`
+- `从今天中午开始`, `在今日运行中段`, `刚才` -> usually `middle`
+- `预计在今晚深夜`, `在夜间低谷期前`, `就快到半夜的时候` -> usually `late`
+
+Localization rules:
+- Output a coarse `position_bucket` first, then choose an exact `region`.
+- The region should be a local temporal box, not the whole sequence.
+- Use `duration_steps` as an explicit estimate of event length before finalizing the region.
+- For transient shock / switch events, duration is usually short: 5–20 steps.
+- For sustained trend / seasonality / shutdown events, duration is usually medium or long: 15–60 steps.
+
+━━━━━━━━━━━━━━━━━  STAGE 2: CANONICAL EDIT INTENT  ━━━━━━━━━━━━━━━━━
+
+Infer the intent with these fields:
+- effect_family: `trend`, `seasonality`, `volatility`, `impulse`, `level`, `shutdown`
+- direction: `up`, `down`, `neutral`
+- shape: `linear`, `quadratic`, `hump`, `plateau`, `step`, `flatline`, `irregular_noise`, `transient`, `periodic`, `flatten`, `residual_amplify`, `none`
+- duration: `short`, `medium`, `long`
+- strength: `weak`, `medium`, `strong`
+
+Disambiguation rules:
+- If the effect is short-lived and returns quickly toward baseline, prefer `impulse`.
+- If the mean level stays roughly unchanged but fluctuations widen or narrow, prefer `volatility`.
+- If the main change is oscillation amplitude or cyclicity, prefer `seasonality`.
+- Only choose `trend` when the event implies sustained drift across many steps.
+- Only choose `shutdown` when the semantics clearly imply zeroing, outage, or hard stop.
+- If the prompt says "短时冲高后回落", "先偏离后恢复", or "一度承压随后恢复", prefer `shape=hump` rather than a long global trend.
+- If the prompt says "持续承压并维持高位", "持续偏高", "维持在高位一段时间", prefer `effect_family=level` and `shape=plateau`.
+- If the prompt says "突然切换后维持", "切换到新的状态", or "跳到另一种运行水平", prefer `effect_family=level` and `shape=step`.
+- If the prompt says "杂乱跳变", "信号失真", or "无规律波动", prefer `effect_family=volatility` and `shape=irregular_noise`.
+- If the prompt says "降到极低水平并维持", "停摆", or "几乎中断", prefer `effect_family=shutdown` and `shape=flatline`.
+- Use `shape=transient` only for a very short spike-like pulse, not for a medium-duration hump or flatline event.
+- Use `shape=linear` only for sustained monotonic drift, not for a step switch.
+
+━━━━━━━━━━━━━━━━━  STAGE 3: TOOL MAPPING  ━━━━━━━━━━━━━━━━━
+
+Use the following layered tool catalog.
+- `tool_layer=native_tedit` means the task is aligned with TEdit's native control space.
+- `tool_layer=derived` means the task is handled by hybrid or pure math tools.
+
+Tool catalog:
+{tool_catalog}
+
+Canonical mapping guide:
+- `trend + up + linear` -> `trend_linear_up` -> `hybrid_up`
+- `trend + down + linear` -> `trend_linear_down` -> `hybrid_down`
+- `trend + up + quadratic` -> `trend_quadratic_up` -> `trend_quadratic_up`
+- `trend + down + quadratic` -> `trend_quadratic_down` -> `trend_quadratic_down`
+- `seasonality + neutral + periodic` -> `seasonality_enhance` -> `season_enhance`
+- `seasonality + neutral + flatten` -> `seasonality_reduce` -> `season_reduce`
+- `volatility + neutral + flatten` -> `smooth_denoise` -> `ensemble_smooth`
+- `volatility + neutral + residual_amplify` -> `volatility_increase` -> `volatility_increase`
+- `volatility + neutral + irregular_noise` -> `volatility_increase` -> `volatility_increase`
+- `impulse + up/down + transient` -> `impulse_spike` -> `spike_inject`
+- `impulse + up/down + hump` -> closest current local hump tool; prefer `spike_inject` for short/medium local bump, or `trend_quadratic_up/down` only if the window is clearly wider and smoother
+- `level + up + plateau` -> closest current elevated-level tool; prefer `hybrid_up`
+- `level + up/down + step` -> `level_step` -> `step_shift`
+- `shutdown + down + flatline` -> closest current shutdown tool; prefer `hybrid_down`
+
+Weak-signal interpretation guide:
+- "持续承压", "持续走高", "明显偏高" -> likely `trend + up`
+- "持续承压并维持高位", "持续偏高", "高位维持一段时间" -> likely `level + plateau`
+- "持续走低", "跌到低位并维持" -> likely `trend + down` or `shutdown`
+- "短时冲高后恢复" -> likely `impulse + hump`
+- "突然切换并维持" -> likely `level + step`; prefer `step_shift`
+- "杂乱跳变", "信号异常", "读数失真" -> likely `volatility + irregular_noise`
+- "降到极低水平并维持" -> likely `shutdown + flatline`
+
+━━━━━━━━━━━━━━━━━  REGION SELECTION  ━━━━━━━━━━━━━━━━━
+
+- Sustained trend/seasonality effects usually span 20–60 steps.
+- Volatility changes usually span 10–40 steps.
+- Transient impulses usually span 5–20 steps.
+- The event should start at a plausible future index relative to the event onset.
 
 CRITICAL CONSTRAINTS:
-- region[0] (start_index) MUST be >= 0 and < 99
-- region[1] (end_index) MUST be > region[0] and <= 100
-- The region length (end_index - start_index) MUST be >= 1
-- Invalid regions will cause runtime errors
+- region[0] MUST be >= 0 and < {ts_length}
+- region[1] MUST be > region[0] and <= {ts_length}
+- The region length MUST be >= 1
+- `math_shift` and `shift_factor` are mutually exclusive
+- For `volatility_increase` and `spike_inject`, do not provide `math_shift` or `shift_factor`
 
-You must output your decision STRICTLY in JSON format matching this schema:
-{
-    "thought": "Your step-by-step reasoning",
-    "tool_name": "hybrid_up" | "hybrid_down" | "ensemble_smooth",
-    "parameters": {
-        "region": [int, int],
-        "math_shift": float (Optional)
-    }
-}
+━━━━━━━━━━━━━━━━━  OUTPUT FORMAT  ━━━━━━━━━━━━━━━━━
+
+Return STRICT JSON with this schema:
+{{
+  "thought": "brief reasoning from time anchor -> region -> canonical intent -> execution tool",
+  "intent": {{
+    "effect_family": "<trend|seasonality|volatility|impulse|level|shutdown>",
+    "direction": "<up|down|neutral>",
+    "shape": "<linear|quadratic|hump|plateau|step|flatline|irregular_noise|transient|periodic|flatten|residual_amplify|none>",
+    "duration": "<short|medium|long>",
+    "strength": "<weak|medium|strong>"
+  }},
+  "localization": {{
+    "time_anchor_phrase": "<phrase copied or summarized from the prompt>",
+    "position_bucket": "<early|middle|late>",
+    "duration_steps": int,
+    "evidence": "short explanation of why this bucket and duration fit",
+    "region": [int, int],
+    "confidence": 0.0
+  }},
+  "execution": {{
+    "canonical_tool": "<canonical task name>",
+    "tool_name": "<actual execution tool>",
+    "control_source": "<native_tedit|hybrid|math_only>",
+    "local_edit_hint": "short local instruction for the selected region only",
+    "parameters": {{
+      "region": [int, int]
+    }}
+  }}
+}}
+
+Parameter rules:
+- `hybrid_up`, `hybrid_down`, `trend_quadratic_up`, `trend_quadratic_down`:
+  may include either `math_shift` or `shift_factor`
+- `volatility_increase`:
+  may include `amplify_factor`
+- `spike_inject`:
+  may include `amplitude`, `width`, `center`
+- `step_shift`:
+  may include either `math_shift` or `shift_factor`
+- `season_enhance`, `season_reduce`, `ensemble_smooth`:
+  region only
+
+Backward compatibility requirement:
+- Ensure `execution.tool_name` is a valid current tool name from the catalog.
+- When the prompt is intentionally indirect, prefer the closest semantically grounded tool rather than defaulting to a generic anomaly interpretation.
 """
+
+
+# Backward-compatible alias (uses legacy default of 100 points)
+EVENT_DRIVEN_AGENT_PROMPT = get_event_driven_agent_prompt(ts_length=100)
 
 
 def collect_descriptor_outputs(ts: dict) -> tuple[dict[str, object], list[str]]:

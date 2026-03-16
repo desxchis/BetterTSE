@@ -7,102 +7,15 @@ BetterTSE 测试脚本包
 3. 集成LLM接口生成模糊宏观描述
 4. 评估和可视化测试结果
 
-主要模块:
-- config: 配置管理
-- data_loader: 数据集加载器
-- change_injector: 物理变化注入器
-- llm_interface: LLM接口
-- test_pipeline: 测试流程管道
-- result_evaluator: 结果评估器
+主要模块（请直接按需从子模块导入，而非通过此包顶层）:
+  from test_scripts.bettertse_cik_official import BetterTSETestPipelineCiKOfficial, TSEditEvaluator
+  from test_scripts.build_mini_benchmark import ...
+  from test_scripts.result_evaluator import ResultEvaluator
+  ...
+
+注意：test_scripts/config.py 与项目根目录 config.py 同名，
+      请勿在顶层 __init__.py 中做通配导入，以避免 sys.modules 冲突。
 """
-
-from config import (
-    ChangeType,
-    ScenarioType,
-    DatasetConfig,
-    ChangeInjectionConfig,
-    LLMConfig,
-    TestConfig,
-    DATASET_CONFIGS,
-    get_config,
-    get_llm_config
-)
-
-from data_loader import (
-    DatasetLoader,
-    create_synthetic_sequence
-)
-
-from change_injector import (
-    PhysicalChangeInjector,
-    ChangeParameters,
-    ChangeResult,
-    validate_change_injection
-)
-
-from llm_interface import (
-    BaseLLMClient,
-    OpenAICompatibleClient,
-    MockLLMClient,
-    VaguePromptGenerator,
-    LLMResponse,
-    evaluate_prompt_quality
-)
-
-from test_pipeline import (
-    TestPipeline,
-    TestSample,
-    TestResult,
-    run_quick_test
-)
-
-from result_evaluator import (
-    ResultEvaluator,
-    ResultVisualizer,
-    generate_dataset_for_bettertse
-)
 
 __version__ = "1.0.0"
 __author__ = "BetterTSE Team"
-
-__all__ = [
-    # Config
-    'ChangeType',
-    'ScenarioType',
-    'DatasetConfig',
-    'ChangeInjectionConfig',
-    'LLMConfig',
-    'TestConfig',
-    'DATASET_CONFIGS',
-    'get_config',
-    'get_llm_config',
-    
-    # Data Loader
-    'DatasetLoader',
-    'create_synthetic_sequence',
-    
-    # Change Injector
-    'PhysicalChangeInjector',
-    'ChangeParameters',
-    'ChangeResult',
-    'validate_change_injection',
-    
-    # LLM Interface
-    'BaseLLMClient',
-    'OpenAICompatibleClient',
-    'MockLLMClient',
-    'VaguePromptGenerator',
-    'LLMResponse',
-    'evaluate_prompt_quality',
-    
-    # Test Pipeline
-    'TestPipeline',
-    'TestSample',
-    'TestResult',
-    'run_quick_test',
-    
-    # Result Evaluator
-    'ResultEvaluator',
-    'ResultVisualizer',
-    'generate_dataset_for_bettertse'
-]

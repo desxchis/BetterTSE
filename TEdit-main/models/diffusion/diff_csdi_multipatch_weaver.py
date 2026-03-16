@@ -451,8 +451,11 @@ class Diff_CSDI_MultiPatch_Weaver_Parallel(nn.Module):
         if self.attention_mask_type == "full":
             attention_mask = None
         elif self.attention_mask_type == "parallel":
-            attention_mask = self.get_mask(attr_emb_raw.shape[1], [x_list[i].shape[-1] for i in range(len(x_list))])
-            attention_mask = self.get_mask(0, [x_list[i].shape[-1] for i in range(len(x_list))], device=x_raw.device)
+            attention_mask = self.get_mask(
+                0,
+                [x_list[i].shape[-1] for i in range(len(x_list))],
+                device=x_raw.device,
+            )
         
         x_in = torch.cat(x_list, dim=-1)
         side_in = torch.cat(side_list, dim=-1)
@@ -493,7 +496,9 @@ class Diff_CSDI_MultiPatch_Weaver_Parallel(nn.Module):
         all_out = all_out.reshape(B, K, L)
         return all_out
     
-    def get_mask(self, attr_len, len_list, device="cuda:0"):
+    def get_mask(self, attr_len, len_list, device=None):
+        if device is None:
+            device = self.output_projection1.weight.device
         total_len = sum(len_list) + attr_len
         mask = torch.zeros(total_len, total_len, device=device) - float("inf")
         mask[:attr_len, :] = 0

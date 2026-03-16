@@ -40,7 +40,7 @@ logging.basicConfig(
 logger = logging.getLogger("MiniBenchmark")
 
 
-DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "sk-5dffb5b7887e474b869647790c534f29")
+DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY") or os.environ.get("OPENAI_API_KEY", "")
 
 
 @dataclass

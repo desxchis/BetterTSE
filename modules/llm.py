@@ -7,9 +7,82 @@ from openai import OpenAI, APIStatusError
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.language_models.chat_models import BaseChatModel
+from modules.region_localizer import infer_shape_hint, localize_region
+from tool.ts_editors import normalize_llm_plan
 
 
 SourceType = Literal["OpenAI", "DashScope", "InterWeb", "Ollama", "vLLM"]
+
+
+def _infer_direction_hint(text: str) -> str:
+    normalized = text or ""
+    upward_hints = ("冲高", "抬升", "走高", "偏高", "激增", "飙升", "高位")
+    if any(token in normalized for token in upward_hints):
+        return "up"
+    downward_hints = ("降至极低", "跌到低位", "停摆", "中断", "掉到特别低", "走低")
+    if any(token in normalized for token in downward_hints):
+        return "down"
+    return ""
+
+
+def _apply_explicit_prompt_hints(plan: Dict[str, Any], instruction_text: str) -> Dict[str, Any]:
+    """Override obviously wrong intent/tool fields using explicit lexical cues.
+
+    This is intentionally narrow: only strong, high-precision text hints should
+    be allowed to overrule the LLM plan.
+    """
+    normalized = normalize_llm_plan(plan)
+    intent = normalized.setdefault("intent", {})
+    execution = normalized.setdefault("execution", {})
+    params = normalized.setdefault("parameters", {})
+
+    shape_hint = infer_shape_hint(instruction_text)
+    direction_hint = _infer_direction_hint(instruction_text)
+
+    if not shape_hint and not direction_hint:
+        return normalized
+
+    if shape_hint:
+        intent["shape"] = shape_hint
+        if shape_hint == "flatline":
+            intent["effect_family"] = "shutdown"
+            if not direction_hint:
+                direction_hint = "down"
+            execution["canonical_tool"] = "trend_linear_down"
+            execution["tool_name"] = "hybrid_down"
+        elif shape_hint == "step":
+            intent["effect_family"] = "level"
+            execution["canonical_tool"] = "level_step"
+            execution["tool_name"] = "step_shift"
+        elif shape_hint == "irregular_noise":
+            intent["effect_family"] = "volatility"
+            intent["direction"] = "neutral"
+            execution["canonical_tool"] = "volatility_increase"
+            execution["tool_name"] = "volatility_increase"
+        elif shape_hint == "hump":
+            intent["effect_family"] = "impulse"
+            execution["canonical_tool"] = "impulse_spike"
+            execution["tool_name"] = "spike_inject"
+
+    plateau_hints = ("持续承压", "持续偏高", "维持高位", "高位维持", "持续处于高位")
+    if any(token in instruction_text for token in plateau_hints):
+        intent["effect_family"] = "level"
+        intent["shape"] = "plateau"
+        if not direction_hint:
+            direction_hint = "up"
+        execution["canonical_tool"] = "trend_linear_up"
+        execution["tool_name"] = "hybrid_up"
+
+    if direction_hint:
+        intent["direction"] = direction_hint
+        if execution.get("tool_name") in {"hybrid_up", "hybrid_down"}:
+            execution["tool_name"] = "hybrid_down" if direction_hint == "down" else "hybrid_up"
+            execution["canonical_tool"] = "trend_linear_down" if direction_hint == "down" else "trend_linear_up"
+
+    normalized["tool_name"] = execution.get("tool_name", normalized.get("tool_name"))
+    normalized["canonical_tool"] = execution.get("canonical_tool", normalized.get("canonical_tool"))
+    execution.setdefault("parameters", params)
+    return normalize_llm_plan(normalized)
 
 
 # Define a customized LLM client implementing the invoke method
@@ -210,6 +283,7 @@ def call_llm(
 def get_event_driven_plan(
     news_text: str,
     instruction_text: str,
+    ts_length: int = 100,
     client=None,
     model: str = "gpt-4o",
     llm=None,
@@ -217,30 +291,45 @@ def get_event_driven_plan(
 ) -> dict:
     """
     Get structured editing plan from LLM based on event-driven instruction.
-    
+
     Supports two calling patterns:
     1. Direct OpenAI client: get_event_driven_plan(news, instruction, client, model)
     2. LangChain LLM: get_event_driven_plan(news, instruction, llm=llm, system_prompt=prompt)
-    
+
     Args:
         news_text: Breaking news or event description
         instruction_text: Specific editing instruction
+        ts_length: Total length of the time series (default: 100). Used to inject
+                   the correct sequence length into the system prompt and user message.
         client: OpenAI client instance (for direct API calls)
         model: Model name for direct API calls (default: "gpt-4o")
         llm: LangChain LLM client (alternative to client)
-        system_prompt: Custom system prompt (uses default if None)
-    
+        system_prompt: Custom system prompt (uses default if None; length-aware prompt
+                       is generated automatically when ts_length is provided)
+
     Returns:
         dict: Parsed JSON plan with keys: thought, tool_name, parameters
     """
     import json
     import re
-    
+
     if system_prompt is None:
-        from agent.prompts import EVENT_DRIVEN_AGENT_PROMPT
-        system_prompt = EVENT_DRIVEN_AGENT_PROMPT
-    
-    user_message = f"News: {news_text}\n\nInstruction: {instruction_text}"
+        from agent.prompts import get_event_driven_agent_prompt
+        system_prompt = get_event_driven_agent_prompt(ts_length=ts_length)
+
+    early_end = max(1, ts_length // 3)
+    mid_end = max(early_end + 1, (2 * ts_length) // 3)
+    user_message = (
+        f"News: {news_text}\n\n"
+        f"Instruction: {instruction_text}\n\n"
+        f"[Sequence Info] The time series has exactly {ts_length} timesteps "
+        f"(index 0 to {ts_length - 1}). "
+        f"You MUST ensure region[0] >= 0 and region[1] <= {ts_length}.\n"
+        f"[Allowed Effect Families] trend, seasonality, volatility, impulse, level, shutdown\n"
+        f"[Localization Hint] Long trends usually span 20-60 steps; transient shocks usually span 5-20 steps.\n"
+        f"[Temporal Buckets] early=[0,{early_end}), middle=[{early_end},{mid_end}), late=[{mid_end},{ts_length})\n"
+        f"[Anchor Mapping] 清晨/早班/大清早->early; 中午/运行中段/刚才->middle; 深夜/夜间低谷前/半夜->late"
+    )
     
     if client is not None:
         response = client.chat.completions.create(
@@ -268,7 +357,18 @@ def get_event_driven_plan(
     if json_match:
         try:
             plan = json.loads(json_match.group())
-            return plan
+            normalized = normalize_llm_plan(plan, ts_length=ts_length)
+            normalized = _apply_explicit_prompt_hints(normalized, instruction_text)
+            refined_localization = localize_region(
+                prompt_text=instruction_text,
+                ts_length=ts_length,
+                llm_plan=normalized,
+            )
+            normalized.setdefault("localization", {}).update(refined_localization)
+            normalized.setdefault("parameters", {})["region"] = refined_localization["region"]
+            normalized.setdefault("execution", {}).setdefault("parameters", {})
+            normalized["execution"]["parameters"]["region"] = refined_localization["region"]
+            return normalize_llm_plan(normalized, ts_length=ts_length)
         except json.JSONDecodeError as e:
             raise ValueError(f"Failed to parse LLM response as JSON: {e}\nResponse: {content}")
     else:

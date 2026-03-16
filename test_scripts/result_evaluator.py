@@ -1,10 +1,17 @@
 import os
+import sys
 import json
 import logging
 from typing import Dict, List, Optional, Tuple, Any
 from pathlib import Path
 from datetime import datetime
 import numpy as np
+
+# 确保从项目根目录调用时，test_scripts/ 目录在 sys.path 中，
+# 使 `from config import ...` 能解析到 test_scripts/config.py
+_pkg_dir = Path(__file__).parent
+if str(_pkg_dir) not in sys.path:
+    sys.path.insert(0, str(_pkg_dir))
 
 from config import ChangeType, ScenarioType
 

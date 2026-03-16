@@ -1,0 +1,108 @@
+{
+  "run_timestamp_utc": "20260315_092042",
+  "sample_id": "003",
+  "task_type": "regime_switch",
+  "target_feature": "87",
+  "prompt": "据最新消息，预计在今晚深夜，相关匝道通行水平将突然切换至新的状态，并在一段时间内维持。",
+  "gt_region": [
+    127,
+    138
+  ],
+  "baseline_pipeline_v5": {
+    "tool_name": "hybrid_up",
+    "llm_region": [
+      116,
+      138
+    ],
+    "metrics": {
+      "t_iou": 0.5217391304347826,
+      "feature_accuracy": 1.0,
+      "mse_edit_region": 0.05357581377029419,
+      "mae_edit_region": 0.2149876356124878,
+      "mse_preserve_region": 0.0004288548952899873,
+      "mae_preserve_region": 0.004712705500423908,
+      "editability_score": 0.3481272611540023,
+      "preservability_score": 0.9857104143073915
+    }
+  },
+  "step_shift_sweep": [
+    {
+      "shift_factor": 1.0,
+      "metrics": {
+        "t_iou": 1.0,
+        "editability_score": 0.5981314179362625,
+        "preservability_score": 1.0,
+        "mse_edit_region": 0.020321661606431007,
+        "mse_preserve_region": 0.0
+      },
+      "edit_log": "[step_shift] region=[127,138], level_shift=-0.032"
+    },
+    {
+      "shift_factor": 1.5,
+      "metrics": {
+        "t_iou": 1.0,
+        "editability_score": 0.6402092596481628,
+        "preservability_score": 1.0,
+        "mse_edit_region": 0.016396310180425644,
+        "mse_preserve_region": 0.0
+      },
+      "edit_log": "[step_shift] region=[127,138], level_shift=-0.048"
+    },
+    {
+      "shift_factor": 2.0,
+      "metrics": {
+        "t_iou": 1.0,
+        "editability_score": 0.682287101360063,
+        "preservability_score": 1.0,
+        "mse_edit_region": 0.012900657951831818,
+        "mse_preserve_region": 0.0
+      },
+      "edit_log": "[step_shift] region=[127,138], level_shift=-0.063"
+    },
+    {
+      "shift_factor": 2.5,
+      "metrics": {
+        "t_iou": 1.0,
+        "editability_score": 0.7243649204807554,
+        "preservability_score": 1.0,
+        "mse_edit_region": 0.009834705851972103,
+        "mse_preserve_region": 0.0
+      },
+      "edit_log": "[step_shift] region=[127,138], level_shift=-0.079"
+    },
+    {
+      "shift_factor": 3.0,
+      "metrics": {
+        "t_iou": 1.0,
+        "editability_score": 0.7664426944190319,
+        "preservability_score": 1.0,
+        "mse_edit_region": 0.007198451552540064,
+        "mse_preserve_region": 0.0
+      },
+      "edit_log": "[step_shift] region=[127,138], level_shift=-0.095"
+    },
+    {
+      "shift_factor": 4.0,
+      "metrics": {
+        "t_iou": 1.0,
+        "editability_score": 0.8505983326604165,
+        "preservability_score": 1.0,
+        "mse_edit_region": 0.0032150393817573786,
+        "mse_preserve_region": 0.0
+      },
+      "edit_log": "[step_shift] region=[127,138], level_shift=-0.127"
+    }
+  ],
+  "best_step_shift": {
+    "shift_factor": 4.0,
+    "metrics": {
+      "t_iou": 1.0,
+      "editability_score": 0.8505983326604165,
+      "preservability_score": 1.0,
+      "mse_edit_region": 0.0032150393817573786,
+      "mse_preserve_region": 0.0
+    },
+    "edit_log": "[step_shift] region=[127,138], level_shift=-0.127",
+    "visualization_path": "results/experiments/step_tuning/traffic_regime_switch_20260315/20260315_092042_traffic_regime_switch_step_shift.png"
+  }
+}

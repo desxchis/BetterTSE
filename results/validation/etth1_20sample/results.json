@@ -1,0 +1,704 @@
+{
+  "results": [
+    {
+      "sample_id": "006",
+      "target_feature": "MULL",
+      "task_type": "heatwave_overload",
+      "prompt": "本市工业区迎来生产高峰，预计在今晚深夜，中压侧无功补偿装置将根据调度指令进行动态调整。",
+      "gt_region": [
+        140,
+        160
+      ],
+      "gt_duration": 20,
+      "gt_mag": 3.8493571281433105,
+      "llm_region": [
+        140,
+        170
+      ],
+      "llm_duration": 30,
+      "tool_name": "ensemble_smooth",
+      "math_shift": "N/A",
+      "edit_mag": 0.48298296332359314,
+      "pre_t_iou": 0.6666666666666666,
+      "bg_fidelity": {
+        "pass": true,
+        "max_err": 0.0
+      },
+      "metrics": {
+        "t_iou": 0.6774193548387096,
+        "feature_accuracy": 1.0,
+        "mse_edit_region": 22.562789916992188,
+        "mae_edit_region": 4.226933002471924,
+        "mse_preserve_region": 0.0008898616069927812,
+        "mae_preserve_region": 0.004722568206489086,
+        "editability_score": 0.0919584865853561,
+        "preservability_score": 0.9989854847524395
+      }
+    },
+    {
+      "sample_id": "007",
+      "target_feature": "HULL",
+      "task_type": "device_switch",
+      "prompt": "电力调度中心通报，从今天中午开始，高压侧系统因计划性维护重启，运行状态出现短暂波动后逐步趋于平稳。",
+      "gt_region": [
+        111,
+        128
+      ],
+      "gt_duration": 17,
+      "gt_mag": 1.7666653394699097,
+      "llm_region": [
+        24,
+        72
+      ],
+      "llm_duration": 48,
+      "tool_name": "ensemble_smooth",
+      "math_shift": "N/A",
+      "edit_mag": 0.9002755284309387,
+      "pre_t_iou": 0.0,
+      "bg_fidelity": {
+        "pass": true,
+        "max_err": 0.0
+      },
+      "metrics": {
+        "t_iou": 0.0,
+        "feature_accuracy": 1.0,
+        "mse_edit_region": 3.162566661834717,
+        "mae_edit_region": 1.6685172319412231,
+        "mse_preserve_region": 0.4630582928657532,
+        "mae_preserve_region": 0.24835187196731567,
+        "editability_score": 0.7292247139712056,
+        "preservability_score": 0.9596962213632653
+      }
+    },
+    {
+      "sample_id": "008",
+      "target_feature": "LULL",
+      "task_type": "market_trend",
+      "prompt": "交通部门发布通知，自今日清晨起，受节假日集中出行影响，多条主干道及周边支路车流量出现显著波动，现已逐步恢复平稳。",
+      "gt_region": [
+        41,
+        62
+      ],
+      "gt_duration": 21,
+      "gt_mag": 0.11410477012395859,
+      "llm_region": [
+        50,
+        65
+      ],
+      "llm_duration": 15,
+      "tool_name": "volatility_increase",
+      "math_shift": "N/A",
+      "edit_mag": 0.15000997483730316,
+      "pre_t_iou": 0.5,
+      "bg_fidelity": {
+        "pass": true,
+        "max_err": 0.0
+      },
+      "metrics": {
+        "t_iou": 0.52,
+        "feature_accuracy": 1.0,
+        "mse_edit_region": 0.04594685137271881,
+        "mae_edit_region": 0.15686997771263123,
+        "mse_preserve_region": 3.202474908903241e-05,
+        "mae_preserve_region": 0.0006117434822954237,
+        "editability_score": 0.88025193107665,
+        "preservability_score": 0.9995330202646199
+      }
+    },
+    {
+      "sample_id": "009",
+      "target_feature": "LULL",
+      "task_type": "market_trend",
+      "prompt": "本市气温自今日清晨起出现剧烈变化，导致居民区与商业建筑的空调及供暖系统需求发生显著调整，用电模式呈现阶段性波动。",
+      "gt_region": [
+        32,
+        43
+      ],
+      "gt_duration": 11,
+      "gt_mag": 0.24157387018203735,
+      "llm_region": [
+        20,
+        80
+      ],
+      "llm_duration": 60,
+      "tool_name": "season_enhance",
+      "math_shift": "N/A",
+      "edit_mag": 0.4341035485267639,
+      "pre_t_iou": 0.18333333333333332,
+      "bg_fidelity": {
+        "pass": true,
+        "max_err": 0.0
+      },
+      "metrics": {
+        "t_iou": 0.19672131147540983,
+        "feature_accuracy": 1.0,
+        "mse_edit_region": 0.9492208361625671,
+        "mae_edit_region": 0.9515426754951477,
+        "mse_preserve_region": 0.050579387694597244,
+        "mae_preserve_region": 0.09602785855531693,
+        "editability_score": 0.25602608064289134,
+        "preservability_score": 0.9249195814999119
+      }
+    },
+    {
+      "sample_id": "010",
+      "target_feature": "LUFL",
+      "task_type": "device_switch",
+      "prompt": "电力调度中心发布通知，预计在今晚深夜，城西工业区将按计划进行设备轮换操作，部分生产线将切换至备用供电模式。",
+      "gt_region": [
+        122,
+        136
+      ],
+      "gt_duration": 14,
+      "gt_mag": 1.1151970624923706,
+      "llm_region": [
+        80,
+        96
+      ],
+      "llm_duration": 16,
+      "tool_name": "spike_inject",
+      "math_shift": "N/A",
+      "edit_mag": 1.2510626316070557,
+      "pre_t_iou": 0.0,
+      "bg_fidelity": {
+        "pass": true,
+        "max_err": 0.0
+      },
+      "metrics": {
+        "t_iou": 0.0,
+        "feature_accuracy": 1.0,
+        "mse_edit_region": 1.235041856765747,
+        "mae_edit_region": 1.0408506393432617,
+        "mse_preserve_region": 0.24062545597553253,
+        "mae_preserve_region": 0.1130903959274292,
+        "editability_score": 0.7350851100897295,
+        "preservability_score": 0.971216494802821
+      }
+    },
+    {
+      "sample_id": "011",
+      "target_feature": "HUFL",
+      "task_type": "device_switch",
+      "prompt": "电力调度中心通报，自今日清晨起，主网高压侧因系统保护性重置，运行状态出现短暂波动，现已逐步恢复正常。",
+      "gt_region": [
+        40,
+        56
+      ],
+      "gt_duration": 16,
+      "gt_mag": 4.661692142486572,
+      "llm_region": [
+        30,
+        45
+      ],
+      "llm_duration": 15,
+      "tool_name": "spike_inject",
+      "math_shift": "N/A",
+      "edit_mag": 1.815038800239563,
+      "pre_t_iou": 0.19230769230769232,
+      "bg_fidelity": {
+        "pass": true,
+        "max_err": 0.0
+      },
+      "metrics": {
+        "t_iou": 0.2222222222222222,
+        "feature_accuracy": 1.0,
+        "mse_edit_region": 25.342838287353516,
+        "mae_edit_region": 4.703929901123047,
+        "mse_preserve_region": 0.3601763844490051,
+        "mae_preserve_region": 0.12483344227075577,
+        "editability_score": 0.6864882703268845,
+        "preservability_score": 0.9916799890240691
+      }
+    },
+    {
+      "sample_id": "012",
+      "target_feature": "HULL",
+      "task_type": "device_switch",
+      "prompt": "电力调度中心发布通知，从今天中午开始，高压侧系统执行了新的控制策略，导致运行状态出现阶段性调整，目前正逐步恢复稳定。",
+      "gt_region": [
+        105,
+        123
+      ],
+      "gt_duration": 18,
+      "gt_mag": 2.869269847869873,
+      "llm_region": [
+        85,
+        100
+      ],
+      "llm_duration": 15,
+      "tool_name": "spike_inject",
+      "math_shift": "N/A",
+      "edit_mag": 0.994757890701294,
+      "pre_t_iou": 0.0,
+      "bg_fidelity": {
+        "pass": true,
+        "max_err": 0.0
+      },
+      "metrics": {
+        "t_iou": 0.0,
+        "feature_accuracy": 1.0,
+        "mse_edit_region": 8.335619926452637,
+        "mae_edit_region": 2.7182557582855225,
+        "mse_preserve_region": 0.12393404543399811,
+        "mae_preserve_region": 0.0862506777048111,
+        "editability_score": 0.4927681183431658,
+        "preservability_score": 0.9839054535567389
+      }
+    },
+    {
+      "sample_id": "013",
+      "target_feature": "OT",
+      "task_type": "device_switch",
+      "prompt": "电力调度中心发布通知，预计在今晚深夜，主变压器将执行计划性系统重置，设备运行状态将经历一次短暂调整。",
+      "gt_region": [
+        141,
+        163
+      ],
+      "gt_duration": 22,
+      "gt_mag": 10.678548812866211,
+      "llm_region": [
+        165,
+        175
+      ],
+      "llm_duration": 10,
+      "tool_name": "spike_inject",
+      "math_shift": "N/A",
+      "edit_mag": 2.033409595489502,
+      "pre_t_iou": 0.0,
+      "bg_fidelity": {
+        "pass": true,
+        "max_err": 0.0
+      },
+      "metrics": {
+        "t_iou": 0.0,
+        "feature_accuracy": 1.0,
+        "mse_edit_region": 116.9219741821289,
+        "mae_edit_region": 10.214263916015625,
+        "mse_preserve_region": 0.27734917402267456,
+        "mae_preserve_region": 0.12032008916139603,
+        "editability_score": 0.43723068554833067,
+        "preservability_score": 0.9933707945429184
+      }
+    },
+    {
+      "sample_id": "014",
+      "target_feature": "HUFL",
+      "task_type": "heatwave_overload",
+      "prompt": "从今天中午开始，为配合国际体育赛事开幕式，全市照明及场馆设施全面启动，电网调度中心已进入特级保电状态。",
+      "gt_region": [
+        72,
+        88
+      ],
+      "gt_duration": 16,
+      "gt_mag": 24.166584014892578,
+      "llm_region": [
+        10,
+        22
+      ],
+      "llm_duration": 12,
+      "tool_name": "spike_inject",
+      "math_shift": "N/A",
+      "edit_mag": 6.246266841888428,
+      "pre_t_iou": 0.0,
+      "bg_fidelity": {
+        "pass": true,
+        "max_err": 0.0
+      },
+      "metrics": {
+        "t_iou": 0.0,
+        "feature_accuracy": 1.0,
+        "mse_edit_region": 609.71533203125,
+        "mae_edit_region": 22.745019912719727,
+        "mse_preserve_region": 4.557567119598389,
+        "mae_preserve_region": 0.4283154308795929,
+        "editability_score": -1.5342639494122285,
+        "preservability_score": 0.9522768342423789
+      }
+    },
+    {
+      "sample_id": "015",
+      "target_feature": "LULL",
+      "task_type": "market_trend",
+      "prompt": "本市体育中心举办大型国际赛事，从今天中午开始，周边商业区及居民用电需求出现显著变化，现已恢复常规供电模式。",
+      "gt_region": [
+        117,
+        125
+      ],
+      "gt_duration": 8,
+      "gt_mag": 0.12480496615171432,
+      "llm_region": [
+        91,
+        101
+      ],
+      "llm_duration": 10,
+      "tool_name": "spike_inject",
+      "math_shift": "N/A",
+      "edit_mag": 0.3530856966972351,
+      "pre_t_iou": 0.0,
+      "bg_fidelity": {
+        "pass": true,
+        "max_err": 0.0
+      },
+      "metrics": {
+        "t_iou": 0.0,
+        "feature_accuracy": 1.0,
+        "mse_edit_region": 0.02076837047934532,
+        "mae_edit_region": 0.11093774437904358,
+        "mse_preserve_region": 0.0077227698639035225,
+        "mae_preserve_region": 0.01929430104792118,
+        "editability_score": 0.9089181032137181,
+        "preservability_score": 0.984159029494905
+      }
+    },
+    {
+      "sample_id": "016",
+      "target_feature": "HUFL",
+      "task_type": "facility_shutdown",
+      "prompt": "电力调度中心发布通知，预计在今晚深夜，城西工业区将按计划进行年度设备维护，届时相关供电线路将暂停运行。",
+      "gt_region": [
+        120,
+        140
+      ],
+      "gt_duration": 20,
+      "gt_mag": 2.591231107711792,
+      "llm_region": [
+        100,
+        110
+      ],
+      "llm_duration": 10,
+      "tool_name": "spike_inject",
+      "math_shift": "N/A",
+      "edit_mag": 1.251384973526001,
+      "pre_t_iou": 0.0,
+      "bg_fidelity": {
+        "pass": true,
+        "max_err": 0.0
+      },
+      "metrics": {
+        "t_iou": 0.0,
+        "feature_accuracy": 1.0,
+        "mse_edit_region": 8.365966796875,
+        "mae_edit_region": 2.4869821071624756,
+        "mse_preserve_region": 0.15578237175941467,
+        "mae_preserve_region": 0.07318040728569031,
+        "editability_score": 0.8223330296581965,
+        "preservability_score": 0.9947720809034439
+      }
+    },
+    {
+      "sample_id": "017",
+      "target_feature": "OT",
+      "task_type": "facility_shutdown",
+      "prompt": "突发通报：从今天中午开始，因紧急故障导致设施关闭，变压器油温监测显示数值出现异常波动，目前正逐步恢复至正常范围。",
+      "gt_region": [
+        65,
+        80
+      ],
+      "gt_duration": 15,
+      "gt_mag": 4.032866954803467,
+      "llm_region": [
+        0,
+        15
+      ],
+      "llm_duration": 15,
+      "tool_name": "spike_inject",
+      "math_shift": "N/A",
+      "edit_mag": 1.250146508216858,
+      "pre_t_iou": 0.0,
+      "bg_fidelity": {
+        "pass": true,
+        "max_err": 0.0
+      },
+      "metrics": {
+        "t_iou": 0.0,
+        "feature_accuracy": 1.0,
+        "mse_edit_region": 20.343338012695312,
+        "mae_edit_region": 3.798375129699707,
+        "mse_preserve_region": 0.2265881896018982,
+        "mae_preserve_region": 0.10654657334089279,
+        "editability_score": 0.7672706740662277,
+        "preservability_score": 0.9934718106170468
+      }
+    },
+    {
+      "sample_id": "018",
+      "target_feature": "LULL",
+      "task_type": "device_switch",
+      "prompt": "电力调度中心发布通知，从今天中午开始，低压侧无功补偿装置执行了新的控制策略，系统运行状态出现阶段性调整。",
+      "gt_region": [
+        91,
+        111
+      ],
+      "gt_duration": 20,
+      "gt_mag": 0.28409892320632935,
+      "llm_region": [
+        96,
+        144
+      ],
+      "llm_duration": 48,
+      "tool_name": "season_reduce",
+      "math_shift": "N/A",
+      "edit_mag": 0.14603804051876068,
+      "pre_t_iou": 0.2830188679245283,
+      "bg_fidelity": {
+        "pass": true,
+        "max_err": 0.0
+      },
+      "metrics": {
+        "t_iou": 0.2962962962962963,
+        "feature_accuracy": 1.0,
+        "mse_edit_region": 0.04143679887056351,
+        "mae_edit_region": 0.16600437462329865,
+        "mse_preserve_region": 0.005963259842246771,
+        "mae_preserve_region": 0.023921892046928406,
+        "editability_score": 0.8241478982005648,
+        "preservability_score": 0.9746590112157132
+      }
+    },
+    {
+      "sample_id": "019",
+      "target_feature": "LUFL",
+      "task_type": "sensor_offline",
+      "prompt": "电力调度中心通报，自今日清晨起，低压侧监测系统受到外部电磁环境干扰，读数呈现无规律波动。",
+      "gt_region": [
+        25,
+        42
+      ],
+      "gt_duration": 17,
+      "gt_mag": 1.9363795518875122,
+      "llm_region": [
+        50,
+        110
+      ],
+      "llm_duration": 60,
+      "tool_name": "volatility_increase",
+      "math_shift": "N/A",
+      "edit_mag": 0.752937912940979,
+      "pre_t_iou": 0.0,
+      "bg_fidelity": {
+        "pass": true,
+        "max_err": 0.0
+      },
+      "metrics": {
+        "t_iou": 0.0,
+        "feature_accuracy": 1.0,
+        "mse_edit_region": 5.558477878570557,
+        "mae_edit_region": 1.9730595350265503,
+        "mse_preserve_region": 0.2777731716632843,
+        "mae_preserve_region": 0.25963377952575684,
+        "editability_score": 0.5439066909207708,
+        "preservability_score": 0.9399829414417259
+      }
+    },
+    {
+      "sample_id": "020",
+      "target_feature": "LULL",
+      "task_type": "facility_shutdown",
+      "prompt": "电力公司发布通知，从今天中午开始，因例行安全检查，部分区域设备进入停运状态，运行参数出现显著波动。",
+      "gt_region": [
+        72,
+        87
+      ],
+      "gt_duration": 15,
+      "gt_mag": 1.84141206741333,
+      "llm_region": [
+        100,
+        120
+      ],
+      "llm_duration": 20,
+      "tool_name": "volatility_increase",
+      "math_shift": "N/A",
+      "edit_mag": 0.16746902465820312,
+      "pre_t_iou": 0.0,
+      "bg_fidelity": {
+        "pass": true,
+        "max_err": 0.0
+      },
+      "metrics": {
+        "t_iou": 0.0,
+        "feature_accuracy": 1.0,
+        "mse_edit_region": 3.4331727027893066,
+        "mae_edit_region": 1.7263238430023193,
+        "mse_preserve_region": 0.004706807900220156,
+        "mae_preserve_region": 0.019030572846531868,
+        "editability_score": 0.3171187000150898,
+        "preservability_score": 0.9924720831623943
+      }
+    },
+    {
+      "sample_id": "021",
+      "target_feature": "OT",
+      "task_type": "heatwave_overload",
+      "prompt": "本市正经历持续极端高温天气，自今日清晨起，变压器油温监测系统显示其温度已显著超出常规运行区间，目前正逐步恢复至正常水平。",
+      "gt_region": [
+        44,
+        59
+      ],
+      "gt_duration": 15,
+      "gt_mag": 4.155215740203857,
+      "llm_region": [
+        30,
+        70
+      ],
+      "llm_duration": 40,
+      "tool_name": "spike_inject",
+      "math_shift": "N/A",
+      "edit_mag": 1.509832739830017,
+      "pre_t_iou": 0.375,
+      "bg_fidelity": {
+        "pass": true,
+        "max_err": 0.0
+      },
+      "metrics": {
+        "t_iou": 0.3902439024390244,
+        "feature_accuracy": 1.0,
+        "mse_edit_region": 3.68650484085083,
+        "mae_edit_region": 1.6262776851654053,
+        "mse_preserve_region": 0.07292795926332474,
+        "mae_preserve_region": 0.0668463185429573,
+        "editability_score": 0.9067822086999626,
+        "preservability_score": 0.9961683873375663
+      }
+    },
+    {
+      "sample_id": "022",
+      "target_feature": "HUFL",
+      "task_type": "market_trend",
+      "prompt": "交通部门发布通告，自今日清晨起，受节假日集中出行影响，多条高速公路及城际快速路车流量出现显著波动，午后已逐步恢复平稳。",
+      "gt_region": [
+        46,
+        68
+      ],
+      "gt_duration": 22,
+      "gt_mag": 1.8062222003936768,
+      "llm_region": [
+        96,
+        106
+      ],
+      "llm_duration": 10,
+      "tool_name": "spike_inject",
+      "math_shift": "N/A",
+      "edit_mag": 1.4282559156417847,
+      "pre_t_iou": 0.0,
+      "bg_fidelity": {
+        "pass": true,
+        "max_err": 0.0
+      },
+      "metrics": {
+        "t_iou": 0.0,
+        "feature_accuracy": 1.0,
+        "mse_edit_region": 4.6808905601501465,
+        "mae_edit_region": 1.7276908159255981,
+        "mse_preserve_region": 0.13683250546455383,
+        "mae_preserve_region": 0.08451218158006668,
+        "editability_score": 0.9026653061450367,
+        "preservability_score": 0.9952387503335174
+      }
+    },
+    {
+      "sample_id": "023",
+      "target_feature": "MULL",
+      "task_type": "market_trend",
+      "prompt": "交通部门发布通知，预计在今晚深夜，受节假日出行高峰影响，部分路段车流量将出现显著变化，随后逐步恢复常态。",
+      "gt_region": [
+        128,
+        150
+      ],
+      "gt_duration": 22,
+      "gt_mag": 0.714701235294342,
+      "llm_region": [
+        100,
+        114
+      ],
+      "llm_duration": 14,
+      "tool_name": "spike_inject",
+      "math_shift": "N/A",
+      "edit_mag": 0.7202799916267395,
+      "pre_t_iou": 0.0,
+      "bg_fidelity": {
+        "pass": true,
+        "max_err": 0.0
+      },
+      "metrics": {
+        "t_iou": 0.0,
+        "feature_accuracy": 1.0,
+        "mse_edit_region": 0.7328839302062988,
+        "mae_edit_region": 0.6836273074150085,
+        "mse_preserve_region": 0.058932773768901825,
+        "mae_preserve_region": 0.0596681647002697,
+        "editability_score": 0.8854703764209652,
+        "preservability_score": 0.9900036578869059
+      }
+    },
+    {
+      "sample_id": "024",
+      "target_feature": "LUFL",
+      "task_type": "device_switch",
+      "prompt": "自今日清晨起，因控制策略优化调整，低压侧运行状态出现短暂波动，随后逐步趋于平稳。",
+      "gt_region": [
+        45,
+        66
+      ],
+      "gt_duration": 21,
+      "gt_mag": 1.3278700113296509,
+      "llm_region": [
+        20,
+        60
+      ],
+      "llm_duration": 40,
+      "tool_name": "ensemble_smooth",
+      "math_shift": "N/A",
+      "edit_mag": 0.5364495515823364,
+      "pre_t_iou": 0.32608695652173914,
+      "bg_fidelity": {
+        "pass": true,
+        "max_err": 0.0
+      },
+      "metrics": {
+        "t_iou": 0.3404255319148936,
+        "feature_accuracy": 1.0,
+        "mse_edit_region": 1.8971991539001465,
+        "mae_edit_region": 1.268952488899231,
+        "mse_preserve_region": 0.13823764026165009,
+        "mae_preserve_region": 0.10109946131706238,
+        "editability_score": 0.6914025681951432,
+        "preservability_score": 0.975413552207645
+      }
+    },
+    {
+      "sample_id": "025",
+      "target_feature": "HUFL",
+      "task_type": "facility_shutdown",
+      "prompt": "电力调度中心通报，从今天中午开始，因例行安全大检查，部分高压设备按计划停运，负荷水平出现显著波动。",
+      "gt_region": [
+        60,
+        71
+      ],
+      "gt_duration": 11,
+      "gt_mag": 1.8741455078125,
+      "llm_region": [
+        96,
+        126
+      ],
+      "llm_duration": 30,
+      "tool_name": "volatility_increase",
+      "math_shift": "N/A",
+      "edit_mag": 0.968926191329956,
+      "pre_t_iou": 0.0,
+      "bg_fidelity": {
+        "pass": true,
+        "max_err": 0.0
+      },
+      "metrics": {
+        "t_iou": 0.0,
+        "feature_accuracy": 1.0,
+        "mse_edit_region": 4.218997478485107,
+        "mae_edit_region": 1.7291332483291626,
+        "mse_preserve_region": 0.25297144055366516,
+        "mae_preserve_region": 0.16148769855499268,
+        "editability_score": 0.8444884136155777,
+        "preservability_score": 0.9854764181949986
+      }
+    }
+  ]
+}
