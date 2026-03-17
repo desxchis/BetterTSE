@@ -5,9 +5,10 @@
 This document consolidates the current forecast-revision evidence chain into one place:
 
 - `Weather v4` as the controlled proof point
-- `XTraffic v2 narrowed` as the best pure real-data positive-transfer checkpoint
+- `XTraffic v2 narrowed` as the best pure real-data positive-transfer checkpoint and main real benchmark
 - `XTraffic v2 nonapp` as the real-data gate evaluation checkpoint
 - `MTBench finance v2` as the native-text real complement
+- `CiK` as the benchmark-design template rather than the main empirical battlefield
 
 The current overall judgment is:
 
@@ -16,6 +17,7 @@ The current overall judgment is:
 - the framework transfers to real data
 - real `revision_needed` behavior is now verified on real no-op samples
 - the framework also transfers to native text + time-series data once the revision schema matches the domain
+- the benchmark plan should now stay role-disciplined rather than expanding broadly
 
 ## Primary References
 
@@ -26,6 +28,24 @@ The current overall judgment is:
 - [XTraffic v2 nonapp milestone](/root/autodl-tmp/BetterTSE-main/results/forecast_revision/milestones/20260317_xtraffic_v2_nonapp/README.md)
 - [MTBench finance v2 milestone](/root/autodl-tmp/BetterTSE-main/results/forecast_revision/milestones/20260317_mtbench_v2_finance/README.md)
 - [MTBench finance v2 100-sample milestone](/root/autodl-tmp/BetterTSE-main/results/forecast_revision/milestones/20260317_mtbench_v2_100/README.md)
+
+## Role Summary
+
+The paper-facing dataset split should now be read as:
+
+1. `XTraffic`
+   - main benchmark
+   - main real empirical battlefield for localized forecast revision
+2. `MTBench`
+   - realism / native-text complement
+3. `CiK`
+   - benchmark-design and evaluation template
+4. `Time-MMD` or `Time-IMM`
+   - optional later extension, not current core evidence
+5. `CGTSF` and pure traffic-only benchmarks
+   - lightweight complement or appendix material
+
+This role split is important because the main current risk is paper dilution, not insufficient data diversity.
 
 ## Controlled Benchmark: Weather v4
 
@@ -74,6 +94,7 @@ Takeaway:
 - real-data positive transfer is established on `dlinear_like`
 - localized revision clearly beats global revision
 - current best pure real-data positive checkpoint is still `XTraffic v2 narrowed`
+- this is the main real benchmark that should anchor the empirical story
 
 ## Real Data Gate Evaluation: XTraffic v2 Non-Applicable
 
@@ -131,8 +152,9 @@ The finance line uses domain-matched revision semantics:
 
 Takeaway:
 
-- MTBench becomes positive once the revision schema matches the finance domain.
-- This confirms the framework can extend beyond structured incident context to native long-text financial news.
+- MTBench becomes positive once the revision schema matches the finance domain
+- this confirms the framework can extend beyond structured incident context to native long-text financial news
+- MTBench should be read as realism support, not as the main benchmark replacing `XTraffic`
 
 ## Real Text Complement: MTBench Finance v2 (100 Samples)
 
@@ -162,9 +184,9 @@ Sample mix:
 
 Takeaway:
 
-- The MTBench finance line remains positive beyond the 10-sample smoke subset.
-- `localized_full_revision` continues to beat `global_revision_only` on both baselines.
-- The native-text complement is now stable enough to treat as part of the main evidence chain.
+- the MTBench finance line remains positive beyond the 10-sample smoke subset
+- `localized_full_revision` continues to beat `global_revision_only` on both baselines
+- the native-text complement is now stable enough to treat as part of the main evidence chain
 
 ## Current Evidence Chain
 
@@ -181,6 +203,44 @@ The current evidence chain is now:
 5. `MTBench finance v2 (100 samples)`
    - proves the native-text complement is stable beyond a tiny smoke subset
 
+## Calibration Progress
+
+A first runnable calibration scaffold is now in place.
+
+What has already been added:
+
+- explicit `edit_spec` outputs and GT extraction
+- calibration metrics in the main runner
+- a dedicated calibration benchmark script for oracle-region / oracle-intent analysis
+
+Current interpretation:
+
+- the main open problem remains `how much to edit`
+- but it is now isolated as a measurable subproblem rather than a vague planner field
+- the next experiments should use this scaffold on `Weather`, then `XTraffic`, then `MTBench`
+
+## Calibration Framework Progress
+
+The repo now also has a config-driven experiment assembly layer for calibration work.
+
+Primary additions:
+
+- framework runner:
+  - [prepare_forecast_revision_calibration_framework.py](/root/autodl-tmp/BetterTSE-main/test_scripts/prepare_forecast_revision_calibration_framework.py)
+- config examples:
+  - [weather_dlinear_v2.json](/root/autodl-tmp/BetterTSE-main/configs/forecast_revision_calibration/weather_dlinear_v2.json)
+  - [xtraffic_dlinear_v2.json](/root/autodl-tmp/BetterTSE-main/configs/forecast_revision_calibration/xtraffic_dlinear_v2.json)
+  - [mtbench_dlinear_v2_100.json](/root/autodl-tmp/BetterTSE-main/configs/forecast_revision_calibration/mtbench_dlinear_v2_100.json)
+
+This layer standardizes:
+
+- stage naming
+- output directory layout
+- learned-calibrator train/eval dependency wiring
+- dry-run planning before actual execution
+
+This is the right immediate emphasis when compute is not the bottleneck to solve.
+
 ## Recommended Breakpoint
 
 At this breakpoint, the line should be treated as established enough to stop redesigning the framework.
@@ -193,12 +253,14 @@ What is established:
 - real gate viability
 - native-text real-data viability
 - native-text real-data stability beyond smoke scale
+- a clear dataset-role split that keeps the paper narrative focused
 
 What remains open:
 
 - stronger real-data calibration
 - cleaner real supervision beyond weak-label incident alignment
 - larger-scale MTBench evaluation beyond the current smoke subset
+- a cleaner solution to `how much to edit`
 
 ## Recommended Next Step
 
@@ -206,10 +268,8 @@ Do not keep changing the framework.
 
 The disciplined next move is:
 
-1. keep `Weather v4` as the controlled proof point
-2. keep `XTraffic v2 narrowed` as the best real positive-transfer checkpoint
-3. keep `XTraffic v2 nonapp` as the real gate checkpoint
-4. keep `MTBench finance v2` as the native-text checkpoint
-5. then either:
-   - scale MTBench beyond smoke size, or
-   - add MTBench case studies / visualizations
+1. keep `XTraffic` as the main benchmark
+2. keep `MTBench` as the realism / native-text complement
+3. keep `CiK` as the benchmark-design template rather than a parallel main benchmark
+4. start calibration-focused work on `how much to edit`
+5. only after that, consider one broader extension dataset such as `Time-MMD` or `Time-IMM`

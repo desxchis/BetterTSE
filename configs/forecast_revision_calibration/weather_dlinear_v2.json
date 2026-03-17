@@ -1,0 +1,44 @@
+{
+  "experiment_id": "weather_dlinear_v2",
+  "benchmark_path": "results/forecast_revision/benchmarks/weather_dlinear_v2/forecast_revision_Weather_dlinear_like_30.json",
+  "output_root": "results/forecast_revision/calibration/framework_plans/weather_dlinear_v2",
+  "train_stage": {
+    "enabled": true,
+    "name": "train_learned_linear",
+    "output_subdir": "train_learned_linear",
+    "train_ratio": 0.8,
+    "seed": 7,
+    "alpha": 1.0
+  },
+  "oracle_stage": {
+    "enabled": true,
+    "name": "oracle_benchmark_heldout",
+    "output_subdir": "oracle_benchmark_heldout",
+    "benchmark_source": "heldout",
+    "methods": [
+      "text_direct_numeric",
+      "discrete_strength_table",
+      "rule_local_stats",
+      "learned_linear",
+      "oracle_calibration"
+    ],
+    "calibration_model_source": "train_model"
+  },
+  "semi_oracle_stages": [
+    {
+      "enabled": true,
+      "name": "semi_oracle_rule",
+      "output_subdir": "semi_oracle_rule",
+      "benchmark_source": "benchmark",
+      "calibration_strategy": "rule_local_stats"
+    },
+    {
+      "enabled": true,
+      "name": "semi_oracle_learned_heldout",
+      "output_subdir": "semi_oracle_learned_heldout",
+      "benchmark_source": "heldout",
+      "calibration_strategy": "learned_linear",
+      "calibration_model_source": "train_model"
+    }
+  ]
+}

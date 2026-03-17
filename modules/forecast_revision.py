@@ -5,6 +5,19 @@ from typing import Any, Dict, List, Tuple
 
 import numpy as np
 
+from modules.edit_spec_learned import load_model as load_edit_spec_model, predict_with_model
+
+
+CALIBRATION_SPEC_KEYS = (
+    "delta_level_z",
+    "slope_ratio",
+    "amp_ratio",
+    "vol_ratio",
+    "duration_ratio",
+    "recovery_ratio",
+    "floor_ratio",
+)
+
 
 @dataclass
 class ForecastRevisionSample:
@@ -27,6 +40,7 @@ class ForecastRevisionSample:
     duration_bucket_gt: str
     revision_operator_family: str
     revision_operator_params: Dict[str, Any]
+    edit_spec_gt: Dict[str, Any] | None = None
     timestamp: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
@@ -44,6 +58,92 @@ def summarize_stats(values: np.ndarray) -> Dict[str, float]:
         "min": float(np.min(finite)),
         "max": float(np.max(finite)),
     }
+
+
+def _safe_div(num: float, den: float, fallback: float = 1.0) -> float:
+    if abs(den) < 1e-8:
+        return float(fallback)
+    return float(num / den)
+
+
+def _clamp(value: float, lo: float, hi: float) -> float:
+    return float(max(lo, min(hi, value)))
+
+
+def _estimate_slope(values: np.ndarray) -> float:
+    arr = np.asarray(values, dtype=np.float64)
+    if arr.size < 2:
+        return 0.0
+    x = np.arange(arr.size, dtype=np.float64)
+    A = np.column_stack([x, np.ones_like(x)])
+    slope, _ = np.linalg.lstsq(A, arr, rcond=None)[0]
+    return float(slope)
+
+
+def _effective_region_bounds(region: List[int], horizon: int) -> Tuple[int, int]:
+    start = max(0, min(int(region[0]), horizon))
+    end = max(start, min(int(region[1]), horizon))
+    return start, end
+
+
+def _local_context(region: List[int], history_ts: np.ndarray, base_forecast: np.ndarray) -> Dict[str, Any]:
+    forecast_arr = np.asarray(base_forecast, dtype=np.float64)
+    horizon = len(forecast_arr)
+    start, end = _effective_region_bounds(region, horizon)
+    local_forecast = forecast_arr[start:end]
+    if local_forecast.size == 0:
+        local_forecast = forecast_arr
+    history_stats = summarize_stats(history_ts)
+    forecast_stats = summarize_stats(forecast_arr)
+    local_stats = summarize_stats(local_forecast)
+    scale = max(history_stats["std"], forecast_stats["std"], local_stats["std"], 1e-3)
+    return {
+        "start": start,
+        "end": end,
+        "region_len": max(1, end - start),
+        "history_stats": history_stats,
+        "forecast_stats": forecast_stats,
+        "local_stats": local_stats,
+        "local_forecast": local_forecast,
+        "scale": float(scale),
+    }
+
+
+def _zero_edit_spec(strategy: str = "none") -> Dict[str, Any]:
+    spec = {key: 0.0 for key in CALIBRATION_SPEC_KEYS}
+    spec.update({"strategy": strategy})
+    return spec
+
+
+def _duration_ratio_from_bucket(bucket: str) -> float:
+    return {
+        "none": 0.0,
+        "short": 0.55,
+        "medium": 0.8,
+        "long": 1.0,
+        "full_horizon": 1.0,
+    }.get(bucket, 0.8)
+
+
+def _strength_scalar(strength: str) -> float:
+    return {
+        "none": 0.0,
+        "weak": 0.8,
+        "medium": 1.0,
+        "strong": 1.45,
+    }.get(strength, 1.0)
+
+
+def _text_intensity_modifier(text: str) -> float:
+    normalized = text or ""
+    modifier = 1.0
+    if any(token in normalized for token in ("略微", "轻微", "稍微", "小幅", "温和")):
+        modifier *= 0.75
+    if any(token in normalized for token in ("明显", "显著", "大幅", "剧烈", "强烈")):
+        modifier *= 1.25
+    if any(token in normalized for token in ("迅速", "快速", "短时冲高", "短时下探")):
+        modifier *= 1.1
+    return float(modifier)
 
 
 def infer_future_bucket(text: str) -> str:
@@ -170,51 +270,262 @@ def localize_future_region(bucket: str, duration_bucket: str, horizon: int) -> L
     return [int(start), int(end)]
 
 
+def extract_gt_edit_spec(
+    sample: Dict[str, Any],
+    history_ts: np.ndarray | None = None,
+    base_forecast: np.ndarray | None = None,
+) -> Dict[str, Any]:
+    if sample.get("edit_spec_gt"):
+        spec = dict(sample["edit_spec_gt"])
+        spec.setdefault("strategy", "gt")
+        return spec
+
+    history_arr = np.asarray(history_ts if history_ts is not None else sample["history_ts"], dtype=np.float64)
+    base_arr = np.asarray(base_forecast if base_forecast is not None else sample["base_forecast"], dtype=np.float64)
+    target_arr = np.asarray(sample["revision_target"], dtype=np.float64)
+    mask = np.asarray(sample["edit_mask_gt"], dtype=np.float64) > 0.5
+    idx = np.where(mask)[0]
+    if idx.size == 0:
+        return _zero_edit_spec(strategy="gt")
+
+    region = [int(idx[0]), int(idx[-1] + 1)]
+    ctx = _local_context(region, history_arr, base_arr)
+    start, end = ctx["start"], ctx["end"]
+    scale = ctx["scale"]
+    region_len = ctx["region_len"]
+    shape = str(sample.get("shape_gt", "none"))
+
+    local_base = base_arr[start:end]
+    local_target = target_arr[start:end]
+    local_delta = local_target - local_base
+    params = (sample.get("revision_operator_params") or {}).get("params", {})
+
+    base_slope = _estimate_slope(local_base)
+    target_slope = _estimate_slope(local_target)
+    tail_len = max(2, region_len // 3)
+    recovery_slope = _estimate_slope(local_target[-tail_len:]) if local_target.size >= tail_len else 0.0
+    amplitude = abs(float(params.get("amplitude", np.max(np.abs(local_delta)) if local_delta.size else 0.0)))
+
+    spec = _zero_edit_spec(strategy="gt")
+    spec["delta_level_z"] = _clamp(float(np.mean(local_delta) / scale), -4.0, 4.0)
+    spec["duration_ratio"] = _clamp(_safe_div(float(params.get("duration", region_len)), float(region_len), fallback=1.0), 0.0, 1.0)
+    spec["recovery_ratio"] = _clamp(
+        float(params.get("recovery_rate", max(0.0, min(1.0, -recovery_slope / scale)))) if local_target.size else 0.0,
+        0.0,
+        1.0,
+    )
+
+    if shape in {"hump", "step", "plateau"}:
+        spec["amp_ratio"] = _clamp(_safe_div(amplitude, scale, fallback=1.0), 0.0, 4.0)
+        spec["slope_ratio"] = _clamp(abs(_safe_div(target_slope, base_slope, fallback=1.0)), 0.0, 4.0)
+    elif shape == "flatline":
+        floor_value = float(params.get("floor_value", np.min(local_target) if local_target.size else ctx["local_stats"]["mean"]))
+        spec["delta_level_z"] = _clamp(float(np.min(local_delta) / scale) if local_delta.size else spec["delta_level_z"], -4.0, 0.0)
+        spec["floor_ratio"] = _clamp(float((ctx["local_stats"]["mean"] - floor_value) / scale), 0.0, 4.0)
+        spec["amp_ratio"] = 0.0
+        spec["slope_ratio"] = 0.0
+        spec["vol_ratio"] = 0.0
+    elif shape == "irregular_noise":
+        spec["amp_ratio"] = 1.0
+        spec["vol_ratio"] = _clamp(float(params.get("volatility_scale", 1.0)), 0.0, 4.0)
+        spec["recovery_ratio"] = 0.0
+    return spec
+
+
+def predict_edit_spec(
+    intent: Dict[str, Any],
+    region: List[int],
+    history_ts: np.ndarray,
+    base_forecast: np.ndarray,
+    context_text: str = "",
+    strategy: str = "rule_local_stats",
+    sample: Dict[str, Any] | None = None,
+    model_path: str | None = None,
+) -> Dict[str, Any]:
+    shape = intent.get("shape")
+    if shape in {None, "none"}:
+        return _zero_edit_spec(strategy=strategy)
+    if strategy == "oracle_from_sample":
+        if sample is None:
+            raise ValueError("sample is required for oracle_from_sample strategy")
+        return extract_gt_edit_spec(sample, history_ts=history_ts, base_forecast=base_forecast)
+    if strategy == "learned_linear":
+        if not model_path:
+            raise ValueError("model_path is required for learned_linear strategy")
+        model = load_edit_spec_model(model_path)
+        return predict_with_model(model, intent, region, history_ts, base_forecast, context_text)
+
+    ctx = _local_context(region, history_ts, base_forecast)
+    strength = str(intent.get("strength", "medium"))
+    duration_bucket = str(intent.get("duration", "medium"))
+    strength_scale = _strength_scalar(strength)
+    duration_ratio = _duration_ratio_from_bucket(duration_bucket)
+    text_modifier = _text_intensity_modifier(context_text)
+    shape = str(shape)
+
+    spec = _zero_edit_spec(strategy=strategy)
+    spec["duration_ratio"] = duration_ratio
+
+    if strategy in {"discrete_strength_table", "text_direct_numeric"}:
+        magnitude = strength_scale if strategy == "discrete_strength_table" else strength_scale * text_modifier
+        if shape == "flatline":
+            spec.update({
+                "delta_level_z": -1.25 * magnitude,
+                "amp_ratio": 0.2,
+                "recovery_ratio": 0.0,
+                "floor_ratio": 1.25 * magnitude,
+            })
+        elif shape == "irregular_noise":
+            spec.update({
+                "delta_level_z": 0.0,
+                "amp_ratio": 1.0,
+                "vol_ratio": 1.0 + 0.45 * magnitude,
+                "recovery_ratio": 0.0,
+            })
+        elif shape == "hump":
+            spec.update({
+                "delta_level_z": 0.9 * magnitude,
+                "amp_ratio": 1.2,
+                "slope_ratio": 1.2,
+                "recovery_ratio": 0.7,
+            })
+        elif shape == "plateau":
+            spec.update({
+                "delta_level_z": 1.0 * magnitude,
+                "amp_ratio": 1.1,
+                "slope_ratio": 1.0,
+                "recovery_ratio": 0.35,
+            })
+        else:
+            spec.update({
+                "delta_level_z": 1.0 * magnitude,
+                "amp_ratio": 1.0,
+                "slope_ratio": 1.0,
+                "recovery_ratio": 0.0,
+            })
+        return spec
+
+    local_trend = _estimate_slope(ctx["local_forecast"])
+    trend_scale = 1.0 + min(abs(local_trend) / max(ctx["scale"], 1e-6), 0.5)
+    magnitude = strength_scale * text_modifier * trend_scale
+
+    if shape == "flatline":
+        spec.update({
+            "delta_level_z": -1.35 * magnitude,
+            "amp_ratio": 0.15,
+            "vol_ratio": 0.5,
+            "recovery_ratio": 0.0,
+            "floor_ratio": 1.1 * magnitude,
+        })
+    elif shape == "irregular_noise":
+        spec.update({
+            "delta_level_z": 0.0,
+            "amp_ratio": 1.0,
+            "vol_ratio": 1.2 + 0.55 * magnitude,
+            "recovery_ratio": 0.0,
+        })
+    elif shape == "hump":
+        spec.update({
+            "delta_level_z": 0.95 * magnitude,
+            "amp_ratio": 1.25 + 0.1 * max(0.0, magnitude - 1.0),
+            "slope_ratio": 1.15 + 0.1 * magnitude,
+            "recovery_ratio": 0.75,
+        })
+    elif shape == "plateau":
+        spec.update({
+            "delta_level_z": 1.0 * magnitude,
+            "amp_ratio": 1.1,
+            "slope_ratio": 1.0 + 0.05 * magnitude,
+            "recovery_ratio": 0.35,
+        })
+    else:
+        spec.update({
+            "delta_level_z": 1.05 * magnitude,
+            "amp_ratio": 1.0,
+            "slope_ratio": 1.0,
+            "recovery_ratio": 0.0,
+        })
+    return spec
+
+
+def project_edit_spec_to_params(
+    edit_spec: Dict[str, Any],
+    intent: Dict[str, Any],
+    region: List[int],
+    history_ts: np.ndarray,
+    base_forecast: np.ndarray,
+    executor_family: str = "math",
+) -> Dict[str, Any]:
+    ctx = _local_context(region, history_ts, base_forecast)
+    region_len = ctx["region_len"]
+    scale = ctx["scale"]
+    local_stats = ctx["local_stats"]
+    forecast_stats = ctx["forecast_stats"]
+
+    duration = int(round(max(1.0, region_len * max(float(edit_spec.get("duration_ratio", 1.0)), 1e-3))))
+    duration = max(1, min(duration, region_len))
+    shape = intent.get("shape")
+
+    amplitude = abs(float(edit_spec.get("delta_level_z", 0.0))) * scale
+    amplitude *= max(float(edit_spec.get("amp_ratio", 1.0)), 1e-3)
+    recovery_rate = _clamp(float(edit_spec.get("recovery_ratio", 0.35)), 0.0, 1.0)
+    vol_ratio = max(float(edit_spec.get("vol_ratio", 1.0)), 0.0)
+    floor_ratio = max(float(edit_spec.get("floor_ratio", 0.0)), 0.0)
+
+    params = {
+        "amplitude": float(amplitude),
+        "duration": int(duration),
+        "onset_lag": 0,
+        "recovery_rate": float(recovery_rate),
+        "volatility_scale": float(max(1.0, vol_ratio)),
+        "executor_family": executor_family,
+    }
+    if shape == "flatline":
+        floor_value = float(local_stats["mean"] - max(floor_ratio, abs(float(edit_spec.get("delta_level_z", 0.0)))) * scale)
+        params["floor_value"] = floor_value
+    elif shape == "irregular_noise":
+        params["volatility_scale"] = float(max(1.05, vol_ratio))
+        params["amplitude"] = float(max(scale * 0.25, abs(float(edit_spec.get("delta_level_z", 0.0))) * scale))
+    elif shape == "step":
+        params["recovery_rate"] = float(recovery_rate)
+    elif shape == "plateau":
+        params["recovery_rate"] = float(max(0.15, recovery_rate))
+    elif shape == "hump":
+        params["recovery_rate"] = float(max(0.35, recovery_rate))
+
+    params["local_scale"] = float(scale)
+    params["local_mean"] = float(local_stats["mean"])
+    params["forecast_min"] = float(forecast_stats["min"])
+    return params
+
+
 def calibrate_revision(
     intent: Dict[str, Any],
     region: List[int],
     history_ts: np.ndarray,
     base_forecast: np.ndarray,
+    context_text: str = "",
+    strategy: str = "rule_local_stats",
+    sample: Dict[str, Any] | None = None,
+    model_path: str | None = None,
 ) -> Dict[str, Any]:
-    history_stats = summarize_stats(history_ts)
-    forecast_stats = summarize_stats(base_forecast)
-    start, end = int(region[0]), int(region[1])
-    local_forecast = np.asarray(base_forecast[max(0, start):max(0, end)], dtype=np.float64)
-    local_stats = summarize_stats(local_forecast if local_forecast.size > 0 else base_forecast)
-    strength = intent.get("strength", "medium")
-    shape = intent.get("shape")
-    region_len = max(1, int(region[1] - region[0]))
-    scale = max(history_stats["std"], forecast_stats["std"], local_stats["std"], 1e-3)
-
-    # Keep the calibrator close to benchmark operator generation for v1.
-    amplitude_factor = {
-        "hump": {"weak": 0.75, "medium": 1.0, "strong": 1.35},
-        "step": {"weak": 0.8, "medium": 1.0, "strong": 1.6},
-        "plateau": {"weak": 0.8, "medium": 1.0, "strong": 1.6},
-        "flatline": {"weak": 0.8, "medium": 1.0, "strong": 1.6},
-        "irregular_noise": {"weak": 0.25, "medium": 0.4, "strong": 0.55},
-    }.get(shape, {"weak": 0.6, "medium": 1.0, "strong": 1.4})
-    amplitude = float(scale * amplitude_factor.get(strength, amplitude_factor["medium"]))
-
-    params = {
-        "amplitude": amplitude,
-        "duration": int(region_len),
-        "onset_lag": 0,
-        "recovery_rate": 0.35,
-        "volatility_scale": 1.0,
-    }
-    if shape == "hump":
-        params["recovery_rate"] = 0.45
-    elif shape == "step":
-        params["recovery_rate"] = 0.0
-    elif shape == "plateau":
-        params["recovery_rate"] = 0.35
-    elif shape == "flatline":
-        flat_scale = max(forecast_stats["std"], 1e-3)
-        params["floor_value"] = float(forecast_stats["min"] - flat_scale * 1.2)
-    elif shape == "irregular_noise":
-        params["volatility_scale"] = {"weak": 1.15, "medium": 1.45, "strong": 1.8}.get(strength, 1.45)
-    return params
+    edit_spec = predict_edit_spec(
+        intent=intent,
+        region=region,
+        history_ts=history_ts,
+        base_forecast=base_forecast,
+        context_text=context_text,
+        strategy=strategy,
+        sample=sample,
+        model_path=model_path,
+    )
+    return project_edit_spec_to_params(
+        edit_spec=edit_spec,
+        intent=intent,
+        region=region,
+        history_ts=history_ts,
+        base_forecast=base_forecast,
+    )
 
 
 def apply_revision_profile(
@@ -226,38 +537,63 @@ def apply_revision_profile(
 ) -> Tuple[np.ndarray, np.ndarray]:
     edited = np.asarray(base_forecast, dtype=np.float64).copy()
     delta = np.zeros_like(edited)
-    start, end = int(region[0]), int(region[1])
-    start = max(0, min(start, len(edited)))
-    end = max(start, min(end, len(edited)))
+    start, end = _effective_region_bounds(region, len(edited))
     if end <= start:
         return edited, delta
 
-    length = end - start
-    x = np.linspace(-1.0, 1.0, length)
+    total_len = end - start
+    active_len = int(max(1, min(total_len, round(float(params.get("duration", total_len))))))
+    tail_len = max(0, total_len - active_len)
     amplitude = float(params.get("amplitude", 0.0))
     direction = -1.0 if intent.get("direction") == "down" else 1.0
     shape = intent.get("shape")
+    recovery_rate = _clamp(float(params.get("recovery_rate", 0.35)), 0.0, 1.0)
 
     if shape in {"none", None}:
         return edited, delta
-    if shape == "step":
-        profile = np.ones(length, dtype=np.float64)
-    elif shape == "plateau":
-        ramp = np.minimum(np.linspace(0.0, 1.0, length), np.linspace(1.0, 0.0, length))
-        profile = 0.6 + 0.4 * (ramp / max(np.max(ramp), 1e-6))
-    elif shape == "flatline":
-        floor_value = float(params.get("floor_value", np.min(edited[start:end]) - amplitude))
-        delta[start:end] = floor_value - edited[start:end]
-        edited[start:end] = floor_value
+
+    if shape == "flatline":
+        floor_value = float(params.get("floor_value", np.min(edited[start:start + active_len]) - amplitude))
+        delta[start:start + active_len] = floor_value - edited[start:start + active_len]
+        edited[start:start + active_len] = floor_value
+        if tail_len > 0:
+            tail_idx = np.arange(tail_len, dtype=np.float64)
+            if recovery_rate <= 0.0:
+                recovery_profile = np.zeros(tail_len, dtype=np.float64)
+            else:
+                recovery_profile = 1.0 - np.exp(-(tail_idx + 1.0) * recovery_rate)
+                recovery_profile = np.clip(recovery_profile, 0.0, 1.0)
+            target_tail = floor_value + recovery_profile * (base_forecast[start + active_len:end] - floor_value)
+            delta[start + active_len:end] = target_tail - edited[start + active_len:end]
+            edited[start + active_len:end] = target_tail
         return edited, delta
-    elif shape == "irregular_noise":
+
+    if shape == "irregular_noise":
         rng = np.random.default_rng(seed)
-        noise = rng.normal(0.0, params.get("volatility_scale", 1.0) * amplitude, size=length)
-        delta[start:end] = noise
-        edited[start:end] = edited[start:end] + noise
+        noise = rng.normal(0.0, params.get("volatility_scale", 1.0) * max(amplitude, 1e-6), size=active_len)
+        delta[start:start + active_len] = noise
+        edited[start:start + active_len] = edited[start:start + active_len] + noise
         return edited, delta
+
+    profile = np.zeros(total_len, dtype=np.float64)
+    active_x = np.linspace(-1.0, 1.0, active_len)
+    if shape == "step":
+        profile[:active_len] = 1.0
+    elif shape == "plateau":
+        active_profile = np.ones(active_len, dtype=np.float64)
+        ramp_len = max(1, active_len // 4)
+        active_profile[:ramp_len] = np.linspace(0.6, 1.0, ramp_len)
+        if active_len > ramp_len:
+            active_profile[-ramp_len:] = np.linspace(1.0, 0.8, ramp_len)
+        profile[:active_len] = active_profile
     else:
-        profile = np.exp(-4.0 * x * x)
+        profile[:active_len] = np.exp(-4.0 * active_x * active_x)
+
+    if tail_len > 0 and recovery_rate > 0.0:
+        decay = np.exp(-np.linspace(0.0, 3.0 * recovery_rate, tail_len))
+        profile[active_len:] = profile[active_len - 1] * decay
+    elif tail_len > 0 and shape == "step":
+        profile[active_len:] = 1.0
 
     delta[start:end] = direction * amplitude * profile
     edited[start:end] = edited[start:end] + delta[start:end]
@@ -312,6 +648,40 @@ def evaluate_revision_sample(
         "magnitude_calibration_error": magnitude_error,
         "outside_region_preservation": preservation,
         "over_edit_rate": over_edit_rate,
+    }
+
+
+def evaluate_calibration(
+    edit_spec_gt: Dict[str, Any],
+    edit_spec_pred: Dict[str, Any],
+    base_forecast: np.ndarray,
+    revision_target: np.ndarray,
+    edited_forecast: np.ndarray,
+    region: List[int],
+) -> Dict[str, float]:
+    start, end = _effective_region_bounds(region, len(base_forecast))
+    region_len = max(1, end - start)
+    base_arr = np.asarray(base_forecast, dtype=np.float64)
+    target_arr = np.asarray(revision_target, dtype=np.float64)
+    edited_arr = np.asarray(edited_forecast, dtype=np.float64)
+
+    gt_delta = target_arr[start:end] - base_arr[start:end]
+    pred_delta = edited_arr[start:end] - base_arr[start:end]
+    tail_len = max(2, region_len // 3)
+
+    npe = float(np.mean([
+        abs(float(edit_spec_pred.get(key, 0.0)) - float(edit_spec_gt.get(key, 0.0)))
+        for key in CALIBRATION_SPEC_KEYS
+    ]))
+    duration_gt = int(round(region_len * max(float(edit_spec_gt.get("duration_ratio", 0.0)), 0.0)))
+    duration_pred = int(round(region_len * max(float(edit_spec_pred.get("duration_ratio", 0.0)), 0.0)))
+
+    return {
+        "normalized_parameter_error": npe,
+        "peak_delta_error": float(abs(np.max(np.abs(pred_delta)) - np.max(np.abs(gt_delta)))) if gt_delta.size else 0.0,
+        "signed_area_error": float(abs(np.sum(pred_delta) - np.sum(gt_delta))) if gt_delta.size else 0.0,
+        "duration_error": float(abs(duration_pred - duration_gt)),
+        "recovery_slope_error": float(abs(_estimate_slope(pred_delta[-tail_len:]) - _estimate_slope(gt_delta[-tail_len:]))) if gt_delta.size >= tail_len else 0.0,
     }
 
 

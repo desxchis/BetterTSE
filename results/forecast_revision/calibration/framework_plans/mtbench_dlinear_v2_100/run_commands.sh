@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# oracle_benchmark_native_text
+/root/miniconda3/bin/python test_scripts/run_forecast_revision_calibration_benchmark.py --benchmark results/forecast_revision/benchmarks/mtbench_finance_dlinear_v2_100/forecast_revision_MTBench_dlinear_like_100.json --output-dir results/forecast_revision/calibration/framework_plans/mtbench_dlinear_v2_100/oracle_benchmark_native_text --methods text_direct_numeric discrete_strength_table rule_local_stats oracle_calibration
+
+# semi_oracle_rule_native_text
+/root/miniconda3/bin/python test_scripts/run_forecast_revision_semi_oracle_suite.py --benchmark results/forecast_revision/benchmarks/mtbench_finance_dlinear_v2_100/forecast_revision_MTBench_dlinear_like_100.json --output-dir results/forecast_revision/calibration/framework_plans/mtbench_dlinear_v2_100/semi_oracle_rule_native_text --calibration-strategy rule_local_stats

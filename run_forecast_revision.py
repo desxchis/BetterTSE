@@ -14,11 +14,16 @@ from modules.experiment_visualization import (
     save_forecast_revision_visualization,
 )
 from modules.forecast_revision import (
+    _zero_edit_spec,
     apply_revision_profile,
     calibrate_revision,
     compute_intent_alignment,
+    evaluate_calibration,
     evaluate_revision_sample,
+    extract_gt_edit_spec,
     heuristic_revision_plan,
+    predict_edit_spec,
+    project_edit_spec_to_params,
 )
 
 
@@ -29,17 +34,120 @@ def _gt_region(mask: np.ndarray) -> List[int]:
     return [int(idx[0]), int(idx[-1] + 1)]
 
 
-def _global_revision(base_forecast: np.ndarray, intent: Dict[str, Any]) -> tuple[np.ndarray, Dict[str, Any], List[int]]:
+def _none_plan() -> Dict[str, Any]:
+    return {
+        "revision_needed": False,
+        "confidence": 1.0,
+        "intent": {
+            "effect_family": "none",
+            "direction": "neutral",
+            "shape": "none",
+            "duration": "none",
+            "strength": "none",
+        },
+        "localization": {"position_bucket": "none", "region": [0, 0]},
+        "tool_name": "none",
+    }
+
+
+def _oracle_plan(sample: Dict[str, Any], region: List[int]) -> Dict[str, Any]:
+    if not bool(sample.get("revision_applicable_gt", True)):
+        return _none_plan()
+    return {
+        "revision_needed": True,
+        "confidence": 1.0,
+        "intent": {
+            "effect_family": sample["effect_family_gt"],
+            "direction": sample["direction_gt"],
+            "shape": sample["shape_gt"],
+            "duration": sample["duration_bucket_gt"],
+            "strength": sample["strength_bucket_gt"],
+        },
+        "localization": {
+            "position_bucket": sample["revision_operator_params"].get("bucket", "mid_horizon"),
+            "region": region,
+        },
+        "tool_name": "oracle",
+    }
+
+
+def _apply_tool_family_override(intent: Dict[str, Any], tool_name: str) -> Dict[str, Any]:
+    overridden = dict(intent)
+    if tool_name == "step_shift":
+        overridden["effect_family"] = "level"
+        overridden["shape"] = "step"
+    elif tool_name == "spike_inject":
+        overridden["effect_family"] = "impulse"
+        overridden["shape"] = "hump"
+    elif tool_name == "volatility_increase":
+        overridden["effect_family"] = "volatility"
+        overridden["shape"] = "irregular_noise"
+        overridden["direction"] = "neutral"
+    elif tool_name == "hybrid_up":
+        overridden["effect_family"] = "level"
+        overridden["shape"] = "plateau"
+        overridden["direction"] = "up"
+    elif tool_name == "hybrid_down":
+        overridden["effect_family"] = "level"
+        overridden["shape"] = "plateau"
+        overridden["direction"] = "down"
+    return overridden
+
+
+def _predict_params(
+    *,
+    intent: Dict[str, Any],
+    region: List[int],
+    history_ts: np.ndarray,
+    base_forecast: np.ndarray,
+    context_text: str,
+    sample: Dict[str, Any],
+    strategy: str,
+    calibration_model_path: str | None = None,
+) -> tuple[Dict[str, Any], Dict[str, Any]]:
+    edit_spec = predict_edit_spec(
+        intent=intent,
+        region=region,
+        history_ts=history_ts,
+        base_forecast=base_forecast,
+        context_text=context_text,
+        strategy=strategy,
+        sample=sample,
+        model_path=calibration_model_path,
+    )
+    params = project_edit_spec_to_params(
+        edit_spec=edit_spec,
+        intent=intent,
+        region=region,
+        history_ts=history_ts,
+        base_forecast=base_forecast,
+    )
+    return edit_spec, params
+
+
+def _global_revision(
+    base_forecast: np.ndarray,
+    history_ts: np.ndarray,
+    context_text: str,
+    intent: Dict[str, Any],
+    sample: Dict[str, Any],
+    calibration_strategy: str,
+    calibration_model_path: str | None = None,
+) -> tuple[np.ndarray, Dict[str, Any], Dict[str, Any], List[int]]:
     horizon = len(base_forecast)
     region = [0, horizon]
-    params = calibrate_revision(intent, region, base_forecast, base_forecast)
+    edit_spec, params = _predict_params(
+        intent=intent,
+        region=region,
+        history_ts=history_ts,
+        base_forecast=base_forecast,
+        context_text=context_text,
+        sample=sample,
+        strategy=calibration_strategy,
+        calibration_model_path=calibration_model_path,
+    )
     edited, _ = apply_revision_profile(base_forecast, intent, region, params)
-    return edited, params, region
-
-
-def _strip_big_fields(result: Dict[str, Any]) -> Dict[str, Any]:
-    kept = dict(result)
-    return kept
+    return edited, edit_spec, params, region
 
 
 def run_revision(
@@ -49,6 +157,8 @@ def run_revision(
     max_samples: int | None = None,
     vis_dir: str | None = None,
     save_visualizations: bool = True,
+    calibration_strategy: str = "rule_local_stats",
+    calibration_model_path: str | None = None,
 ) -> Dict[str, Any]:
     with open(benchmark_path, "r", encoding="utf-8") as f:
         payload = json.load(f)
@@ -68,72 +178,131 @@ def run_revision(
         revision_target = np.asarray(sample["revision_target"], dtype=np.float64)
         gt_mask = np.asarray(sample["edit_mask_gt"], dtype=np.float64)
         gt_region = _gt_region(gt_mask)
+        edit_spec_gt = extract_gt_edit_spec(sample, history_ts=history_ts, base_forecast=base_forecast)
 
         if mode == "base_only":
             edited = base_forecast.copy()
-            plan = {
-                "revision_needed": False,
-                "confidence": 1.0,
-                "intent": {
-                    "effect_family": "none",
-                    "direction": "neutral",
-                    "shape": "none",
-                    "duration": "none",
-                    "strength": "none",
-                },
-                "localization": {"position_bucket": "none", "region": [0, 0]},
-                "tool_name": "none",
-            }
+            plan = _none_plan()
+            edit_spec = _zero_edit_spec(strategy="base_only")
             params: Dict[str, Any] = {}
             pred_region = [0, 0]
         elif mode == "oracle_region":
             plan = heuristic_revision_plan(sample["context_text"], sample["forecast_horizon"])
             pred_region = gt_region
-            params = calibrate_revision(plan["intent"], pred_region, history_ts, base_forecast)
-            edited, _ = apply_revision_profile(base_forecast, plan["intent"], pred_region, params)
+            if plan["revision_needed"]:
+                edit_spec, params = _predict_params(
+                    intent=plan["intent"],
+                    region=pred_region,
+                    history_ts=history_ts,
+                    base_forecast=base_forecast,
+                    context_text=sample["context_text"],
+                    sample=sample,
+                    strategy=calibration_strategy,
+                    calibration_model_path=calibration_model_path,
+                )
+                edited, _ = apply_revision_profile(base_forecast, plan["intent"], pred_region, params)
+            else:
+                edited = base_forecast.copy()
+                edit_spec = _zero_edit_spec(strategy="oracle_region")
+                params = {}
         elif mode == "oracle_intent":
             pred_region = gt_region
-            plan = {
-                "revision_needed": True,
-                "confidence": 1.0,
-                "intent": {
-                    "effect_family": sample["effect_family_gt"],
-                    "direction": sample["direction_gt"],
-                    "shape": sample["shape_gt"],
-                    "duration": sample["duration_bucket_gt"],
-                    "strength": sample["strength_bucket_gt"],
-                },
-                "localization": {"position_bucket": sample["revision_operator_params"].get("bucket", "mid_horizon"), "region": pred_region},
-                "tool_name": "oracle",
-            }
-            params = calibrate_revision(plan["intent"], pred_region, history_ts, base_forecast)
-            edited, _ = apply_revision_profile(base_forecast, plan["intent"], pred_region, params)
+            plan = _oracle_plan(sample, pred_region)
+            if plan["revision_needed"]:
+                edit_spec, params = _predict_params(
+                    intent=plan["intent"],
+                    region=pred_region,
+                    history_ts=history_ts,
+                    base_forecast=base_forecast,
+                    context_text=sample["context_text"],
+                    sample=sample,
+                    strategy=calibration_strategy,
+                    calibration_model_path=calibration_model_path,
+                )
+                edited, _ = apply_revision_profile(base_forecast, plan["intent"], pred_region, params)
+            else:
+                edited = base_forecast.copy()
+                edit_spec = _zero_edit_spec(strategy="oracle_intent")
+                params = {}
+        elif mode == "oracle_tool":
+            pred_region = gt_region
+            pred_plan = heuristic_revision_plan(sample["context_text"], sample["forecast_horizon"])
+            plan = _oracle_plan(sample, pred_region)
+            plan["tool_name"] = pred_plan.get("tool_name", "none")
+            if plan["revision_needed"]:
+                execution_intent = _apply_tool_family_override(plan["intent"], plan["tool_name"])
+                edit_spec, params = _predict_params(
+                    intent=execution_intent,
+                    region=pred_region,
+                    history_ts=history_ts,
+                    base_forecast=base_forecast,
+                    context_text=sample["context_text"],
+                    sample=sample,
+                    strategy=calibration_strategy,
+                    calibration_model_path=calibration_model_path,
+                )
+                edited, _ = apply_revision_profile(base_forecast, execution_intent, pred_region, params)
+                plan["execution_intent"] = execution_intent
+            else:
+                edited = base_forecast.copy()
+                edit_spec = _zero_edit_spec(strategy="oracle_tool")
+                params = {}
         elif mode == "oracle_calibration":
             pred_region = gt_region
-            plan = {
-                "revision_needed": True,
-                "confidence": 1.0,
-                "intent": {
-                    "effect_family": sample["effect_family_gt"],
-                    "direction": sample["direction_gt"],
-                    "shape": sample["shape_gt"],
-                    "duration": sample["duration_bucket_gt"],
-                    "strength": sample["strength_bucket_gt"],
-                },
-                "localization": {"position_bucket": sample["revision_operator_params"].get("bucket", "mid_horizon"), "region": pred_region},
-                "tool_name": "oracle",
-            }
-            params = dict(sample["revision_operator_params"]["params"])
-            edited, _ = apply_revision_profile(base_forecast, plan["intent"], pred_region, params)
+            plan = _oracle_plan(sample, pred_region)
+            if plan["revision_needed"]:
+                edit_spec = dict(edit_spec_gt)
+                params = dict(sample["revision_operator_params"].get("params", {}))
+                if not params:
+                    params = project_edit_spec_to_params(
+                        edit_spec=edit_spec,
+                        intent=plan["intent"],
+                        region=pred_region,
+                        history_ts=history_ts,
+                        base_forecast=base_forecast,
+                    )
+                edited, _ = apply_revision_profile(base_forecast, plan["intent"], pred_region, params)
+            else:
+                edited = base_forecast.copy()
+                edit_spec = _zero_edit_spec(strategy="oracle_calibration")
+                params = {}
         elif mode == "global_revision_only":
             plan = heuristic_revision_plan(sample["context_text"], sample["forecast_horizon"])
-            edited, params, pred_region = _global_revision(base_forecast, plan["intent"])
-            plan["localization"]["region"] = pred_region
+            if plan["revision_needed"]:
+                edited, edit_spec, params, pred_region = _global_revision(
+                    base_forecast=base_forecast,
+                    history_ts=history_ts,
+                    context_text=sample["context_text"],
+                    intent=plan["intent"],
+                    sample=sample,
+                    calibration_strategy=calibration_strategy,
+                    calibration_model_path=calibration_model_path,
+                )
+                plan["localization"]["region"] = pred_region
+            else:
+                edited = base_forecast.copy()
+                edit_spec = _zero_edit_spec(strategy="global_revision_only")
+                params = {}
+                pred_region = [0, 0]
         else:
             plan = heuristic_revision_plan(sample["context_text"], sample["forecast_horizon"])
             pred_region = plan["localization"]["region"]
-            params = calibrate_revision(plan["intent"], pred_region, history_ts, base_forecast)
-            edited, _ = apply_revision_profile(base_forecast, plan["intent"], pred_region, params)
+            if plan["revision_needed"]:
+                edit_spec, params = _predict_params(
+                    intent=plan["intent"],
+                    region=pred_region,
+                    history_ts=history_ts,
+                    base_forecast=base_forecast,
+                    context_text=sample["context_text"],
+                    sample=sample,
+                    strategy=calibration_strategy,
+                    calibration_model_path=calibration_model_path,
+                )
+                edited, _ = apply_revision_profile(base_forecast, plan["intent"], pred_region, params)
+            else:
+                edited = base_forecast.copy()
+                edit_spec = _zero_edit_spec(strategy="localized_full_revision")
+                params = {}
 
         metrics = evaluate_revision_sample(
             base_forecast=base_forecast,
@@ -142,6 +311,14 @@ def run_revision(
             revision_target=revision_target,
             pred_region=pred_region,
             gt_mask=gt_mask,
+        )
+        calibration_metrics = evaluate_calibration(
+            edit_spec_gt=edit_spec_gt,
+            edit_spec_pred=edit_spec,
+            base_forecast=base_forecast,
+            revision_target=revision_target,
+            edited_forecast=edited,
+            region=gt_region,
         )
         intent_alignment = compute_intent_alignment(plan, sample)
         result = {
@@ -152,8 +329,13 @@ def run_revision(
             "plan": plan,
             "pred_region": pred_region,
             "gt_region": gt_region,
+            "edit_spec": edit_spec,
+            "edit_spec_gt": edit_spec_gt,
             "calibration": params,
+            "calibration_strategy": calibration_strategy,
+        "calibration_model_path": calibration_model_path,
             "metrics": metrics,
+            "calibration_metrics": calibration_metrics,
             "intent_alignment": intent_alignment,
             "revision_applicable_gt": sample["revision_applicable_gt"],
             "edit_intent_gt": sample.get("edit_intent_gt"),
@@ -192,6 +374,7 @@ def run_revision(
         "summary": summary,
         "run_timestamp_utc": datetime.now(timezone.utc).isoformat(),
         "visualization_dir": str(vis_dir_obj) if vis_dir_obj is not None else None,
+        "calibration_strategy": calibration_strategy,
         "results": results,
     }
     output_file = Path(output_path)
@@ -218,9 +401,19 @@ def _summarize_results(results: List[Dict[str, Any]]) -> Dict[str, Any]:
         "outside_region_preservation",
         "over_edit_rate",
     ]
+    calibration_keys = [
+        "normalized_parameter_error",
+        "peak_delta_error",
+        "signed_area_error",
+        "duration_error",
+        "recovery_slope_error",
+    ]
     summary: Dict[str, Any] = {"total": len(results), "successful": len(results), "failed": 0}
     for key in metric_keys:
         values = [r["metrics"][key] for r in results if key in r["metrics"]]
+        summary[f"avg_{key}"] = float(np.mean(values)) if values else None
+    for key in calibration_keys:
+        values = [r["calibration_metrics"][key] for r in results if key in r.get("calibration_metrics", {})]
         summary[f"avg_{key}"] = float(np.mean(values)) if values else None
     intent_keys = [
         "revision_needed_match",
@@ -252,6 +445,9 @@ def _summarize_results(results: List[Dict[str, Any]]) -> Dict[str, Any]:
         ):
             values = [r["metrics"][key] for r in subset if key in r["metrics"]]
             summary[f"{subset_name}_avg_{key}"] = float(np.mean(values)) if values else None
+        for key in calibration_keys:
+            values = [r["calibration_metrics"][key] for r in subset if key in r.get("calibration_metrics", {})]
+            summary[f"{subset_name}_avg_{key}"] = float(np.mean(values)) if values else None
         values = [r["intent_alignment"]["revision_needed_match"] for r in subset if "intent_alignment" in r]
         summary[f"{subset_name}_avg_revision_needed_match"] = float(np.mean(values)) if values else None
     return summary
@@ -270,12 +466,19 @@ def main() -> None:
             "localized_full_revision",
             "oracle_region",
             "oracle_intent",
+            "oracle_tool",
             "oracle_calibration",
         ],
     )
     parser.add_argument("--max-samples", type=int, default=None)
     parser.add_argument("--vis-dir", default=None)
     parser.add_argument("--no-save-vis", action="store_true")
+    parser.add_argument(
+        "--calibration-strategy",
+        default="rule_local_stats",
+        choices=["text_direct_numeric", "discrete_strength_table", "rule_local_stats", "learned_linear"],
+    )
+    parser.add_argument("--calibration-model", default=None)
     args = parser.parse_args()
 
     run_revision(
@@ -285,6 +488,8 @@ def main() -> None:
         max_samples=args.max_samples,
         vis_dir=args.vis_dir,
         save_visualizations=not args.no_save_vis,
+        calibration_strategy=args.calibration_strategy,
+        calibration_model_path=args.calibration_model,
     )
 
 

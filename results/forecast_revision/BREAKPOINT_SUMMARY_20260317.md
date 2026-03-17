@@ -116,6 +116,24 @@ Reference:
 
 - [MTBench finance v2 100-sample milestone](/root/autodl-tmp/BetterTSE-main/results/forecast_revision/milestones/20260317_mtbench_v2_100/README.md)
 
+## Dataset Role Freeze
+
+The paper-facing dataset roles should now be treated as fixed:
+
+- `XTraffic`:
+  - main benchmark / main empirical battlefield
+- `MTBench`:
+  - realism and native-text complement
+- `CiK`:
+  - protocol and benchmark-design template
+- `Time-MMD` or `Time-IMM`:
+  - optional later extension, not current mainline
+- `CGTSF` and pure traffic-only data:
+  - lightweight complement or appendix material
+
+The main current risk is not lack of data.
+It is benchmark-role sprawl that dilutes the paper narrative.
+
 ## What Should Not Change Now
 
 Do not keep redesigning the main framework.
@@ -134,6 +152,7 @@ The line does not currently need:
 - more domains right away
 - new large baseline integrations
 - another round of framework refactor
+- multiple new main benchmarks opened in parallel
 
 ## Current Main Open Problems
 
@@ -143,6 +162,64 @@ The remaining headroom is now much narrower:
 - cleaner execution quality on real data
 - larger-scale MTBench validation beyond the current 100-sample checkpoint
 - a cleaner treatment of `how much to edit`
+
+## Calibration Scaffold Status
+
+A first explicit calibration scaffold is now wired into the repo.
+
+Added code paths:
+
+- `modules/forecast_revision.py`
+  - explicit `edit_spec` prediction
+  - `edit_spec -> executor params` projection
+  - calibration metrics: `normalized_parameter_error`, `peak_delta_error`, `signed_area_error`, `duration_error`, `recovery_slope_error`
+- `run_forecast_revision.py`
+  - `calibration_strategy` switch
+  - result payloads now store `edit_spec`, `edit_spec_gt`, and `calibration_metrics`
+- `test_scripts/build_forecast_revision_benchmark.py`
+  - synthetic samples now export `edit_spec_gt`
+- `test_scripts/run_forecast_revision_calibration_benchmark.py`
+  - dedicated oracle-region / oracle-intent calibration benchmark runner
+
+Current verification status:
+
+- syntax check passed
+- 3-sample ETTh1 smoke test passed end to end
+- `normalized_parameter_error` is now numerically stable after shape-aware GT spec extraction
+
+This means the next stage is no longer abstract planning.
+The repo now has a runnable calibration benchmark skeleton.
+
+## Calibration Framework Status
+
+The next step has now been narrowed further:
+
+- do not prioritize more training while GPU mode is off
+- prioritize framework assembly for calibration experiments
+
+Added framework layer:
+
+- config-driven planner:
+  - [prepare_forecast_revision_calibration_framework.py](/root/autodl-tmp/BetterTSE-main/test_scripts/prepare_forecast_revision_calibration_framework.py)
+- config examples:
+  - [weather_dlinear_v2.json](/root/autodl-tmp/BetterTSE-main/configs/forecast_revision_calibration/weather_dlinear_v2.json)
+  - [xtraffic_dlinear_v2.json](/root/autodl-tmp/BetterTSE-main/configs/forecast_revision_calibration/xtraffic_dlinear_v2.json)
+  - [mtbench_dlinear_v2_100.json](/root/autodl-tmp/BetterTSE-main/configs/forecast_revision_calibration/mtbench_dlinear_v2_100.json)
+
+What this framework layer does:
+
+- writes a reusable `experiment_plan.json`
+- writes a runnable `run_commands.sh`
+- writes a per-experiment `README.md`
+- keeps training, oracle benchmark, and semi-oracle suite wired through one config
+
+What this framework layer does not do yet:
+
+- it does not claim new empirical gains
+- it does not require GPU execution
+- it does not replace the current benchmark scripts
+
+Its role is only to make the next calibration stage reproducible and easier to resume.
 
 ## Recommended Immediate Next Step
 
@@ -155,23 +232,21 @@ The next work should stay inside the current framework and focus on calibration:
    - `XTraffic v2 narrowed`
    - `XTraffic v2 nonapp`
    - `MTBench finance v2 (100)`
-2. start a small `how much to edit` calibration line inside the existing revision pipeline
-3. compare calibration variants under the same method ladder:
-   - `base_only`
-   - `global_revision_only`
-   - `localized_full_revision`
-   - `oracle_region`
-   - `oracle_intent`
-   - `oracle_calibration`
-4. only after calibration ablations are stable, consider a new dataset line
+2. keep dataset roles fixed:
+   - `XTraffic` as main benchmark
+   - `MTBench` as realism complement
+   - `CiK` as protocol template
+3. start a small `how much to edit` calibration line inside the existing revision pipeline
+4. keep calibration work config-driven and resumable while GPU training is deferred
+5. only after calibration ablations are stable, consider one broader extension dataset
 
 ## Candidate Future Dataset Priority
 
 If a new dataset must be opened later, use this priority:
 
-1. `CGTSF`
-2. `Time-MMD`
-3. `Time-IMM`
+1. `Time-MMD`
+2. `Time-IMM`
+3. `CGTSF`
 
 But none of them should be started before the current breakpoint is fully stabilized.
 

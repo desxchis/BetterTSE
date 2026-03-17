@@ -19,6 +19,7 @@ from forecasting.registry import load_baseline
 from modules.forecast_revision import (
     ForecastRevisionSample,
     apply_revision_profile,
+    extract_gt_edit_spec,
 )
 
 
@@ -205,9 +206,12 @@ def build_benchmark(
                 "bucket": spec["bucket"],
                 "params": params,
             },
+            edit_spec_gt=None,
             timestamp=datetime.now(timezone.utc).isoformat(),
         )
-        samples.append(sample.to_dict())
+        sample_dict = sample.to_dict()
+        sample_dict["edit_spec_gt"] = extract_gt_edit_spec(sample_dict)
+        samples.append(sample_dict)
 
     output_root = Path(output_dir)
     output_root.mkdir(parents=True, exist_ok=True)

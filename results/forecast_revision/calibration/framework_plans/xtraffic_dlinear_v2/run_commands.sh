@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# oracle_benchmark_proxy_target
+/root/miniconda3/bin/python test_scripts/run_forecast_revision_calibration_benchmark.py --benchmark results/forecast_revision/benchmarks/xtraffic_p01_speed_dlinear_v2/forecast_revision_XTraffic_dlinear_like_9.json --output-dir results/forecast_revision/calibration/framework_plans/xtraffic_dlinear_v2/oracle_benchmark_proxy_target --methods text_direct_numeric discrete_strength_table rule_local_stats oracle_calibration
+
+# semi_oracle_rule_proxy_target
+/root/miniconda3/bin/python test_scripts/run_forecast_revision_semi_oracle_suite.py --benchmark results/forecast_revision/benchmarks/xtraffic_p01_speed_dlinear_v2/forecast_revision_XTraffic_dlinear_like_9.json --output-dir results/forecast_revision/calibration/framework_plans/xtraffic_dlinear_v2/semi_oracle_rule_proxy_target --calibration-strategy rule_local_stats
