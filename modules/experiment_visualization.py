@@ -121,6 +121,70 @@ def save_pipeline_visualization(
     plt.close(fig)
 
 
+def save_forecast_revision_visualization(
+    sample_id: str,
+    history_ts: np.ndarray,
+    future_gt: np.ndarray,
+    base_forecast: np.ndarray,
+    revision_target: np.ndarray,
+    edited_forecast: np.ndarray,
+    gt_region: tuple[int, int],
+    pred_region: tuple[int, int],
+    context_text: str,
+    metrics: Dict[str, Any],
+    save_path: Path,
+) -> None:
+    fig, axes = plt.subplots(3, 1, figsize=(14, 11), sharex=False)
+    fig.suptitle(
+        f"Forecast Revision | Sample {sample_id}\n"
+        f"Context: {context_text[:140]}{'...' if len(context_text) > 140 else ''}",
+        fontsize=10,
+    )
+
+    hist_x = np.arange(len(history_ts))
+    future_x = np.arange(len(history_ts), len(history_ts) + len(base_forecast))
+
+    ax = axes[0]
+    ax.plot(hist_x, history_ts, color="0.45", lw=1.4, label="History")
+    ax.plot(future_x, future_gt, color="black", lw=1.4, ls=":", label="Future GT")
+    ax.plot(future_x, base_forecast, color="royalblue", lw=1.6, label="Base forecast")
+    ax.plot(future_x, edited_forecast, color="seagreen", lw=1.6, label="Edited forecast")
+    ax.plot(future_x, revision_target, color="crimson", lw=1.6, ls="--", label="Revision target")
+    ax.axvspan(len(history_ts) + gt_region[0], len(history_ts) + gt_region[1], color="gold", alpha=0.18, label="GT edit")
+    ax.axvspan(len(history_ts) + pred_region[0], len(history_ts) + pred_region[1], color="mediumpurple", alpha=0.12, label="Pred edit")
+    ax.set_title("History and forecast horizon")
+    ax.grid(True, alpha=0.3)
+    ax.legend(fontsize=8, loc="upper right")
+
+    ax = axes[1]
+    base_delta = revision_target - base_forecast
+    pred_delta = edited_forecast - base_forecast
+    ax.plot(np.arange(len(base_delta)), base_delta, color="crimson", lw=1.6, ls="--", label="GT delta")
+    ax.plot(np.arange(len(pred_delta)), pred_delta, color="seagreen", lw=1.6, label="Pred delta")
+    ax.axhline(0, color="black", lw=0.8)
+    ax.axvspan(gt_region[0], gt_region[1], color="gold", alpha=0.18)
+    ax.axvspan(pred_region[0], pred_region[1], color="mediumpurple", alpha=0.12)
+    ax.set_title("Revision delta")
+    ax.grid(True, alpha=0.3)
+    ax.legend(fontsize=8, loc="upper right")
+
+    ax = axes[2]
+    metric_text = (
+        f"MAE(base,target)={metrics.get('base_mae_vs_revision_target', 0.0):.3f}\n"
+        f"MAE(edit,target)={metrics.get('edited_mae_vs_revision_target', 0.0):.3f}\n"
+        f"Revision Gain={metrics.get('revision_gain', 0.0):.3f}\n"
+        f"future t-IoU={metrics.get('future_t_iou', 0.0):.3f}\n"
+        f"Mag Err={metrics.get('magnitude_calibration_error', 0.0):.3f}\n"
+        f"Over-edit={metrics.get('over_edit_rate', 0.0):.3f}"
+    )
+    ax.axis("off")
+    ax.text(0.01, 0.98, metric_text, va="top", ha="left", fontsize=11)
+
+    plt.tight_layout()
+    fig.savefig(save_path, dpi=130, bbox_inches="tight")
+    plt.close(fig)
+
+
 def _slugify(value: str) -> str:
     chars = []
     for ch in value:

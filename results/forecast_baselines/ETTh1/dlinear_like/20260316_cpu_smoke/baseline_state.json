@@ -1,0 +1,13 @@
+{
+  "name": "dlinear_like",
+  "config": {
+    "context_length": 96,
+    "prediction_length": 24,
+    "seq_len": 96,
+    "pred_len": 24,
+    "device": "cpu",
+    "epochs": 3,
+    "batch_size": 16,
+    "lr": 0.001
+  }
+}

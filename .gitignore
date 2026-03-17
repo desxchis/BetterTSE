@@ -48,6 +48,9 @@ logs/
 *.bak
 *.pyc
 
+# Secrets and local credentials
+.kaggle/
+
 # Model weights (large files)
 TEdit-main/save/
 TEdit-main/checkpoints/
@@ -61,6 +64,9 @@ outputs/
 
 # Local datasets and notebook caches
 data/traffic.csv
+data/Weather.csv
+data/mtbench/
+data/xtraffic_minimal/
 .ipynb_checkpoints/
 **/.ipynb_checkpoints/
 

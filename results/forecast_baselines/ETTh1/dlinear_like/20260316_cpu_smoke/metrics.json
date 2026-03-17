@@ -1,0 +1,21 @@
+{
+  "dataset_name": "ETTh1",
+  "feature": "HUFL",
+  "model_name": "dlinear_like",
+  "timestamp_utc": "2026-03-16T07:04:59.896647+00:00",
+  "train_points": 12194,
+  "val_points": 1741,
+  "config": {
+    "name": "dlinear_like",
+    "config": {
+      "context_length": 96,
+      "prediction_length": 24,
+      "seq_len": 96,
+      "pred_len": 24,
+      "device": "cpu",
+      "epochs": 3,
+      "batch_size": 16,
+      "lr": 0.001
+    }
+  }
+}

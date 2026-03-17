@@ -1,0 +1,21 @@
+{
+  "dataset_name": "Weather",
+  "feature": "feature_0",
+  "model_name": "naive_last",
+  "timestamp_utc": "2026-03-16T12:26:44.695103+00:00",
+  "train_points": 36886,
+  "val_points": 5270,
+  "config": {
+    "name": "naive_last",
+    "config": {
+      "context_length": 96,
+      "prediction_length": 24,
+      "seq_len": 96,
+      "pred_len": 24,
+      "device": "cpu",
+      "epochs": 3,
+      "batch_size": 16,
+      "lr": 0.001
+    }
+  }
+}

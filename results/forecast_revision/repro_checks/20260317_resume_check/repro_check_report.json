@@ -1,0 +1,171 @@
+{
+  "created_at_utc": "2026-03-17T09:02:33.175038+00:00",
+  "tolerance": 1e-12,
+  "checkpoints": [
+    {
+      "key": "weather_dlinear_v4_cal_fast",
+      "label": "Weather v4 controlled checkpoint (`dlinear_like`)",
+      "reference_summary_path": "/root/autodl-tmp/BetterTSE-main/results/forecast_revision/runs/weather_dlinear_v4_cal_fast/suite_summary.json",
+      "benchmark_path": "results/forecast_revision/benchmarks/weather_dlinear_v2/forecast_revision_Weather_dlinear_like_30.json",
+      "rerun_summary_path": "results/forecast_revision/repro_checks/20260317_resume_check/weather_dlinear_v4_cal_fast/suite_summary.json",
+      "exact_match": true,
+      "max_abs_diff": 0.0,
+      "mode_reports": {
+        "localized_full_revision": {
+          "exact_within_tolerance": true,
+          "mismatch_count": 0,
+          "max_abs_diff": 0.0,
+          "mismatches": []
+        },
+        "oracle_calibration": {
+          "exact_within_tolerance": true,
+          "mismatch_count": 0,
+          "max_abs_diff": 0.0,
+          "mismatches": []
+        },
+        "oracle_intent": {
+          "exact_within_tolerance": true,
+          "mismatch_count": 0,
+          "max_abs_diff": 0.0,
+          "mismatches": []
+        },
+        "oracle_region": {
+          "exact_within_tolerance": true,
+          "mismatch_count": 0,
+          "max_abs_diff": 0.0,
+          "mismatches": []
+        }
+      }
+    },
+    {
+      "key": "xtraffic_dlinear_v2_real",
+      "label": "XTraffic v2 narrowed real checkpoint (`dlinear_like`)",
+      "reference_summary_path": "/root/autodl-tmp/BetterTSE-main/results/forecast_revision/runs/xtraffic_p01_speed_dlinear_v2_real_suite/suite_summary.json",
+      "benchmark_path": "results/forecast_revision/benchmarks/xtraffic_p01_speed_dlinear_v2/forecast_revision_XTraffic_dlinear_like_9.json",
+      "rerun_summary_path": "results/forecast_revision/repro_checks/20260317_resume_check/xtraffic_dlinear_v2_real/suite_summary.json",
+      "exact_match": true,
+      "max_abs_diff": 0.0,
+      "mode_reports": {
+        "base_only": {
+          "exact_within_tolerance": true,
+          "mismatch_count": 0,
+          "max_abs_diff": 0.0,
+          "mismatches": []
+        },
+        "global_revision_only": {
+          "exact_within_tolerance": true,
+          "mismatch_count": 0,
+          "max_abs_diff": 0.0,
+          "mismatches": []
+        },
+        "localized_full_revision": {
+          "exact_within_tolerance": true,
+          "mismatch_count": 0,
+          "max_abs_diff": 0.0,
+          "mismatches": []
+        },
+        "oracle_intent": {
+          "exact_within_tolerance": true,
+          "mismatch_count": 0,
+          "max_abs_diff": 0.0,
+          "mismatches": []
+        },
+        "oracle_region": {
+          "exact_within_tolerance": true,
+          "mismatch_count": 0,
+          "max_abs_diff": 0.0,
+          "mismatches": []
+        }
+      }
+    },
+    {
+      "key": "xtraffic_dlinear_v2_nonapp",
+      "label": "XTraffic v2 non-app gate checkpoint (`dlinear_like`)",
+      "reference_summary_path": "/root/autodl-tmp/BetterTSE-main/results/forecast_revision/runs/xtraffic_p01_speed_dlinear_v2_nonapp_suite/suite_summary.json",
+      "benchmark_path": "results/forecast_revision/benchmarks/xtraffic_p01_speed_dlinear_v2_nonapp/forecast_revision_XTraffic_dlinear_like_23.json",
+      "rerun_summary_path": "results/forecast_revision/repro_checks/20260317_resume_check/xtraffic_dlinear_v2_nonapp/suite_summary.json",
+      "exact_match": true,
+      "max_abs_diff": 0.0,
+      "mode_reports": {
+        "base_only": {
+          "exact_within_tolerance": true,
+          "mismatch_count": 0,
+          "max_abs_diff": 0.0,
+          "mismatches": []
+        },
+        "global_revision_only": {
+          "exact_within_tolerance": true,
+          "mismatch_count": 0,
+          "max_abs_diff": 0.0,
+          "mismatches": []
+        },
+        "localized_full_revision": {
+          "exact_within_tolerance": true,
+          "mismatch_count": 0,
+          "max_abs_diff": 0.0,
+          "mismatches": []
+        },
+        "oracle_intent": {
+          "exact_within_tolerance": true,
+          "mismatch_count": 0,
+          "max_abs_diff": 0.0,
+          "mismatches": []
+        },
+        "oracle_region": {
+          "exact_within_tolerance": true,
+          "mismatch_count": 0,
+          "max_abs_diff": 0.0,
+          "mismatches": []
+        }
+      }
+    },
+    {
+      "key": "mtbench_dlinear_v2_100",
+      "label": "MTBench finance v2 100-sample checkpoint (`dlinear_like`)",
+      "reference_summary_path": "/root/autodl-tmp/BetterTSE-main/results/forecast_revision/runs/mtbench_finance_dlinear_v2_100_suite/suite_summary.json",
+      "benchmark_path": "results/forecast_revision/benchmarks/mtbench_finance_dlinear_v2_100/forecast_revision_MTBench_dlinear_like_100.json",
+      "rerun_summary_path": "results/forecast_revision/repro_checks/20260317_resume_check/mtbench_dlinear_v2_100/suite_summary.json",
+      "exact_match": true,
+      "max_abs_diff": 0.0,
+      "mode_reports": {
+        "base_only": {
+          "exact_within_tolerance": true,
+          "mismatch_count": 0,
+          "max_abs_diff": 0.0,
+          "mismatches": []
+        },
+        "global_revision_only": {
+          "exact_within_tolerance": true,
+          "mismatch_count": 0,
+          "max_abs_diff": 0.0,
+          "mismatches": []
+        },
+        "localized_full_revision": {
+          "exact_within_tolerance": true,
+          "mismatch_count": 0,
+          "max_abs_diff": 0.0,
+          "mismatches": []
+        },
+        "oracle_calibration": {
+          "exact_within_tolerance": true,
+          "mismatch_count": 0,
+          "max_abs_diff": 0.0,
+          "mismatches": []
+        },
+        "oracle_intent": {
+          "exact_within_tolerance": true,
+          "mismatch_count": 0,
+          "max_abs_diff": 0.0,
+          "mismatches": []
+        },
+        "oracle_region": {
+          "exact_within_tolerance": true,
+          "mismatch_count": 0,
+          "max_abs_diff": 0.0,
+          "mismatches": []
+        }
+      }
+    }
+  ],
+  "all_exact_match": true
+}

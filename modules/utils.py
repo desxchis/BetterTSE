@@ -17,6 +17,35 @@ plt.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei', 'Arial Unicode M
 plt.rcParams['axes.unicode_minus'] = False
 
 
+def inspect_user_input_mode(user_input: str) -> dict[str, Any]:
+    """Inspect whether the payload represents base generation or forecast revision."""
+
+    payload = json.loads(user_input)
+    forecast_section = payload.get("forecast") or {}
+    forecast_values = forecast_section.get("values")
+    seed_forecast_provided = forecast_values is not None
+    forecast_timestamps = forecast_section.get("timestamps") or []
+    history_values = payload.get("history", {}).get("values") or []
+
+    if seed_forecast_provided:
+        initial_forecast_source = "provided_seed_forecast"
+        mode = "revision"
+    elif forecast_timestamps:
+        initial_forecast_source = "mean_history_seed"
+        mode = "base_generation"
+    else:
+        initial_forecast_source = "none"
+        mode = "base_generation"
+
+    return {
+        "mode": mode,
+        "seed_forecast_provided": seed_forecast_provided,
+        "forecast_horizon": len(forecast_timestamps),
+        "history_length": len(history_values),
+        "initial_forecast_source": initial_forecast_source,
+    }
+
+
 def parse_user_input(user_input: str) -> tuple[dict[str, object], dict[str, object], str]:
     """Parse the simulated payload and return history, forecast, and optional context."""
 

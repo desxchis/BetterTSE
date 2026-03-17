@@ -16,7 +16,7 @@ from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, StateGraph
 
 from modules.llm import get_llm
-from modules.utils import parse_user_input, pretty_print, to_python
+from modules.utils import inspect_user_input_mode, parse_user_input, pretty_print, to_python
 from tool.tool_description.ts_composers import description as tsc_description
 from tool.tool_description.ts_editors import description as tse_description
 from tool.tool_description.tedit_tools import description as tedit_description
@@ -172,6 +172,9 @@ class A1:
         self._forecast_before_last_update: list[float] | None = None
         self.iteration_index: int = 0
         self.editing_mode: bool = False
+        self.revision_mode: bool = False
+        self.seed_forecast_provided: bool = False
+        self.initial_forecast_source: str = "none"
 
         # 时间序列数据（在go()方法中设置）
         self.ts_history: dict[str, Any] = {}
@@ -334,6 +337,9 @@ class A1:
         return {
             "iteration_index": self.iteration_index,
             "planner_context_mode": self.planner_context_mode,
+            "forecast_task_mode": "revision" if self.revision_mode else "base_generation",
+            "seed_forecast_provided": self.seed_forecast_provided,
+            "initial_forecast_source": self.initial_forecast_source,
             "history": self._build_ts_context_payload(
                 self.ts_history,
                 self.history_descriptor_results,
@@ -588,6 +594,11 @@ class A1:
         self.forecast_descriptor_failures = []
         self.iteration_index = 0
 
+        input_mode = inspect_user_input_mode(user_input)
+        self.revision_mode = input_mode["mode"] == "revision"
+        self.seed_forecast_provided = bool(input_mode["seed_forecast_provided"])
+        self.initial_forecast_source = str(input_mode["initial_forecast_source"])
+
         # 解析用户输入
         self.ts_history, self.ts_forecast, self.context_text = parse_user_input(user_input)
         self.ts_history = to_python(self.ts_history)
@@ -610,6 +621,17 @@ class A1:
             "instruction_decomposition": self.enable_instruction_decomposition,
         }
         self.latest_pipeline_snapshot = []
+        inputs["pipeline_outputs"].append(
+            {
+                "timestamp": time.time(),
+                "type": "input.mode",
+                "forecast_task_mode": input_mode["mode"],
+                "seed_forecast_provided": input_mode["seed_forecast_provided"],
+                "forecast_horizon": input_mode["forecast_horizon"],
+                "history_length": input_mode["history_length"],
+                "initial_forecast_source": input_mode["initial_forecast_source"],
+            }
+        )
 
         # 配置工作流
         config = {"recursion_limit": 500, "configurable": {"thread_id": 42}}
