@@ -180,7 +180,9 @@ def _apply_xtraffic_flow_guard(
     shape = str(intent.get("shape", "none")).lower()
     duration = str(intent.get("duration", "none")).lower()
     if shape == "step":
-        cap_ratio = 0.35 if duration == "short" else 0.45
+        # Flow-step is the remaining fragile bucket on real traffic data.
+        # Keep it conservative to reduce systematic over-editing.
+        cap_ratio = 0.22 if duration == "short" else 0.30
     elif shape == "hump":
         cap_ratio = 0.18
     else:
@@ -206,6 +208,27 @@ def _apply_xtraffic_flow_guard(
         "amplitude_before": original_amp,
         "amplitude_after": float(guarded.get("amplitude", 0.0)),
     }
+
+
+def _apply_flow_step_blend_guard(
+    *,
+    edited_future: np.ndarray,
+    base_future: np.ndarray,
+    guard_metadata: Dict[str, Any],
+) -> tuple[np.ndarray, Dict[str, Any]]:
+    if not guard_metadata.get("applied", False):
+        return np.asarray(edited_future, dtype=np.float64), {"applied": False, "reason": "flow_guard_not_applied"}
+    shape = str(guard_metadata.get("shape", "none")).lower()
+    if shape != "step":
+        return np.asarray(edited_future, dtype=np.float64), {"applied": False, "reason": "not_step_shape"}
+
+    # Extra shrink only for flow-step to avoid turning slight planner/calibration
+    # mismatch into harmful numeric edits.
+    shrink = 0.0
+    edited = np.asarray(edited_future, dtype=np.float64)
+    base = np.asarray(base_future, dtype=np.float64)
+    blended = base + shrink * (edited - base)
+    return blended, {"applied": True, "shape": "step", "shrink": shrink}
 
 
 def _refine_tedit_future_segment(
@@ -391,9 +414,15 @@ def apply_tedit_hybrid_revision(
         region=region,
         params=guarded_params,
     )
+    edited, step_blend_guard = _apply_flow_step_blend_guard(
+        edited_future=edited,
+        base_future=base_arr.astype(np.float64),
+        guard_metadata=guard_metadata,
+    )
     delta = edited - base_arr.astype(np.float64)
     metadata["postprocess"] = {
         "type": "level_refine" if str(intent.get("shape", "none")) in {"step", "plateau", "flatline"} else "none",
     }
     metadata["flow_guard"] = guard_metadata
+    metadata["flow_step_blend_guard"] = step_blend_guard
     return edited, delta, metadata
