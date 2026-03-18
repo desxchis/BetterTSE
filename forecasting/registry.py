@@ -5,12 +5,22 @@ from pathlib import Path
 from typing import Any, Dict, List
 
 from forecasting.base import ForecastBaseline
-from forecasting.baselines import DLinearLikeBaseline, NaiveLastBaseline, PatchTSTHFBaseline
+from forecasting.baselines import (
+    DLinearLikeBaseline,
+    HoltLinearBaseline,
+    LSTMOfficialBaseline,
+    NaiveLastBaseline,
+    PatchTSTHFBaseline,
+    SeasonalNaiveBaseline,
+)
 
 
 _REGISTRY = {
     "naive_last": NaiveLastBaseline,
     "dlinear_like": DLinearLikeBaseline,
+    "holt_linear": HoltLinearBaseline,
+    "lstm_official": LSTMOfficialBaseline,
+    "seasonal_naive": SeasonalNaiveBaseline,
     "patchtst": PatchTSTHFBaseline,
 }
 
@@ -25,8 +35,9 @@ def load_baseline(name: str, model_dir: str | Path, **config: Any) -> ForecastBa
     if name not in _REGISTRY:
         raise ValueError(f"Unknown baseline '{name}'. Available: {sorted(_REGISTRY)}")
     cls = _REGISTRY[name]
+    model_dir = Path(model_dir).expanduser().resolve()
     merged_config = {}
-    state_path = Path(model_dir) / "baseline_state.json"
+    state_path = model_dir / "baseline_state.json"
     if state_path.exists():
         with open(state_path, "r", encoding="utf-8") as f:
             state = json.load(f)

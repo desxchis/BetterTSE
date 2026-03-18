@@ -104,7 +104,12 @@ def _predict_params(
     sample: Dict[str, Any],
     strategy: str,
     calibration_model_path: str | None = None,
+    plan_confidence: float | None = None,
+    tool_name: str | None = None,
 ) -> tuple[Dict[str, Any], Dict[str, Any]]:
+    model_sample = dict(sample)
+    if tool_name is not None:
+        model_sample["tool_name"] = tool_name
     edit_spec = predict_edit_spec(
         intent=intent,
         region=region,
@@ -112,8 +117,9 @@ def _predict_params(
         base_forecast=base_forecast,
         context_text=context_text,
         strategy=strategy,
-        sample=sample,
+        sample=model_sample,
         model_path=calibration_model_path,
+        plan_confidence=plan_confidence,
     )
     params = project_edit_spec_to_params(
         edit_spec=edit_spec,
@@ -133,7 +139,13 @@ def _global_revision(
     sample: Dict[str, Any],
     calibration_strategy: str,
     calibration_model_path: str | None = None,
-) -> tuple[np.ndarray, Dict[str, Any], Dict[str, Any], List[int]]:
+    plan_confidence: float | None = None,
+    tool_name: str | None = None,
+    revision_executor: str = "profile",
+    tedit_model_path: str | None = None,
+    tedit_config_path: str | None = None,
+    tedit_device: str = "cuda:0",
+) -> tuple[np.ndarray, Dict[str, Any], Dict[str, Any], List[int], Dict[str, Any]]:
     horizon = len(base_forecast)
     region = [0, horizon]
     edit_spec, params = _predict_params(
@@ -145,9 +157,57 @@ def _global_revision(
         sample=sample,
         strategy=calibration_strategy,
         calibration_model_path=calibration_model_path,
+        plan_confidence=plan_confidence,
+        tool_name=tool_name,
     )
+    edited, execution_metadata = _apply_with_executor(
+        revision_executor=revision_executor,
+        history_ts=history_ts,
+        base_forecast=base_forecast,
+        intent=intent,
+        region=region,
+        params=params,
+        tool_name=tool_name,
+        tedit_model_path=tedit_model_path,
+        tedit_config_path=tedit_config_path,
+        tedit_device=tedit_device,
+        sample_metadata=sample,
+    )
+    return edited, edit_spec, params, region, execution_metadata
+
+
+def _apply_with_executor(
+    *,
+    revision_executor: str,
+    history_ts: np.ndarray,
+    base_forecast: np.ndarray,
+    intent: Dict[str, Any],
+    region: List[int],
+    params: Dict[str, Any],
+    tool_name: str | None,
+    tedit_model_path: str | None,
+    tedit_config_path: str | None,
+    tedit_device: str,
+    sample_metadata: Dict[str, Any] | None = None,
+) -> tuple[np.ndarray, Dict[str, Any]]:
+    if revision_executor == "tedit_hybrid":
+        from modules.forecast_revision_executor import apply_tedit_hybrid_revision
+
+        edited, _, execution_metadata = apply_tedit_hybrid_revision(
+            history_ts=history_ts,
+            base_forecast=base_forecast,
+            intent=intent,
+            region=region,
+            params=params,
+            preferred_tool_name=tool_name,
+            tedit_model_path=tedit_model_path,
+            tedit_config_path=tedit_config_path,
+            tedit_device=tedit_device,
+            sample_metadata=sample_metadata,
+        )
+        return edited, execution_metadata
     edited, _ = apply_revision_profile(base_forecast, intent, region, params)
-    return edited, edit_spec, params, region
+    return edited, {"executor": "profile", "tool_name": tool_name}
 
 
 def run_revision(
@@ -159,6 +219,10 @@ def run_revision(
     save_visualizations: bool = True,
     calibration_strategy: str = "rule_local_stats",
     calibration_model_path: str | None = None,
+    revision_executor: str = "profile",
+    tedit_model_path: str | None = None,
+    tedit_config_path: str | None = None,
+    tedit_device: str = "cuda:0",
 ) -> Dict[str, Any]:
     with open(benchmark_path, "r", encoding="utf-8") as f:
         payload = json.load(f)
@@ -186,6 +250,7 @@ def run_revision(
             edit_spec = _zero_edit_spec(strategy="base_only")
             params: Dict[str, Any] = {}
             pred_region = [0, 0]
+            execution_metadata: Dict[str, Any] = {"executor": revision_executor, "tool_name": "none"}
         elif mode == "oracle_region":
             plan = heuristic_revision_plan(sample["context_text"], sample["forecast_horizon"])
             pred_region = gt_region
@@ -199,12 +264,27 @@ def run_revision(
                     sample=sample,
                     strategy=calibration_strategy,
                     calibration_model_path=calibration_model_path,
+                    plan_confidence=plan.get("confidence"),
+                    tool_name=plan.get("tool_name"),
                 )
-                edited, _ = apply_revision_profile(base_forecast, plan["intent"], pred_region, params)
+                edited, execution_metadata = _apply_with_executor(
+                    revision_executor=revision_executor,
+                    history_ts=history_ts,
+                    base_forecast=base_forecast,
+                    intent=plan["intent"],
+                    region=pred_region,
+                    params=params,
+                    tool_name=plan.get("tool_name"),
+                    tedit_model_path=tedit_model_path,
+                    tedit_config_path=tedit_config_path,
+                    tedit_device=tedit_device,
+                    sample_metadata=sample,
+                )
             else:
                 edited = base_forecast.copy()
                 edit_spec = _zero_edit_spec(strategy="oracle_region")
                 params = {}
+                execution_metadata = {"executor": revision_executor, "tool_name": "none"}
         elif mode == "oracle_intent":
             pred_region = gt_region
             plan = _oracle_plan(sample, pred_region)
@@ -218,12 +298,27 @@ def run_revision(
                     sample=sample,
                     strategy=calibration_strategy,
                     calibration_model_path=calibration_model_path,
+                    plan_confidence=plan.get("confidence"),
+                    tool_name=plan.get("tool_name"),
                 )
-                edited, _ = apply_revision_profile(base_forecast, plan["intent"], pred_region, params)
+                edited, execution_metadata = _apply_with_executor(
+                    revision_executor=revision_executor,
+                    history_ts=history_ts,
+                    base_forecast=base_forecast,
+                    intent=plan["intent"],
+                    region=pred_region,
+                    params=params,
+                    tool_name=plan.get("tool_name"),
+                    tedit_model_path=tedit_model_path,
+                    tedit_config_path=tedit_config_path,
+                    tedit_device=tedit_device,
+                    sample_metadata=sample,
+                )
             else:
                 edited = base_forecast.copy()
                 edit_spec = _zero_edit_spec(strategy="oracle_intent")
                 params = {}
+                execution_metadata = {"executor": revision_executor, "tool_name": "none"}
         elif mode == "oracle_tool":
             pred_region = gt_region
             pred_plan = heuristic_revision_plan(sample["context_text"], sample["forecast_horizon"])
@@ -240,13 +335,28 @@ def run_revision(
                     sample=sample,
                     strategy=calibration_strategy,
                     calibration_model_path=calibration_model_path,
+                    plan_confidence=plan.get("confidence"),
+                    tool_name=plan.get("tool_name"),
                 )
-                edited, _ = apply_revision_profile(base_forecast, execution_intent, pred_region, params)
+                edited, execution_metadata = _apply_with_executor(
+                    revision_executor=revision_executor,
+                    history_ts=history_ts,
+                    base_forecast=base_forecast,
+                    intent=execution_intent,
+                    region=pred_region,
+                    params=params,
+                    tool_name=plan.get("tool_name"),
+                    tedit_model_path=tedit_model_path,
+                    tedit_config_path=tedit_config_path,
+                    tedit_device=tedit_device,
+                    sample_metadata=sample,
+                )
                 plan["execution_intent"] = execution_intent
             else:
                 edited = base_forecast.copy()
                 edit_spec = _zero_edit_spec(strategy="oracle_tool")
                 params = {}
+                execution_metadata = {"executor": revision_executor, "tool_name": "none"}
         elif mode == "oracle_calibration":
             pred_region = gt_region
             plan = _oracle_plan(sample, pred_region)
@@ -261,15 +371,28 @@ def run_revision(
                         history_ts=history_ts,
                         base_forecast=base_forecast,
                     )
-                edited, _ = apply_revision_profile(base_forecast, plan["intent"], pred_region, params)
+                edited, execution_metadata = _apply_with_executor(
+                    revision_executor=revision_executor,
+                    history_ts=history_ts,
+                    base_forecast=base_forecast,
+                    intent=plan["intent"],
+                    region=pred_region,
+                    params=params,
+                    tool_name=plan.get("tool_name"),
+                    tedit_model_path=tedit_model_path,
+                    tedit_config_path=tedit_config_path,
+                    tedit_device=tedit_device,
+                    sample_metadata=sample,
+                )
             else:
                 edited = base_forecast.copy()
                 edit_spec = _zero_edit_spec(strategy="oracle_calibration")
                 params = {}
+                execution_metadata = {"executor": revision_executor, "tool_name": "none"}
         elif mode == "global_revision_only":
             plan = heuristic_revision_plan(sample["context_text"], sample["forecast_horizon"])
             if plan["revision_needed"]:
-                edited, edit_spec, params, pred_region = _global_revision(
+                edited, edit_spec, params, pred_region, execution_metadata = _global_revision(
                     base_forecast=base_forecast,
                     history_ts=history_ts,
                     context_text=sample["context_text"],
@@ -277,6 +400,12 @@ def run_revision(
                     sample=sample,
                     calibration_strategy=calibration_strategy,
                     calibration_model_path=calibration_model_path,
+                    plan_confidence=plan.get("confidence"),
+                    tool_name=plan.get("tool_name"),
+                    revision_executor=revision_executor,
+                    tedit_model_path=tedit_model_path,
+                    tedit_config_path=tedit_config_path,
+                    tedit_device=tedit_device,
                 )
                 plan["localization"]["region"] = pred_region
             else:
@@ -284,6 +413,7 @@ def run_revision(
                 edit_spec = _zero_edit_spec(strategy="global_revision_only")
                 params = {}
                 pred_region = [0, 0]
+                execution_metadata = {"executor": revision_executor, "tool_name": "none"}
         else:
             plan = heuristic_revision_plan(sample["context_text"], sample["forecast_horizon"])
             pred_region = plan["localization"]["region"]
@@ -297,12 +427,27 @@ def run_revision(
                     sample=sample,
                     strategy=calibration_strategy,
                     calibration_model_path=calibration_model_path,
+                    plan_confidence=plan.get("confidence"),
+                    tool_name=plan.get("tool_name"),
                 )
-                edited, _ = apply_revision_profile(base_forecast, plan["intent"], pred_region, params)
+                edited, execution_metadata = _apply_with_executor(
+                    revision_executor=revision_executor,
+                    history_ts=history_ts,
+                    base_forecast=base_forecast,
+                    intent=plan["intent"],
+                    region=pred_region,
+                    params=params,
+                    tool_name=plan.get("tool_name"),
+                    tedit_model_path=tedit_model_path,
+                    tedit_config_path=tedit_config_path,
+                    tedit_device=tedit_device,
+                    sample_metadata=sample,
+                )
             else:
                 edited = base_forecast.copy()
                 edit_spec = _zero_edit_spec(strategy="localized_full_revision")
                 params = {}
+                execution_metadata = {"executor": revision_executor, "tool_name": "none"}
 
         metrics = evaluate_revision_sample(
             base_forecast=base_forecast,
@@ -333,7 +478,9 @@ def run_revision(
             "edit_spec_gt": edit_spec_gt,
             "calibration": params,
             "calibration_strategy": calibration_strategy,
-        "calibration_model_path": calibration_model_path,
+            "calibration_model_path": calibration_model_path,
+            "revision_executor": revision_executor,
+            "execution_metadata": execution_metadata,
             "metrics": metrics,
             "calibration_metrics": calibration_metrics,
             "intent_alignment": intent_alignment,
@@ -375,6 +522,7 @@ def run_revision(
         "run_timestamp_utc": datetime.now(timezone.utc).isoformat(),
         "visualization_dir": str(vis_dir_obj) if vis_dir_obj is not None else None,
         "calibration_strategy": calibration_strategy,
+        "revision_executor": revision_executor,
         "results": results,
     }
     output_file = Path(output_path)
@@ -476,9 +624,13 @@ def main() -> None:
     parser.add_argument(
         "--calibration-strategy",
         default="rule_local_stats",
-        choices=["text_direct_numeric", "discrete_strength_table", "rule_local_stats", "learned_linear"],
+        choices=["text_direct_numeric", "discrete_strength_table", "rule_local_stats", "learned_linear", "learned_rule_guarded", "learned_rule_shrunk", "learned_confidence_gated", "learned_reliability_gated"],
     )
     parser.add_argument("--calibration-model", default=None)
+    parser.add_argument("--revision-executor", default="profile", choices=["profile", "tedit_hybrid"])
+    parser.add_argument("--tedit-model", default=None)
+    parser.add_argument("--tedit-config", default=None)
+    parser.add_argument("--tedit-device", default="cuda:0")
     args = parser.parse_args()
 
     run_revision(
@@ -490,6 +642,10 @@ def main() -> None:
         save_visualizations=not args.no_save_vis,
         calibration_strategy=args.calibration_strategy,
         calibration_model_path=args.calibration_model,
+        revision_executor=args.revision_executor,
+        tedit_model_path=args.tedit_model,
+        tedit_config_path=args.tedit_config,
+        tedit_device=args.tedit_device,
     )
 
 

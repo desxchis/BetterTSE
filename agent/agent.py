@@ -217,9 +217,12 @@ class A1:
         self.checkpointer = MemorySaver()
         self.app.checkpointer = self.checkpointer
 
-        # 保存工作流可视化图
+        # 保存工作流可视化图（网络受限时不阻断主流程）
         graph_path = Path(__file__).resolve().parents[1] / "workflow_graph.png"
-        graph_path.write_bytes(self.app.get_graph().draw_mermaid_png())
+        try:
+            graph_path.write_bytes(self.app.get_graph().draw_mermaid_png())
+        except Exception as exc:
+            print(f"Warning: skip workflow graph export due to rendering error: {exc}")
 
     # -------------------------------------------------------------------------
     # 状态和管道辅助方法
