@@ -71,7 +71,6 @@ BetterTSE-main/
 │   ├── bettertse_cik_official.py      #   CiK 范式完整 Pipeline + TSEditEvaluator
 │   ├── result_evaluator.py            #   结果评估器（ResultEvaluator）
 │   ├── build_mini_benchmark.py        #   小型基准集构建（旧版）
-│   ├── build_testset.py               #   通用测试集构建（旧版）
 │   ├── data_loader.py                 #   数据加载模块
 │   ├── config.py                      #   test_scripts 内部枚举（ChangeType 等）
 │   ├── change_injector.py             #   物理注入器集合
@@ -89,10 +88,10 @@ BetterTSE-main/
 ├── data/
 │   └── ETTh1.csv                   # 原始时间序列数据
 │
-├── examples/                       # 示例脚本（开发历史记录）
+├── examples/                       # 保留中的示例与诊断脚本
 │   ├── llm_tedit_pipeline_v9_full_validation.py  # 最新完整验证版
 │   ├── llm_tedit_pipeline_v8_soft_boundary.py    # 软边界版
-│   └── ...                         # v1–v7 历史版本
+│   └── ...                         # 其它保留中的分析/诊断脚本
 │
 ├── TEdit-main/                     # TEdit 核心模型代码（子项目）
 │   ├── models/

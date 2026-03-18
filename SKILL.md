@@ -1,65 +1,36 @@
 ---
-name: code-reviewer
-description:
-  Use this skill to review code. It supports both local changes (staged or working tree)
-  and remote Pull Requests (by ID or URL). It focuses on correctness, maintainability,
-  and adherence to project standards.
+name: bettertse-skill-catalog
+description: local skill index for BetterTSE. use this file to discover the repository-specific skill workflows stored under .codex/skills/.
 ---
 
-# Code Reviewer
+# BetterTSE Skill Catalog
 
-This skill guides the agent in conducting professional and thorough code reviews for both local development and remote Pull Requests.
+This repository keeps task-specific Codex workflows under `.codex/skills/`.
 
-## Workflow
+## Available local skills
 
-### 1. Determine Review Target
-*   **Remote PR**: If the user provides a PR number or URL (e.g., "Review PR #123"), target that remote PR.
-*   **Local Changes**: If no specific PR is mentioned, or if the user asks to "review my changes", target the current local file system states (staged and unstaged changes).
+- `bugfix`
+  - Fix a bug with the smallest correct change, validate the affected pipeline path, and summarize residual risk.
+- `feature-delivery`
+  - Deliver a new capability while preserving architecture, schema compatibility, and reproducible validation.
+- `test-and-verify`
+  - Run syntax checks, smoke tests, and path-specific validation for changed behavior.
+- `review-changes`
+  - Review local changes with a risk-first focus on correctness, architecture, schema drift, and missing validation.
+- `retrospective-update`
+  - Convert repeated mistakes into durable AGENTS or workflow improvements.
 
-### 2. Preparation
+## When to use which skill
 
-#### For Remote PRs:
-1.  **Checkout**: Use the GitHub CLI to checkout the PR.
-    ```bash
-    gh pr checkout <PR_NUMBER>
-    ```
-2.  **Preflight**: Execute the project's standard verification suite to catch automated failures early.
-    ```bash
-    npm run preflight
-    ```
-3.  **Context**: Read the PR description and any existing comments to understand the goal and history.
+- Use `bugfix` for root-cause repairs.
+- Use `feature-delivery` for new behavior or workflow additions.
+- Use `test-and-verify` after behavior changes or when confidence is low.
+- Use `review-changes` when asked to inspect diffs or provide review findings.
+- Use `retrospective-update` when the same class of mistake happens repeatedly.
 
-#### For Local Changes:
-1.  **Identify Changes**:
-    *   Check status: `git status`
-    *   Read diffs: `git diff` (working tree) and/or `git diff --staged` (staged).
-2.  **Preflight (Optional)**: If the changes are substantial, ask the user if they want to run `npm run preflight` before reviewing.
+## Related repository rules
 
-### 3. In-Depth Analysis
-Analyze the code changes based on the following pillars:
-
-*   **Correctness**: Does the code achieve its stated purpose without bugs or logical errors?
-*   **Maintainability**: Is the code clean, well-structured, and easy to understand and modify in the future? Consider factors like code clarity, modularity, and adherence to established design patterns.
-*   **Readability**: Is the code well-commented (where necessary) and consistently formatted according to our project's coding style guidelines?
-*   **Efficiency**: Are there any obvious performance bottlenecks or resource inefficiencies introduced by the changes?
-*   **Security**: Are there any potential security vulnerabilities or insecure coding practices?
-*   **Edge Cases and Error Handling**: Does the code appropriately handle edge cases and potential errors?
-*   **Testability**: Is the new or modified code adequately covered by tests (even if preflight checks pass)? Suggest additional test cases that would improve coverage or robustness.
-
-### 4. Provide Feedback
-
-#### Structure
-*   **Summary**: A high-level overview of the review.
-*   **Findings**:
-    *   **Critical**: Bugs, security issues, or breaking changes.
-    *   **Improvements**: Suggestions for better code quality or performance.
-    *   **Nitpicks**: Formatting or minor style issues (optional).
-*   **Conclusion**: Clear recommendation (Approved / Request Changes).
-
-#### Tone
-*   Be constructive, professional, and friendly.
-*   Explain *why* a change is requested.
-*   For approvals, acknowledge the specific value of the contribution.
-
-### 5. Cleanup (Remote PRs only)
-*   After the review, ask the user if they want to switch back to the default branch (e.g., `main` or `master`).
+- Project-wide guardrails live in `AGENTS.md`.
+- High-risk tooling rules live in `tool/AGENTS.md`.
+- Review format lives in `docs/code_review.md`.
+- Process improvements live in `docs/retrospective.md`.
