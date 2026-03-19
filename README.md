@@ -1,6 +1,30 @@
 # BetterTSF
 
-BetterTSF is an agentic time series forecasting workflow that combines a language model planner with deterministic time series tools. The core idea is to keep the LLM focused on choosing *what* to do (which tool, where to apply it, and how strongly), while the actual series updates are performed by transparent, reproducible functions. The system loops over three stages - describe, plan, compose - until the forecast is good enough.
+BetterTSF is an agentic time series editing framework with a forecast-revision application track.
+
+## Mainline Status (Canonical)
+
+Current repository mainline is organized into **two connected tasks**:
+
+1. **Pure time-series editing**  
+   `base_ts + vague_prompt -> generated_ts`
+
+2. **Forecast revision as downstream application**  
+   `history + base_forecast + context_text -> edited_forecast`
+
+The first task is the method core: BetterTSE focuses on parsing complex or vague instructions into executable time-series edits. The second task reuses that capability in a forecasting scenario to test generality and robustness across different forecast backbones.
+
+Recommended entry points are:
+
+- pure editing: `run_pipeline.py`
+- forecast baseline preparation: `test_scripts/train_forecast_baseline.py`
+- forecast-revision benchmark construction: `test_scripts/build_*forecast_revision*_benchmark.py`
+- forecast-revision execution and evaluation: `run_forecast_revision.py`
+- multi-backbone forecast-revision orchestration: `test_scripts/run_multibackbone_forecast_revision.py`
+
+Baseline models in `forecasting/` are maintained as **forecast providers for the forecast-revision application track**. They are not the main research contribution by themselves; they support testing that the editing method does not depend on a single backbone.
+
+The core idea remains: keep the LLM focused on choosing *what/where/how* to edit, while actual series updates are performed by transparent, reproducible functions.
 
 ## How it works (end-to-end)
 

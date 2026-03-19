@@ -232,9 +232,13 @@ def build_benchmark(
 
     output_root = Path(output_dir)
     output_root.mkdir(parents=True, exist_ok=True)
+    target_construction_method = "synthetic_physical_injection"
     payload = {
         "dataset_name": dataset_name,
         "feature": feature,
+        "task_family": "forecast_revision",
+        "application_of": "bettertse_editing",
+        "target_construction_method": target_construction_method,
         "baseline_name": baseline_name,
         "context_style": context_style,
         "schema_version": "forecast_revision_v1",

@@ -2,13 +2,25 @@
 
 > 更新时间：2026-03-12
 
+> 主线声明（2026-03-19）：
+> 当前仓库按 **双任务结构** 维护：
+> 1. `run_pipeline.py` 对应纯时间序列编辑主任务。
+> 2. `run_forecast_revision.py` 对应 forecast revision downstream application。
+> 二者并行存在，但前者是方法核心，后者是应用验证线。
+
 ---
 
 ## 一、项目概述
 
-**BetterTSE** (Better Time Series Editing) 是一个结合**扩散模型**与**大语言模型（LLM）**的时间序列智能编辑框架，核心目标是：
+**BetterTSE** (Better Time Series Editing) 是一个结合**扩散模型**与**大语言模型（LLM）**的时间序列编辑框架，并包含一个 forecast revision 应用线。
 
-> 给定一段真实时间序列（Base TS）和一条模糊的事件性自然语言指令（Vague Prompt），让系统自动理解编辑意图、定位时间区间、调用编辑工具，产出符合预期的 Target TS，并以多维指标量化评估效果。
+主任务：
+
+> 给定原始时间序列和复杂/模糊指令，让系统理解编辑意图、定位时间区间、调用编辑工具，产出可解释的编辑后序列。
+
+下游应用：
+
+> 给定历史序列、baseline forecast 和上下文文本，在 `base_forecast` 上执行 BetterTSE 风格的可解释修正，并以多维指标量化效果。
 
 ### 核心技术
 
@@ -66,19 +78,13 @@ BetterTSE-main/
 │       ├── tedit_tools.py
 │       └── ts_processor.py
 │
-├── test_scripts/                   # 测试集构建与评估
-│   ├── build_event_driven_testset.py  # ★ 主用：事件驱动测试集生成器
-│   ├── bettertse_cik_official.py      #   CiK 范式完整 Pipeline + TSEditEvaluator
-│   ├── result_evaluator.py            #   结果评估器（ResultEvaluator）
-│   ├── build_mini_benchmark.py        #   小型基准集构建（旧版）
-│   ├── data_loader.py                 #   数据加载模块
-│   ├── config.py                      #   test_scripts 内部枚举（ChangeType 等）
-│   ├── change_injector.py             #   物理注入器集合
-│   ├── llm_interface.py               #   LLM 接口封装
-│   ├── test_pipeline.py               #   测试 Pipeline
-│   ├── main.py                        #   入口脚本
-│   ├── data/ETTh1.csv                 #   本地测试数据
-│   └── test_results/                  #   评估结果输出
+├── test_scripts/                   # 数据构建、实验编排与验证脚本
+│   ├── build_event_driven_testset.py     # 纯编辑测试集构建
+│   ├── bettertse_cik_official.py         # 纯编辑评估器与官方 CiK 流程
+│   ├── build_forecast_revision_benchmark.py   # forecast revision benchmark 构建
+│   ├── run_forecast_revision_smoke_demo.py    # forecast revision smoke demo
+│   ├── train_forecast_baseline.py            # base forecast 模型准备
+│   └── run_multibackbone_forecast_revision.py # 选定 backbone 集合的应用线编排
 │
 ├── event_driven_testset_ultimate/  # ★ 当前正式测试集（保留）
 │   ├── event_driven_testset_ETTh1_5.json   # 5 条样本
@@ -355,9 +361,9 @@ run_pipeline(
 )
 ```
 
-**格式兼容**：通过 `_normalize_gt_config()` 统一两种 gt_config 字段命名：
-- `build_mini_benchmark.py` 产出：`gt_start` / `gt_end`
-- `bettertse_cik_official.py` 产出：`start_step` / `end_step`
+**格式兼容**：通过 `_normalize_gt_config()` 同时兼容当前主测试集字段与旧样本字段：
+- legacy samples：`gt_start` / `gt_end`
+- `bettertse_cik_official.py`：`start_step` / `end_step`
 
 **数学-only fallback**（`_math_only_edit()`）：无 TEdit 时，基于 LLM 预测区间做线性平移，仅评估区间定位能力。
 

@@ -1,5 +1,9 @@
 # Forecasting Baselines
 
+Boundary:
+`forecasting/` is a support layer for the forecast-revision pipeline.
+Baselines here are maintained as `base_forecast` providers, not as a standalone forecasting benchmark track.
+
 Current revision-benchmark forecasting baselines:
 
 - `naive_last`
@@ -9,9 +13,8 @@ Current revision-benchmark forecasting baselines:
 - `seasonal_naive`
 - `patchtst`
 
-Primary baseline for forecast-revision experiments:
-
-- `patchtst`
+These are currently supported baseline implementations, not a fixed project-wide or paper-wide backbone set.
+The intended workflow is to keep the `base_forecast` interface stable while progressively reproducing and integrating newer forecasting models.
 
 ## Train Or Materialize A Baseline
 
@@ -88,7 +91,7 @@ python test_scripts/train_forecast_baseline.py \
   --output-dir tmp/baselines/weather_lstm_official
 ```
 
-For trainable deep baselines such as `patchtst`, point the benchmark builder to the
+For trainable baselines such as `patchtst`, point the benchmark builder to the
 saved directory via `--baseline-model-dir`.
 
 ## Use In Forecast Revision Benchmark Builders

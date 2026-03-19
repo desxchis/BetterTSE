@@ -67,16 +67,16 @@ logger = logging.getLogger("PipelineRunner")
 
 
 # ---------------------------------------------------------------------------
-# 格式归一化：同时支持两种测试集的 gt_config 字段名
-#   bettertse_cik_official.py → start_step / end_step
-#   build_mini_benchmark.py   → gt_start   / gt_end
+# 格式归一化：兼容当前主测试集和旧样本字段名
+#   bettertse_cik_official.py / event-driven 主线 → start_step / end_step
+#   legacy samples                                 → gt_start / gt_end
 # ---------------------------------------------------------------------------
 
 def _normalize_gt_config(sample: Dict[str, Any]) -> Dict[str, Any]:
     """返回包含 start_step / end_step / target_feature 的标准 gt_config."""
     gt_config: Dict[str, Any] = dict(sample.get("gt_config", {}))
 
-    # build_mini_benchmark 格式
+    # legacy sample format
     if "start_step" not in gt_config:
         gt_config["start_step"] = sample.get("gt_start", gt_config.get("gt_start", 0))
     if "end_step" not in gt_config:
