@@ -208,7 +208,7 @@ def main() -> None:
     parser.add_argument("--xtraffic-channel", default="flow")
     parser.add_argument("--mtbench-path", default=None)
     parser.add_argument("--mtbench-limit", type=int, default=None)
-    parser.add_argument("--timemmd-root", default=None)
+    parser.add_argument("--timemmd-root", default="data/Time-MMD")
     parser.add_argument("--timemmd-domain", default="Energy")
     parser.add_argument("--train-ratio", type=float, default=0.8)
     parser.add_argument("--context-length", type=int, default=96)

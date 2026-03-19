@@ -67,6 +67,8 @@ data/traffic.csv
 data/Weather.csv
 data/mtbench/
 data/xtraffic_minimal/
+data/Time-MMD/
+forecasting/baselines/vendor/
 .ipynb_checkpoints/
 **/.ipynb_checkpoints/
 

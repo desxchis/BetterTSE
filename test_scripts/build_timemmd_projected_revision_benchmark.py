@@ -323,7 +323,7 @@ def build_timemmd_projected_benchmark(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Build projected forecast revision benchmark from Time-MMD.")
-    parser.add_argument("--timemmd-root", default="external/Time-MMD")
+    parser.add_argument("--timemmd-root", default="data/Time-MMD")
     parser.add_argument("--domain", default="Energy")
     parser.add_argument("--text-source", choices=["report", "search", "all"], default="report")
     parser.add_argument("--output-dir", required=True)
