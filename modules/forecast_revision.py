@@ -6,6 +6,7 @@ from typing import Any, Dict, List, Tuple
 import numpy as np
 
 from modules.edit_spec_learned import load_model as load_edit_spec_model, predict_with_model
+from modules.reliability_learned import load_model as load_reliability_bundle, predict_reliability
 
 
 CALIBRATION_SPEC_KEYS = (
@@ -40,6 +41,10 @@ class ForecastRevisionSample:
     duration_bucket_gt: str
     revision_operator_family: str
     revision_operator_params: Dict[str, Any]
+    projection_residual: List[float] | None = None
+    revision_target_source: str = "unspecified"
+    target_projection_metrics: Dict[str, Any] | None = None
+    intent_struct: Dict[str, Any] | None = None
     edit_spec_gt: Dict[str, Any] | None = None
     timestamp: str = ""
 
@@ -146,6 +151,287 @@ def _text_intensity_modifier(text: str) -> float:
     return float(modifier)
 
 
+def _activation_confidence(intent: Dict[str, Any], context_text: str, plan_confidence: float | None) -> float:
+    shape = str(intent.get("shape", "none"))
+    duration = str(intent.get("duration", "none"))
+    strength = str(intent.get("strength", "none"))
+    effect_family = str(intent.get("effect_family", "none"))
+    direction = str(intent.get("direction", "neutral"))
+
+    score = float(plan_confidence if plan_confidence is not None else 0.75)
+    normalized = (context_text or "").lower()
+
+    if effect_family == "level" and shape in {"step", "plateau"}:
+        score += 0.12
+    elif shape == "hump":
+        score -= 0.10
+    elif effect_family in {"volatility", "shutdown"}:
+        score -= 0.06
+
+    if duration in {"medium", "long", "full_horizon"}:
+        score += 0.06
+    elif duration == "short":
+        score -= 0.08
+
+    if strength in {"medium", "strong"}:
+        score += 0.04
+    elif strength == "weak":
+        score -= 0.05
+
+    if direction == "neutral":
+        score -= 0.04
+
+    if any(token in normalized for token in ("upgrade", "downgrade", "guidance", "repric", "reprice", "forecast", "outlook", "estimate")):
+        score += 0.05
+    if any(token in normalized for token in ("brief", "temporary", "intraday", "volatile", "noise", "uncertain")):
+        score -= 0.06
+    return _clamp(score, 0.0, 1.0)
+
+
+def _guarded_learned_spec(
+    intent: Dict[str, Any],
+    region: List[int],
+    history_ts: np.ndarray,
+    base_forecast: np.ndarray,
+    context_text: str,
+    model_path: str,
+) -> Dict[str, Any]:
+    learned = predict_with_model(load_edit_spec_model(model_path), intent, region, history_ts, base_forecast, context_text)
+    rule = predict_edit_spec(
+        intent=intent,
+        region=region,
+        history_ts=history_ts,
+        base_forecast=base_forecast,
+        context_text=context_text,
+        strategy="rule_local_stats",
+    )
+
+    shape = str(intent.get("shape", "none"))
+    duration = str(intent.get("duration", "none"))
+    strength = str(intent.get("strength", "none"))
+    effect_family = str(intent.get("effect_family", "none"))
+
+    structurally_simple = (
+        effect_family == "level"
+        and shape in {"step", "plateau"}
+        and duration in {"medium", "long", "full_horizon"}
+        and strength in {"medium", "strong"}
+    )
+
+    delta_gap = abs(float(learned.get("delta_level_z", 0.0)) - float(rule.get("delta_level_z", 0.0)))
+    duration_gap = abs(float(learned.get("duration_ratio", 0.0)) - float(rule.get("duration_ratio", 0.0)))
+    amp_gap = abs(float(learned.get("amp_ratio", 0.0)) - float(rule.get("amp_ratio", 0.0)))
+
+    learned_abs_delta = abs(float(learned.get("delta_level_z", 0.0)))
+    rule_abs_delta = abs(float(rule.get("delta_level_z", 0.0)))
+    overconfident = learned_abs_delta > max(1.75 * max(rule_abs_delta, 0.35), rule_abs_delta + 0.8)
+
+    if (not structurally_simple) or delta_gap > 0.9 or duration_gap > 0.25 or amp_gap > 0.75 or overconfident:
+        fallback = dict(rule)
+        fallback["strategy"] = "learned_rule_guarded:fallback_rule"
+        return fallback
+
+    blended = {}
+    for key in CALIBRATION_SPEC_KEYS:
+        blended[key] = float(0.65 * float(learned.get(key, 0.0)) + 0.35 * float(rule.get(key, 0.0)))
+    blended["duration_ratio"] = _clamp(float(blended.get("duration_ratio", 0.0)), 0.0, 1.0)
+    blended["recovery_ratio"] = _clamp(float(blended.get("recovery_ratio", 0.0)), 0.0, 1.0)
+    blended["vol_ratio"] = max(0.0, float(blended.get("vol_ratio", 0.0)))
+    blended["amp_ratio"] = max(0.0, float(blended.get("amp_ratio", 0.0)))
+    blended["floor_ratio"] = max(0.0, float(blended.get("floor_ratio", 0.0)))
+    blended["strategy"] = "learned_rule_guarded:blended"
+    return blended
+
+
+def _shrunk_learned_spec(
+    intent: Dict[str, Any],
+    region: List[int],
+    history_ts: np.ndarray,
+    base_forecast: np.ndarray,
+    context_text: str,
+    model_path: str,
+) -> Dict[str, Any]:
+    learned = predict_with_model(load_edit_spec_model(model_path), intent, region, history_ts, base_forecast, context_text)
+    rule = predict_edit_spec(
+        intent=intent,
+        region=region,
+        history_ts=history_ts,
+        base_forecast=base_forecast,
+        context_text=context_text,
+        strategy="rule_local_stats",
+    )
+
+    shape = str(intent.get("shape", "none"))
+    duration = str(intent.get("duration", "none"))
+    strength = str(intent.get("strength", "none"))
+    effect_family = str(intent.get("effect_family", "none"))
+
+    if shape in {None, "none"} or effect_family == "none":
+        fallback = dict(rule)
+        fallback["strategy"] = "learned_rule_shrunk:rule_only"
+        return fallback
+
+    delta_gap = abs(float(learned.get("delta_level_z", 0.0)) - float(rule.get("delta_level_z", 0.0)))
+    duration_gap = abs(float(learned.get("duration_ratio", 0.0)) - float(rule.get("duration_ratio", 0.0)))
+    amp_gap = abs(float(learned.get("amp_ratio", 0.0)) - float(rule.get("amp_ratio", 0.0)))
+    slope_gap = abs(float(learned.get("slope_ratio", 0.0)) - float(rule.get("slope_ratio", 0.0)))
+    recovery_gap = abs(float(learned.get("recovery_ratio", 0.0)) - float(rule.get("recovery_ratio", 0.0)))
+
+    rule_abs_delta = abs(float(rule.get("delta_level_z", 0.0)))
+    learned_abs_delta = abs(float(learned.get("delta_level_z", 0.0)))
+    relative_delta_gap = delta_gap / max(rule_abs_delta + 0.35, 0.75)
+    disagreement = (
+        0.45 * relative_delta_gap
+        + 0.20 * (duration_gap / 0.35)
+        + 0.20 * (amp_gap / 0.8)
+        + 0.10 * (slope_gap / 1.25)
+        + 0.05 * (recovery_gap / 0.35)
+    )
+
+    structurally_simple = effect_family == "level" and shape in {"step", "plateau"}
+    if structurally_simple:
+        max_weight = 0.55
+    elif shape == "hump":
+        max_weight = 0.22
+    else:
+        max_weight = 0.18
+
+    if duration in {"short", "none"}:
+        max_weight *= 0.55
+    elif duration in {"medium", "long", "full_horizon"}:
+        max_weight *= 1.0
+    else:
+        max_weight *= 0.7
+
+    if strength == "weak":
+        max_weight *= 0.7
+    elif strength == "strong":
+        max_weight *= 1.0
+    else:
+        max_weight *= 0.85
+
+    if learned_abs_delta > max(rule_abs_delta + 1.25, 2.0 * max(rule_abs_delta, 0.25)):
+        max_weight *= 0.35
+
+    learned_weight = _clamp(max_weight / (1.0 + max(disagreement, 0.0)), 0.0, max_weight)
+
+    blended = {}
+    for key in CALIBRATION_SPEC_KEYS:
+        rule_value = float(rule.get(key, 0.0))
+        learned_value = float(learned.get(key, 0.0))
+        blended[key] = float(rule_value + learned_weight * (learned_value - rule_value))
+
+    blended["duration_ratio"] = _clamp(float(blended.get("duration_ratio", 0.0)), 0.0, 1.0)
+    blended["recovery_ratio"] = _clamp(float(blended.get("recovery_ratio", 0.0)), 0.0, 1.0)
+    blended["vol_ratio"] = max(0.0, float(blended.get("vol_ratio", 0.0)))
+    blended["amp_ratio"] = max(0.0, float(blended.get("amp_ratio", 0.0)))
+    blended["floor_ratio"] = max(0.0, float(blended.get("floor_ratio", 0.0)))
+    blended["strategy"] = f"learned_rule_shrunk:w={learned_weight:.3f}"
+    return blended
+
+
+def _confidence_gated_learned_spec(
+    intent: Dict[str, Any],
+    region: List[int],
+    history_ts: np.ndarray,
+    base_forecast: np.ndarray,
+    context_text: str,
+    model_path: str,
+    plan_confidence: float | None,
+) -> Dict[str, Any]:
+    learned = predict_with_model(load_edit_spec_model(model_path), intent, region, history_ts, base_forecast, context_text)
+    rule = predict_edit_spec(
+        intent=intent,
+        region=region,
+        history_ts=history_ts,
+        base_forecast=base_forecast,
+        context_text=context_text,
+        strategy="rule_local_stats",
+    )
+
+    activation = _activation_confidence(intent, context_text, plan_confidence)
+    if activation < 0.82:
+        fallback = dict(rule)
+        fallback["strategy"] = f"learned_confidence_gated:rule@{activation:.3f}"
+        return fallback
+
+    max_weight = 0.25 + 0.55 * ((activation - 0.82) / 0.18)
+    max_weight = _clamp(max_weight, 0.25, 0.80)
+
+    blended = {}
+    for key in CALIBRATION_SPEC_KEYS:
+        rule_value = float(rule.get(key, 0.0))
+        learned_value = float(learned.get(key, 0.0))
+        blended[key] = float(rule_value + max_weight * (learned_value - rule_value))
+
+    blended["duration_ratio"] = _clamp(float(blended.get("duration_ratio", 0.0)), 0.0, 1.0)
+    blended["recovery_ratio"] = _clamp(float(blended.get("recovery_ratio", 0.0)), 0.0, 1.0)
+    blended["vol_ratio"] = max(0.0, float(blended.get("vol_ratio", 0.0)))
+    blended["amp_ratio"] = max(0.0, float(blended.get("amp_ratio", 0.0)))
+    blended["floor_ratio"] = max(0.0, float(blended.get("floor_ratio", 0.0)))
+    blended["strategy"] = f"learned_confidence_gated:blend@{activation:.3f}:w={max_weight:.3f}"
+    return blended
+
+
+def _disagreement_features(rule: Dict[str, Any], learned: Dict[str, Any]) -> Dict[str, float]:
+    return {
+        "delta_gap": abs(float(learned.get("delta_level_z", 0.0)) - float(rule.get("delta_level_z", 0.0))),
+        "duration_gap": abs(float(learned.get("duration_ratio", 0.0)) - float(rule.get("duration_ratio", 0.0))),
+        "amp_gap": abs(float(learned.get("amp_ratio", 0.0)) - float(rule.get("amp_ratio", 0.0))),
+        "slope_gap": abs(float(learned.get("slope_ratio", 0.0)) - float(rule.get("slope_ratio", 0.0))),
+        "recovery_gap": abs(float(learned.get("recovery_ratio", 0.0)) - float(rule.get("recovery_ratio", 0.0))),
+    }
+
+
+def _reliability_gated_learned_spec(
+    intent: Dict[str, Any],
+    region: List[int],
+    history_ts: np.ndarray,
+    base_forecast: np.ndarray,
+    context_text: str,
+    model_path: str,
+    plan_confidence: float | None,
+    sample: Dict[str, Any] | None,
+) -> Dict[str, Any]:
+    bundle = load_reliability_bundle(model_path)
+    learned_model_path = bundle.get("learned_calibrator_path")
+    if not learned_model_path:
+        raise ValueError("learned_reliability_gate bundle missing learned_calibrator_path")
+
+    learned = predict_with_model(load_edit_spec_model(learned_model_path), intent, region, history_ts, base_forecast, context_text)
+    rule = predict_edit_spec(
+        intent=intent,
+        region=region,
+        history_ts=history_ts,
+        base_forecast=base_forecast,
+        context_text=context_text,
+        strategy="rule_local_stats",
+    )
+    disagreement = _disagreement_features(rule, learned)
+    tool_name = "none"
+    if sample is not None:
+        tool_name = str(sample.get("tool_name", "none"))
+    reliability = predict_reliability(
+        bundle["reliability_model"],
+        intent=intent,
+        region=region,
+        history_ts=history_ts,
+        base_forecast=base_forecast,
+        context_text=context_text,
+        plan_confidence=float(plan_confidence if plan_confidence is not None else 0.75),
+        tool_name=tool_name,
+        disagreement=disagreement,
+    )
+    threshold = float(bundle.get("threshold", 0.75))
+    if reliability < threshold:
+        fallback = dict(rule)
+        fallback["strategy"] = f"learned_reliability_gated:rule@{reliability:.3f}"
+        return fallback
+    kept = dict(learned)
+    kept["strategy"] = f"learned_reliability_gated:learned@{reliability:.3f}"
+    return kept
+
+
 def infer_future_bucket(text: str) -> str:
     normalized = text or ""
     if any(token in normalized for token in ("整个预测窗口", "全窗口", "全时段", "full horizon", "full_horizon")):
@@ -161,6 +447,110 @@ def infer_future_bucket(text: str) -> str:
 
 def heuristic_revision_plan(context_text: str, horizon: int) -> Dict[str, Any]:
     normalized = context_text or ""
+    lowered = normalized.lower()
+
+    structured_direction = None
+    structured_shape = None
+    structured_duration = None
+    structured_strength = None
+    structured_bucket = None
+    if "direction=up" in lowered:
+        structured_direction = "up"
+    elif "direction=down" in lowered:
+        structured_direction = "down"
+    elif "direction=neutral" in lowered:
+        structured_direction = "neutral"
+    if "shape=plateau" in lowered:
+        structured_shape = "plateau"
+    elif "shape=step" in lowered:
+        structured_shape = "step"
+    elif "shape=hump" in lowered:
+        structured_shape = "hump"
+    elif "shape=flatline" in lowered:
+        structured_shape = "flatline"
+    elif "shape=irregular_noise" in lowered:
+        structured_shape = "irregular_noise"
+    elif "shape=none" in lowered:
+        structured_shape = "none"
+    if "duration=short" in lowered:
+        structured_duration = "short"
+    elif "duration=medium" in lowered:
+        structured_duration = "medium"
+    elif "duration=long" in lowered:
+        structured_duration = "long"
+    elif "duration=none" in lowered:
+        structured_duration = "none"
+    if "strength=weak" in lowered:
+        structured_strength = "weak"
+    elif "strength=medium" in lowered:
+        structured_strength = "medium"
+    elif "strength=strong" in lowered:
+        structured_strength = "strong"
+    elif "strength=none" in lowered:
+        structured_strength = "none"
+    if "bucket=full_horizon" in lowered:
+        structured_bucket = "full_horizon"
+    elif "bucket=early_horizon" in lowered:
+        structured_bucket = "early_horizon"
+    elif "bucket=mid_horizon" in lowered:
+        structured_bucket = "mid_horizon"
+    elif "bucket=late_horizon" in lowered:
+        structured_bucket = "late_horizon"
+    elif "bucket=none" in lowered:
+        structured_bucket = "none"
+
+    if structured_shape is not None and structured_direction is not None:
+        if structured_shape == "none" or structured_direction == "neutral":
+            return {
+                "revision_needed": False,
+                "confidence": 0.95,
+                "intent": {
+                    "effect_family": "none",
+                    "direction": "neutral",
+                    "shape": "none",
+                    "duration": structured_duration or "none",
+                    "strength": structured_strength or "none",
+                },
+                "localization": {
+                    "position_bucket": structured_bucket or "none",
+                    "region": [0, 0],
+                },
+                "tool_name": "none",
+            }
+        if structured_shape == "flatline":
+            effect_family = "shutdown"
+            tool_name = "hybrid_down"
+        elif structured_shape == "irregular_noise":
+            effect_family = "volatility"
+            tool_name = "volatility_increase"
+        elif structured_shape == "hump":
+            effect_family = "impulse"
+            tool_name = "spike_inject"
+        elif structured_shape == "step":
+            effect_family = "level"
+            tool_name = "step_shift"
+        else:
+            effect_family = "level"
+            tool_name = "hybrid_down" if structured_direction == "down" else "hybrid_up"
+        bucket = structured_bucket or infer_future_bucket(normalized)
+        duration_bucket = structured_duration or "medium"
+        return {
+            "revision_needed": True,
+            "confidence": 0.95,
+            "intent": {
+                "effect_family": effect_family,
+                "direction": structured_direction,
+                "shape": structured_shape,
+                "duration": duration_bucket,
+                "strength": structured_strength or "medium",
+            },
+            "localization": {
+                "position_bucket": bucket,
+                "region": localize_future_region(bucket, duration_bucket, horizon),
+            },
+            "tool_name": tool_name,
+        }
+
     if any(token in normalized for token in ("无新增影响", "暂无额外冲击", "维持原预测", "没有新的修正信号")):
         return {
             "revision_needed": False,
@@ -179,8 +569,8 @@ def heuristic_revision_plan(context_text: str, horizon: int) -> Dict[str, Any]:
             "tool_name": "none",
         }
     bucket = infer_future_bucket(normalized)
-    finance_down = any(token in normalized.lower() for token in ("bearish", "downgrade", "cut guidance", "crashing", "negative outlook"))
-    finance_up = any(token in normalized.lower() for token in ("bullish", "upgrade", "positive outlook", "beats estimates", "raising guidance"))
+    finance_down = any(token in lowered for token in ("bearish", "downgrade", "cut guidance", "crashing", "negative outlook"))
+    finance_up = any(token in lowered for token in ("bullish", "upgrade", "positive outlook", "beats estimates", "raising guidance"))
     if any(token in normalized for token in ("flatline", "停摆", "中断", "低位运行", "极低水平")):
         shape = "flatline"
         effect_family = "shutdown"
@@ -341,6 +731,7 @@ def predict_edit_spec(
     strategy: str = "rule_local_stats",
     sample: Dict[str, Any] | None = None,
     model_path: str | None = None,
+    plan_confidence: float | None = None,
 ) -> Dict[str, Any]:
     shape = intent.get("shape")
     if shape in {None, "none"}:
@@ -354,6 +745,22 @@ def predict_edit_spec(
             raise ValueError("model_path is required for learned_linear strategy")
         model = load_edit_spec_model(model_path)
         return predict_with_model(model, intent, region, history_ts, base_forecast, context_text)
+    if strategy == "learned_rule_guarded":
+        if not model_path:
+            raise ValueError("model_path is required for learned_rule_guarded strategy")
+        return _guarded_learned_spec(intent, region, history_ts, base_forecast, context_text, model_path)
+    if strategy == "learned_rule_shrunk":
+        if not model_path:
+            raise ValueError("model_path is required for learned_rule_shrunk strategy")
+        return _shrunk_learned_spec(intent, region, history_ts, base_forecast, context_text, model_path)
+    if strategy == "learned_confidence_gated":
+        if not model_path:
+            raise ValueError("model_path is required for learned_confidence_gated strategy")
+        return _confidence_gated_learned_spec(intent, region, history_ts, base_forecast, context_text, model_path, plan_confidence)
+    if strategy == "learned_reliability_gated":
+        if not model_path:
+            raise ValueError("model_path is required for learned_reliability_gated strategy")
+        return _reliability_gated_learned_spec(intent, region, history_ts, base_forecast, context_text, model_path, plan_confidence, sample)
 
     ctx = _local_context(region, history_ts, base_forecast)
     strength = str(intent.get("strength", "medium"))
@@ -362,6 +769,8 @@ def predict_edit_spec(
     duration_ratio = _duration_ratio_from_bucket(duration_bucket)
     text_modifier = _text_intensity_modifier(context_text)
     shape = str(shape)
+    structured_hint = "[revisionhint]" in str(context_text or "").lower()
+    hinted_bucket = infer_future_bucket(context_text) if structured_hint else None
 
     spec = _zero_edit_spec(strategy=strategy)
     spec["duration_ratio"] = duration_ratio
@@ -445,6 +854,18 @@ def predict_edit_spec(
             "slope_ratio": 1.0,
             "recovery_ratio": 0.0,
         })
+
+    if structured_hint and shape in {"plateau", "step"}:
+        hint_scale = {
+            "weak": 0.45,
+            "medium": 0.62,
+            "strong": 0.8,
+        }.get(strength, 0.62)
+        spec["delta_level_z"] = float(spec.get("delta_level_z", 0.0)) * hint_scale
+        spec["amp_ratio"] = min(float(spec.get("amp_ratio", 1.0)), 0.9 if strength == "weak" else 1.0)
+        if hinted_bucket == "full_horizon":
+            spec["duration_ratio"] = 1.0
+            spec["recovery_ratio"] = 0.0
     return spec
 
 
@@ -508,6 +929,7 @@ def calibrate_revision(
     strategy: str = "rule_local_stats",
     sample: Dict[str, Any] | None = None,
     model_path: str | None = None,
+    plan_confidence: float | None = None,
 ) -> Dict[str, Any]:
     edit_spec = predict_edit_spec(
         intent=intent,
@@ -518,6 +940,7 @@ def calibrate_revision(
         strategy=strategy,
         sample=sample,
         model_path=model_path,
+        plan_confidence=plan_confidence,
     )
     return project_edit_spec_to_params(
         edit_spec=edit_spec,

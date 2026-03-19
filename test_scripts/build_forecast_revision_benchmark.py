@@ -16,9 +16,12 @@ if str(_ROOT) not in sys.path:
 from forecasting import create_baseline
 from forecasting.data_utils import load_univariate_series
 from forecasting.registry import load_baseline
+from modules.forecast_revision_benchmark import (
+    anchor_forecast_to_history,
+    apply_physical_revision_injection,
+)
 from modules.forecast_revision import (
     ForecastRevisionSample,
-    apply_revision_profile,
     extract_gt_edit_spec,
 )
 
@@ -126,6 +129,10 @@ def build_benchmark(
     context_style: str = "generic",
 ) -> Dict[str, Any]:
     series, feature = load_univariate_series(csv_path, target_col)
+    if baseline_name == "patchtst" and not baseline_model_dir:
+        raise ValueError(
+            "baseline_name='patchtst' requires --baseline-model-dir with a trained PatchTST checkpoint."
+        )
     baseline = (
         load_baseline(baseline_name, baseline_model_dir)
         if baseline_model_dir
@@ -144,7 +151,8 @@ def build_benchmark(
         future_gt = series[start + seq_len:start + seq_len + pred_len]
         if len(future_gt) < pred_len:
             continue
-        base_forecast = baseline.predict(history, pred_len)
+        raw_base_forecast = np.asarray(baseline.predict(history, pred_len), dtype=np.float64)
+        base_forecast, anchor_metadata = anchor_forecast_to_history(history, raw_base_forecast)
         spec = _operator_spec(idx, include_no_revision_every=include_no_revision_every)
         if spec["operator"] == "none":
             region = [0, 0]
@@ -160,6 +168,7 @@ def build_benchmark(
             delta = np.zeros(pred_len, dtype=np.float64)
             mask = np.zeros(pred_len, dtype=int)
             revision_applicable_gt = False
+            injection_metadata = {"injection_type": "none", "region": region}
         else:
             region = _bucket_region(spec["bucket"], pred_len, spec["duration_bucket"])
             intent = {
@@ -177,7 +186,13 @@ def build_benchmark(
                 "volatility_scale": 1.8,
                 "floor_value": float(np.nanmin(base_forecast) - max(np.nanstd(base_forecast), 1e-3) * 1.2),
             }
-            revision_target, delta = apply_revision_profile(base_forecast, intent, region, params, seed=idx + 7)
+            revision_target, delta, injection_metadata = apply_physical_revision_injection(
+                base_forecast,
+                intent,
+                region,
+                seed=idx + 7,
+                params=params,
+            )
             mask = np.zeros(pred_len, dtype=int)
             mask[region[0]:region[1]] = 1
             revision_applicable_gt = True
@@ -205,6 +220,8 @@ def build_benchmark(
                 "region": region,
                 "bucket": spec["bucket"],
                 "params": params,
+                "anchor_metadata": anchor_metadata,
+                "injection_metadata": injection_metadata,
             },
             edit_spec_gt=None,
             timestamp=datetime.now(timezone.utc).isoformat(),
@@ -234,7 +251,7 @@ def main() -> None:
     parser.add_argument("--csv-path", required=True)
     parser.add_argument("--dataset-name", required=True)
     parser.add_argument("--output-dir", required=True)
-    parser.add_argument("--baseline-name", default="naive_last")
+    parser.add_argument("--baseline-name", default="patchtst")
     parser.add_argument("--baseline-model-dir", default=None)
     parser.add_argument("--seq-len", type=int, default=96)
     parser.add_argument("--pred-len", type=int, default=24)

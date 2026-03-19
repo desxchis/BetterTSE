@@ -18,6 +18,16 @@ class ForecastBaseline(ABC):
     def fit(self, train_split: np.ndarray, val_split: Optional[np.ndarray] = None) -> "ForecastBaseline":
         return self
 
+    def fit_windows(
+        self,
+        history_windows: np.ndarray,
+        future_windows: np.ndarray,
+        val_history_windows: Optional[np.ndarray] = None,
+        val_future_windows: Optional[np.ndarray] = None,
+    ) -> "ForecastBaseline":
+        del history_windows, future_windows, val_history_windows, val_future_windows
+        raise NotImplementedError(f"{self.__class__.__name__} does not support window-based training.")
+
     @abstractmethod
     def predict(self, history: np.ndarray, horizon: int) -> np.ndarray:
         raise NotImplementedError

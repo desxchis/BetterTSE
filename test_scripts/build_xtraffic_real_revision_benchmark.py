@@ -15,6 +15,10 @@ if str(_ROOT) not in sys.path:
 
 from forecasting import create_baseline
 from forecasting.registry import load_baseline
+from modules.forecast_revision_benchmark import (
+    anchor_forecast_to_history,
+    apply_physical_revision_injection,
+)
 from modules.forecast_revision import ForecastRevisionSample
 from modules.xtraffic_data import XTRAFFIC_CHANNELS, extract_node_series, load_xtraffic_minimal
 
@@ -216,7 +220,8 @@ def _build_non_applicable_samples(
             if abs(response["drop_z"]) > max_non_applicable_abs_z:
                 continue
 
-            base_forecast = np.asarray(baseline.predict(history, pred_len), dtype=np.float64)
+            raw_base_forecast = np.asarray(baseline.predict(history, pred_len), dtype=np.float64)
+            base_forecast, anchor_metadata = anchor_forecast_to_history(history, raw_base_forecast)
             mask = np.zeros(pred_len, dtype=int)
             sample = ForecastRevisionSample(
                 sample_id=f"NA_{len(samples) + 1:03d}",
@@ -256,6 +261,7 @@ def _build_non_applicable_samples(
                     "station_id": station_id,
                     "node_index": node_index,
                     "channel_name": row["channel_name"],
+                    "anchor_metadata": anchor_metadata,
                     "response_drop_z": response["drop_z"],
                     "history_mean": response["history_mean"],
                     "future_mean": response["future_mean"],
@@ -309,6 +315,10 @@ def build_real_benchmark(
     )
     pred_len = int(candidates[0]["future_end_idx"] - candidates[0]["future_start_idx"]) if candidates else 0
     seq_len = int(candidates[0]["history_end_idx"] - candidates[0]["history_start_idx"]) if candidates else 0
+    if baseline_name == "patchtst" and not baseline_model_dir:
+        raise ValueError(
+            "baseline_name='patchtst' requires --baseline-model-dir with a trained PatchTST checkpoint."
+        )
     baseline = (
         load_baseline(baseline_name, baseline_model_dir)
         if baseline_model_dir
@@ -328,7 +338,8 @@ def build_real_benchmark(
         response = _response_stats(history, future_gt)
         if response["drop_z"] < min_response_z:
             continue
-        base_forecast = baseline.predict(history, pred_len)
+        raw_base_forecast = np.asarray(baseline.predict(history, pred_len), dtype=np.float64)
+        base_forecast, anchor_metadata = anchor_forecast_to_history(history, raw_base_forecast)
 
         op = _infer_operator(
             description=str(row.get("incident_description") or ""),
@@ -344,27 +355,40 @@ def build_real_benchmark(
         mask = np.zeros(pred_len, dtype=int)
         mask[:duration_steps] = 1
         context_text = _context_text(row, op["shape"], duration_bucket)
+        region = [0, duration_steps]
+        intent_payload = {
+            "effect_family": op["effect_family"],
+            "direction": op["direction"],
+            "shape": op["shape"],
+            "duration": duration_bucket,
+            "strength": strength_bucket,
+            "label_source": "weak_real_incident",
+        }
+        revision_target, delta, injection_metadata = apply_physical_revision_injection(
+            base_forecast,
+            intent_payload,
+            region,
+            seed=idx + 29,
+            params={
+                "amplitude": max(response["history_std"] * max(response["drop_z"], 0.5), 1e-3),
+                "duration": duration_steps,
+                "floor_value": response["future_mean"] - response["history_std"],
+            },
+        )
 
         sample = ForecastRevisionSample(
             sample_id=f"{idx:03d}",
             dataset_name="XTraffic",
             history_ts=history.astype(float).tolist(),
             future_gt=future_gt.astype(float).tolist(),
-            base_forecast=np.asarray(base_forecast, dtype=np.float64).astype(float).tolist(),
-            revision_target=future_gt.astype(float).tolist(),
+            base_forecast=base_forecast.astype(float).tolist(),
+            revision_target=revision_target.astype(float).tolist(),
             context_text=context_text,
             forecast_horizon=pred_len,
             edit_mask_gt=mask.astype(int).tolist(),
-            delta_gt=(future_gt - np.asarray(base_forecast, dtype=np.float64)).astype(float).tolist(),
+            delta_gt=delta.astype(float).tolist(),
             revision_applicable_gt=True,
-            edit_intent_gt={
-                "effect_family": op["effect_family"],
-                "direction": op["direction"],
-                "shape": op["shape"],
-                "duration": duration_bucket,
-                "strength": strength_bucket,
-                "label_source": "weak_real_incident",
-            },
+            edit_intent_gt=intent_payload,
             effect_family_gt=op["effect_family"],
             direction_gt=op["direction"],
             shape_gt=op["shape"],
@@ -372,9 +396,11 @@ def build_real_benchmark(
             duration_bucket_gt=duration_bucket,
             revision_operator_family=op["shape"],
             revision_operator_params={
-                "region": [0, duration_steps],
+                "region": region,
                 "bucket": "early_horizon",
                 "label_source": "weak_real_incident",
+                "anchor_metadata": anchor_metadata,
+                "injection_metadata": injection_metadata,
                 "incident_id": row["incident_id"],
                 "station_id": row["station_id"],
                 "node_index": row["node_index"],
@@ -448,7 +474,7 @@ def main() -> None:
     parser.add_argument("--candidate-json", required=True)
     parser.add_argument("--data-dir", required=True)
     parser.add_argument("--output-dir", required=True)
-    parser.add_argument("--baseline-name", default="naive_last")
+    parser.add_argument("--baseline-name", default="patchtst")
     parser.add_argument("--baseline-model-dir", default=None)
     parser.add_argument("--max-samples", type=int, default=None)
     parser.add_argument("--min-response-z", type=float, default=0.2)

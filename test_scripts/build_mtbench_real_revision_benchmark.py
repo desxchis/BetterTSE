@@ -15,6 +15,10 @@ if str(_ROOT) not in sys.path:
 
 from forecasting import create_baseline
 from forecasting.registry import load_baseline
+from modules.forecast_revision_benchmark import (
+    anchor_forecast_to_history,
+    apply_physical_revision_injection,
+)
 from modules.forecast_revision import ForecastRevisionSample, calibrate_revision
 from modules.mtbench_data import load_mtbench_aligned_pairs
 
@@ -107,6 +111,10 @@ def build_mtbench_real_benchmark(
 
     seq_len = len(records[0].input_window)
     pred_len = len(records[0].output_window)
+    if baseline_name == "patchtst" and not baseline_model_dir:
+        raise ValueError(
+            "baseline_name='patchtst' requires --baseline-model-dir with a trained PatchTST checkpoint."
+        )
     baseline = (
         load_baseline(baseline_name, baseline_model_dir)
         if baseline_model_dir
@@ -118,12 +126,19 @@ def build_mtbench_real_benchmark(
             pred_len=pred_len,
         )
     )
+    expected_horizon = getattr(baseline, "prediction_length", None)
+    expected_context = getattr(baseline, "context_length", None)
 
     samples: List[Dict[str, Any]] = []
     for idx, record in enumerate(records, start=1):
         history = np.asarray(record.input_window, dtype=np.float64)
         future_gt = np.asarray(record.output_window, dtype=np.float64)
-        base_forecast = np.asarray(baseline.predict(history, len(future_gt)), dtype=np.float64)
+        if expected_context is not None and len(history) < int(expected_context):
+            continue
+        if expected_horizon is not None and len(future_gt) != int(expected_horizon):
+            continue
+        raw_base_forecast = np.asarray(baseline.predict(history, len(future_gt)), dtype=np.float64)
+        base_forecast, anchor_metadata = anchor_forecast_to_history(history, raw_base_forecast)
 
         direction = _trend_direction(record.trend)
         family = _finance_family(record.trend)
@@ -147,16 +162,22 @@ def build_mtbench_real_benchmark(
 
         if revision_applicable_gt:
             mask = np.ones(len(future_gt), dtype=int)
-            delta = future_gt - base_forecast
-            revision_target = future_gt.copy()
             context_text = _safe_context_text(record.text, record.trend, revision_applicable_gt)
             oracle_params = calibrate_revision(intent_payload, region, history, base_forecast)
+            revision_target, delta, injection_metadata = apply_physical_revision_injection(
+                base_forecast,
+                intent_payload,
+                region,
+                seed=idx + 17,
+                params=oracle_params,
+            )
         else:
             mask = np.zeros(len(future_gt), dtype=int)
             delta = np.zeros(len(future_gt), dtype=np.float64)
             revision_target = base_forecast.copy()
             context_text = _safe_context_text(record.text, record.trend, revision_applicable_gt)
             oracle_params = {}
+            injection_metadata = {"injection_type": "none", "region": region}
 
         sample = ForecastRevisionSample(
             sample_id=f"{idx:03d}",
@@ -183,6 +204,8 @@ def build_mtbench_real_benchmark(
                 "label_source": "mtbench_trend_heuristic_v2",
                 "finance_family": family if revision_applicable_gt else "none",
                 "params": oracle_params,
+                "anchor_metadata": anchor_metadata,
+                "injection_metadata": injection_metadata,
                 "alignment": record.alignment,
                 "trend": record.trend,
                 "technical": record.technical,
@@ -224,7 +247,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Build a real MTBench forecast revision benchmark from aligned pairs.")
     parser.add_argument("--dataset-path", required=True)
     parser.add_argument("--output-dir", required=True)
-    parser.add_argument("--baseline-name", default="naive_last")
+    parser.add_argument("--baseline-name", default="patchtst")
     parser.add_argument("--baseline-model-dir", default=None)
     parser.add_argument("--max-samples", type=int, default=None)
     parser.add_argument("--include-non-applicable", action="store_true")

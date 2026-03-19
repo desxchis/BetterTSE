@@ -6,6 +6,7 @@ from typing import Any, Dict, List
 
 from forecasting.base import ForecastBaseline
 from forecasting.baselines import (
+    DLinearOfficialBaseline,
     DLinearLikeBaseline,
     HoltLinearBaseline,
     LSTMOfficialBaseline,
@@ -17,6 +18,7 @@ from forecasting.baselines import (
 
 _REGISTRY = {
     "naive_last": NaiveLastBaseline,
+    "dlinear_official": DLinearOfficialBaseline,
     "dlinear_like": DLinearLikeBaseline,
     "holt_linear": HoltLinearBaseline,
     "lstm_official": LSTMOfficialBaseline,

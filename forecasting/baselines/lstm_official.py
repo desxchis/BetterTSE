@@ -142,36 +142,13 @@ class LSTMOfficialBaseline(ForecastBaseline):
             raise ValueError("No valid sliding windows available for lstm_official training.")
         return np.asarray(xs, dtype=np.float32), np.asarray(ys, dtype=np.float32)
 
-    def _compute_norm_stats(self, series: np.ndarray) -> None:
-        finite = np.asarray(series, dtype=np.float64)
-        finite = finite[np.isfinite(finite)]
-        if finite.size == 0:
-            self.norm_mean = 0.0
-            self.norm_std = 1.0
-            return
-        self.norm_mean = float(np.mean(finite))
-        self.norm_std = max(float(np.std(finite)), 1e-6)
-
-    def _normalize(self, values: np.ndarray) -> np.ndarray:
-        arr = np.asarray(values, dtype=np.float64)
-        return ((arr - self.norm_mean) / self.norm_std).astype(np.float32)
-
-    def _denormalize(self, values: np.ndarray) -> np.ndarray:
-        arr = np.asarray(values, dtype=np.float64)
-        return arr * self.norm_std + self.norm_mean
-
-    def fit(self, train_split: np.ndarray, val_split: Optional[np.ndarray] = None) -> "LSTMOfficialBaseline":
-        del val_split
-        train_split = np.asarray(train_split, dtype=np.float64)
-        self._compute_norm_stats(train_split)
+    def _fit_from_windows(self, x_np: np.ndarray, y_np: np.ndarray) -> "LSTMOfficialBaseline":
         self._build_model()
         assert self.model is not None
         torch = self._torch
 
-        normalized = self._normalize(train_split)
-        x_np, y_np = self._build_windows(np.asarray(normalized, dtype=np.float64))
-        x = torch.tensor(x_np, dtype=torch.float32, device=self.device)
-        y = torch.tensor(y_np, dtype=torch.float32, device=self.device)
+        x = torch.tensor(np.asarray(x_np, dtype=np.float32), dtype=torch.float32, device=self.device)
+        y = torch.tensor(np.asarray(y_np, dtype=np.float32), dtype=torch.float32, device=self.device)
 
         if self.optimizer_name == "lbfgs":
             optimizer = torch.optim.LBFGS(self.model.parameters(), lr=self.lr)
@@ -204,6 +181,58 @@ class LSTMOfficialBaseline(ForecastBaseline):
 
         self.model.eval()
         return self
+
+    def _compute_norm_stats(self, series: np.ndarray) -> None:
+        finite = np.asarray(series, dtype=np.float64)
+        finite = finite[np.isfinite(finite)]
+        if finite.size == 0:
+            self.norm_mean = 0.0
+            self.norm_std = 1.0
+            return
+        self.norm_mean = float(np.mean(finite))
+        self.norm_std = max(float(np.std(finite)), 1e-6)
+
+    def _normalize(self, values: np.ndarray) -> np.ndarray:
+        arr = np.asarray(values, dtype=np.float64)
+        return ((arr - self.norm_mean) / self.norm_std).astype(np.float32)
+
+    def _denormalize(self, values: np.ndarray) -> np.ndarray:
+        arr = np.asarray(values, dtype=np.float64)
+        return arr * self.norm_std + self.norm_mean
+
+    def fit(self, train_split: np.ndarray, val_split: Optional[np.ndarray] = None) -> "LSTMOfficialBaseline":
+        del val_split
+        train_split = np.asarray(train_split, dtype=np.float64)
+        self._compute_norm_stats(train_split)
+
+        normalized = self._normalize(train_split)
+        x_np, y_np = self._build_windows(np.asarray(normalized, dtype=np.float64))
+        return self._fit_from_windows(x_np, y_np)
+
+    def fit_windows(
+        self,
+        history_windows: np.ndarray,
+        future_windows: np.ndarray,
+        val_history_windows: Optional[np.ndarray] = None,
+        val_future_windows: Optional[np.ndarray] = None,
+    ) -> "LSTMOfficialBaseline":
+        del val_history_windows, val_future_windows
+        x_np = np.asarray(history_windows, dtype=np.float64)
+        y_np = np.asarray(future_windows, dtype=np.float64)
+        if x_np.ndim != 2 or y_np.ndim != 2:
+            raise ValueError("fit_windows expects 2D arrays [N, T] for histories and futures.")
+        if x_np.shape[0] == 0 or y_np.shape[0] == 0:
+            raise ValueError("fit_windows received empty training windows.")
+        if x_np.shape[1] != self.context_length:
+            raise ValueError(f"history window length mismatch: expected {self.context_length}, got {x_np.shape[1]}")
+        if y_np.shape[1] != self.prediction_length:
+            raise ValueError(f"future window length mismatch: expected {self.prediction_length}, got {y_np.shape[1]}")
+
+        train_values = np.concatenate([x_np.reshape(-1), y_np.reshape(-1)], axis=0)
+        self._compute_norm_stats(train_values)
+        x_norm = self._normalize(x_np)
+        y_norm = self._normalize(y_np)
+        return self._fit_from_windows(x_norm, y_norm)
 
     def predict(self, history: np.ndarray, horizon: int) -> np.ndarray:
         if horizon != self.prediction_length:
