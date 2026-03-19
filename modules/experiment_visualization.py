@@ -144,12 +144,22 @@ def save_forecast_revision_visualization(
     hist_x = np.arange(len(history_ts))
     future_x = np.arange(len(history_ts), len(history_ts) + len(base_forecast))
 
+    def _connected_future(values: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        series = np.asarray(values, dtype=np.float64)
+        x = np.concatenate([[len(history_ts) - 1], future_x])
+        y = np.concatenate([[float(history_ts[-1])], series])
+        return x, y
+
     ax = axes[0]
     ax.plot(hist_x, history_ts, color="0.45", lw=1.4, label="History")
-    ax.plot(future_x, future_gt, color="black", lw=1.4, ls=":", label="Future GT")
-    ax.plot(future_x, base_forecast, color="royalblue", lw=1.6, label="Base forecast")
-    ax.plot(future_x, edited_forecast, color="seagreen", lw=1.6, label="Edited forecast")
-    ax.plot(future_x, revision_target, color="crimson", lw=1.6, ls="--", label="Revision target")
+    gt_x, gt_y = _connected_future(future_gt)
+    base_x, base_y = _connected_future(base_forecast)
+    edit_x, edit_y = _connected_future(edited_forecast)
+    target_x, target_y = _connected_future(revision_target)
+    ax.plot(gt_x, gt_y, color="black", lw=1.4, ls=":", label="Future GT")
+    ax.plot(base_x, base_y, color="royalblue", lw=1.6, label="Base forecast")
+    ax.plot(edit_x, edit_y, color="seagreen", lw=1.6, label="Edited forecast")
+    ax.plot(target_x, target_y, color="crimson", lw=1.6, ls="--", label="Revision target")
     ax.axvspan(len(history_ts) + gt_region[0], len(history_ts) + gt_region[1], color="gold", alpha=0.18, label="GT edit")
     ax.axvspan(len(history_ts) + pred_region[0], len(history_ts) + pred_region[1], color="mediumpurple", alpha=0.12, label="Pred edit")
     ax.set_title("History and forecast horizon")

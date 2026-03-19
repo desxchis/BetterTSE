@@ -84,6 +84,8 @@ def apply_physical_revision_injection(
     if shape in {"step", "plateau"}:
         magnitude = sign * max(amplitude, data_range * 0.10 * strength)
         offset = np.ones(region_len, dtype=np.float64) * magnitude
+        ramp_in = min(max(2, region_len // 4), region_len)
+        offset[:ramp_in] = np.linspace(0.0, magnitude, ramp_in, dtype=np.float64)
         if end < len(base):
             ramp_out = min(max(3, region_len // 3), 20)
             offset[-ramp_out:] = np.linspace(magnitude, 0.0, ramp_out, dtype=np.float64)
@@ -117,6 +119,8 @@ def apply_physical_revision_injection(
         baseline = float(data_min + data_range * 0.05)
         noise_std = float(max(local_std * (1.2 + 0.8 * strength), amplitude))
         noise = rng.normal(loc=baseline, scale=noise_std, size=region_len)
+        if noise.size:
+            noise[0] = base[start]
         target[start:end] = noise.astype(np.float64)
         delta[start:end] = target[start:end] - base[start:end]
         return target, delta, {

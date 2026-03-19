@@ -994,23 +994,28 @@ def apply_revision_profile(
     if shape == "irregular_noise":
         rng = np.random.default_rng(seed)
         noise = rng.normal(0.0, params.get("volatility_scale", 1.0) * max(amplitude, 1e-6), size=active_len)
+        if noise.size:
+            noise[0] = 0.0
         delta[start:start + active_len] = noise
         edited[start:start + active_len] = edited[start:start + active_len] + noise
         return edited, delta
 
     profile = np.zeros(total_len, dtype=np.float64)
-    active_x = np.linspace(-1.0, 1.0, active_len)
+    active_x = np.linspace(0.0, 1.0, active_len)
     if shape == "step":
+        ramp_len = max(2, min(active_len, active_len // 4 if active_len >= 4 else active_len))
         profile[:active_len] = 1.0
+        profile[:ramp_len] = np.linspace(0.0, 1.0, ramp_len, dtype=np.float64)
     elif shape == "plateau":
         active_profile = np.ones(active_len, dtype=np.float64)
         ramp_len = max(1, active_len // 4)
-        active_profile[:ramp_len] = np.linspace(0.6, 1.0, ramp_len)
+        active_profile[:ramp_len] = np.linspace(0.0, 1.0, ramp_len)
         if active_len > ramp_len:
             active_profile[-ramp_len:] = np.linspace(1.0, 0.8, ramp_len)
         profile[:active_len] = active_profile
     else:
-        profile[:active_len] = np.exp(-4.0 * active_x * active_x)
+        rise = np.sin(np.pi * active_x)
+        profile[:active_len] = np.clip(rise, 0.0, 1.0)
 
     if tail_len > 0 and recovery_rate > 0.0:
         decay = np.exp(-np.linspace(0.0, 3.0 * recovery_rate, tail_len))
@@ -1018,8 +1023,13 @@ def apply_revision_profile(
     elif tail_len > 0 and shape == "step":
         profile[active_len:] = 1.0
 
+    if profile.size:
+        profile[0] = 0.0
     delta[start:end] = direction * amplitude * profile
     edited[start:end] = edited[start:end] + delta[start:end]
+    if start == 0 and edited.size:
+        delta[0] = 0.0
+        edited[0] = base_forecast[0]
     return edited, delta
 
 
