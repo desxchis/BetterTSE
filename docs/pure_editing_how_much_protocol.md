@@ -72,6 +72,48 @@ Current interpretation:
 - the current lightweight linear student is not yet stable enough to replace teacher search or enter the main pure-editing result table
 - the next student work should focus on model adequacy and per-tool calibration quality, not on reopening volatility taxonomy or routing
 
+## Student Capacity Ablation
+
+The current student question is no longer whether a student path can run, but what the minimum adequate capacity is.
+
+Current ablation set:
+
+1. `linear`
+2. `quadratic`
+3. `mixed_capacity`
+   - `volatility_global_scale`, `volatility_envelope_monotonic`: tiny MLP heads
+   - `spike_inject`, `hybrid_up`, `volatility_local_burst`: quadratic heads
+   - `step_shift`, `hybrid_down`: linear heads
+
+Current ETTh1 56-sample heldout reading:
+
+- `linear`
+  - student MAE `0.5053`
+  - heuristic MAE `0.5024`
+  - teacher gap closed `0.0712`
+- `quadratic`
+  - student MAE `0.7004`
+  - heuristic MAE `0.5027`
+  - teacher gap closed `-1.5313`
+- `mixed_capacity`
+  - student MAE `0.4843`
+  - heuristic MAE `0.5025`
+  - teacher gap closed `0.4563`
+
+Current interpretation:
+
+- `mixed_capacity` is the best current student variant and materially improves over the plain linear head
+- a naive global `quadratic` upgrade overfits and should not be treated as the default next step
+- the remaining bottleneck is per-tool adequacy, especially:
+  - `volatility_global_scale`
+  - `volatility_envelope_monotonic`
+  - cross-distribution robustness
+
+Current runtime note:
+
+- 3-sample ETTh1 smoke confirms `mixed_capacity` runtime override works and is less damaging than the initial linear kickoff
+- it is still worse than the frozen teacher-backed `full_bettertse` path, so student remains experimental rather than promoted
+
 ## Current teacher design
 
 The teacher is tool-conditioned and searches directly in each tool's native parameter space.

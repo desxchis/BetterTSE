@@ -84,6 +84,8 @@ BURST_HINTS = ("局部", "短时", "突发", "骤然", "burst", "那一小段")
 MONOTONIC_UP_HINTS = ("逐渐加剧", "越来越乱", "后面更乱", "持续加剧")
 MONOTONIC_DOWN_HINTS = ("逐渐恢复", "慢慢恢复", "前面更乱", "逐步平稳")
 
+VALID_STUDENT_MODEL_KINDS = ("linear", "quadratic", "mixed_capacity")
+
 
 def _safe_region(region: List[int], length: int) -> tuple[int, int]:
     start = max(0, min(int(region[0]), length - 1))
@@ -189,6 +191,9 @@ def build_student_feature_vector(
     region_len = max(1, end - start)
     length = max(1, len(base))
     text = str(prompt_text or "")
+    diffs = np.diff(local) if len(local) > 1 else np.asarray([0.0], dtype=np.float64)
+    roughness = float(np.mean(np.abs(diffs))) if diffs.size else 0.0
+    diff_energy = float(np.mean(np.square(diffs))) if diffs.size else 0.0
 
     features: list[float] = [
         1.0,
@@ -208,6 +213,53 @@ def build_student_feature_vector(
         1.0 if any(token in text for token in MONOTONIC_UP_HINTS) else 0.0,
         1.0 if any(token in text for token in MONOTONIC_DOWN_HINTS) else 0.0,
     ]
+    if tool_name == "spike_inject":
+        second_diffs = np.diff(local, n=2) if len(local) > 2 else np.asarray([0.0], dtype=np.float64)
+        features.extend(
+            [
+                float(np.max(np.abs(local - np.mean(local)))) / max(local_std, 1e-6),
+                roughness / max(local_std, 1e-6),
+                float(np.mean(np.abs(second_diffs))) / max(local_std, 1e-6),
+            ]
+        )
+    elif tool_name == "step_shift":
+        half = max(1, len(local) // 2)
+        left = local[:half]
+        right = local[half:] if len(local[half:]) else local[-half:]
+        features.extend(
+            [
+                (float(np.mean(right)) - float(np.mean(left))) / max(local_std, 1e-6),
+                float(np.std(left)) / max(local_std, 1e-6),
+                float(np.std(right)) / max(local_std, 1e-6),
+            ]
+        )
+    elif tool_name in {"hybrid_up", "hybrid_down"}:
+        start_val = float(local[0]) if len(local) else 0.0
+        end_val = float(local[-1]) if len(local) else 0.0
+        features.extend(
+            [
+                (end_val - start_val) / max(local_std, 1e-6),
+                _estimate_slope(local),
+                float(np.mean(local)) / max(local_std, 1e-6),
+            ]
+        )
+    elif tool_name.startswith("volatility_"):
+        windows = np.array_split(local, 4) if len(local) >= 4 else [local]
+        window_stds = [float(np.std(window)) for window in windows]
+        window_energies = [
+            float(np.mean(np.square(np.diff(window)))) if len(window) > 1 else 0.0
+            for window in windows
+        ]
+        features.extend(
+            [
+                roughness / max(local_std, 1e-6),
+                diff_energy / max(local_std ** 2, 1e-6),
+                float(max(window_stds, default=0.0)) / max(local_std, 1e-6),
+                float(min(window_stds, default=0.0)) / max(local_std, 1e-6),
+                float(max(window_energies, default=0.0)) / max(diff_energy, 1e-6),
+                float(min(window_energies, default=0.0)) / max(diff_energy, 1e-6),
+            ]
+        )
     features.extend(_one_hot(str(intent.get("effect_family", "none")), EFFECT_VALUES))
     features.extend(_one_hot(str(intent.get("shape", "none")), SHAPE_VALUES))
     features.extend(_one_hot(str(intent.get("duration", "none")), DURATION_VALUES))
@@ -290,7 +342,11 @@ def fit_tool_conditioned_student(
     samples: List[Dict[str, Any]],
     *,
     alpha: float = 1.0,
+    model_kind: str = "linear",
+    seed: int = 7,
 ) -> Dict[str, Any]:
+    if model_kind not in VALID_STUDENT_MODEL_KINDS:
+        raise ValueError(f"unsupported model_kind: {model_kind}")
     grouped: dict[str, list[dict[str, Any]]] = {}
     for sample in samples:
         tool_name = str(sample.get("tool_name", ""))
@@ -303,6 +359,7 @@ def fit_tool_conditioned_student(
     model: Dict[str, Any] = {
         "model_type": "tool_conditioned_pure_editing_student_v1",
         "alpha": float(alpha),
+        "model_kind": model_kind,
         "tool_heads": {},
     }
     for tool_name, rows in grouped.items():
@@ -330,20 +387,29 @@ def fit_tool_conditioned_student(
         feat_std = X_arr.std(axis=0)
         feat_std = np.where(feat_std < 1e-6, 1.0, feat_std)
         X_norm = (X_arr - feat_mean) / feat_std
-        X_aug = np.column_stack([X_norm, np.ones(len(X_norm), dtype=np.float64)])
-        if len(rows) == 1:
-            weights = np.zeros((X_aug.shape[1], Y_arr.shape[1]), dtype=np.float64)
-            weights[-1, :] = Y_arr[0]
+        head_kind = _resolve_head_kind(model_kind, tool_name)
+        if head_kind in {"linear", "quadratic"}:
+            X_aug = _expand_design_matrix(X_norm, head_kind)
+            if len(rows) == 1:
+                weights = np.zeros((X_aug.shape[1], Y_arr.shape[1]), dtype=np.float64)
+                weights[-1, :] = Y_arr[0]
+            else:
+                reg = alpha * np.eye(X_aug.shape[1], dtype=np.float64)
+                reg[-1, -1] = 0.0
+                weights = np.linalg.solve(X_aug.T @ X_aug + reg, X_aug.T @ Y_arr)
+            head_payload = {
+                "head_kind": head_kind,
+                "weights": weights.tolist(),
+            }
         else:
-            reg = alpha * np.eye(X_aug.shape[1], dtype=np.float64)
-            reg[-1, -1] = 0.0
-            weights = np.linalg.solve(X_aug.T @ X_aug + reg, X_aug.T @ Y_arr)
+            head_payload = _fit_mlp_head(X_norm, Y_arr, alpha=alpha, seed=seed + len(rows) + len(tool_name))
         model["tool_heads"][tool_name] = {
+            "head_kind": head_kind,
             "feature_mean": feat_mean.tolist(),
             "feature_std": feat_std.tolist(),
-            "weights": weights.tolist(),
             "target_keys": list(TOOL_PARAM_KEYS[tool_name]),
             "train_count": len(rows),
+            **head_payload,
         }
     return model
 
@@ -370,11 +436,18 @@ def predict_tool_conditioned_params(
     feat_mean = np.asarray(head.get("feature_mean", []), dtype=np.float64)
     feat_std = np.asarray(head.get("feature_std", []), dtype=np.float64)
     feat_std = np.where(feat_std < 1e-6, 1.0, feat_std)
-    weights = np.asarray(head.get("weights", []), dtype=np.float64)
+    head_kind = str(head.get("head_kind", "linear"))
     if features.size != feat_mean.size:
         raise ValueError(f"feature size mismatch for {tool_name}: got {features.size}, expected {feat_mean.size}")
-    x_aug = np.concatenate([(features - feat_mean) / feat_std, np.ones(1, dtype=np.float64)])
-    prediction = x_aug @ weights
+    x_norm = (features - feat_mean) / feat_std
+    if head_kind in {"linear", "quadratic"}:
+        weights = np.asarray(head.get("weights", []), dtype=np.float64)
+        x_aug = _expand_feature_vector(x_norm, head_kind)
+        prediction = x_aug @ weights
+    elif head_kind == "mlp":
+        prediction = _predict_mlp_head(x_norm, head)
+    else:
+        raise ValueError(f"unsupported head_kind: {head_kind}")
     return target_vector_to_params(
         tool_name=tool_name,
         target=prediction,
@@ -421,3 +494,78 @@ def save_student_model(model: Dict[str, Any], path: str) -> None:
 
 def load_student_model(path: str) -> Dict[str, Any]:
     return json.loads(Path(path).read_text(encoding="utf-8"))
+
+
+def _resolve_head_kind(model_kind: str, tool_name: str) -> str:
+    if model_kind == "linear":
+        return "linear"
+    if model_kind == "quadratic":
+        return "quadratic"
+    if model_kind == "mixed_capacity":
+        if tool_name in {"volatility_global_scale", "volatility_envelope_monotonic"}:
+            return "mlp"
+        if tool_name in {"spike_inject", "hybrid_up", "volatility_local_burst"}:
+            return "quadratic"
+        return "linear"
+    raise ValueError(f"unsupported model_kind: {model_kind}")
+
+
+def _expand_design_matrix(x_norm: np.ndarray, head_kind: str) -> np.ndarray:
+    if head_kind == "linear":
+        return np.column_stack([x_norm, np.ones(len(x_norm), dtype=np.float64)])
+    if head_kind == "quadratic":
+        return np.column_stack([x_norm, np.square(x_norm), np.ones(len(x_norm), dtype=np.float64)])
+    raise ValueError(f"unsupported head_kind: {head_kind}")
+
+
+def _expand_feature_vector(x_norm: np.ndarray, head_kind: str) -> np.ndarray:
+    if head_kind == "linear":
+        return np.concatenate([x_norm, np.ones(1, dtype=np.float64)])
+    if head_kind == "quadratic":
+        return np.concatenate([x_norm, np.square(x_norm), np.ones(1, dtype=np.float64)])
+    raise ValueError(f"unsupported head_kind: {head_kind}")
+
+
+def _fit_mlp_head(x_norm: np.ndarray, targets: np.ndarray, *, alpha: float, seed: int) -> Dict[str, Any]:
+    rng = np.random.RandomState(seed)
+    input_dim = x_norm.shape[1]
+    output_dim = targets.shape[1]
+    hidden_dim = int(min(16, max(6, input_dim // 3)))
+    w1 = rng.normal(scale=0.12, size=(input_dim, hidden_dim))
+    b1 = np.zeros(hidden_dim, dtype=np.float64)
+    w2 = rng.normal(scale=0.12, size=(hidden_dim, output_dim))
+    b2 = np.zeros(output_dim, dtype=np.float64)
+    lr = 0.03
+    steps = 600
+    n = max(1, x_norm.shape[0])
+    for _ in range(steps):
+        hidden_pre = x_norm @ w1 + b1
+        hidden = np.tanh(hidden_pre)
+        pred = hidden @ w2 + b2
+        diff = (pred - targets) / n
+        grad_w2 = hidden.T @ diff + alpha * w2
+        grad_b2 = np.sum(diff, axis=0)
+        hidden_grad = (diff @ w2.T) * (1.0 - np.square(hidden))
+        grad_w1 = x_norm.T @ hidden_grad + alpha * w1
+        grad_b1 = np.sum(hidden_grad, axis=0)
+        w1 -= lr * grad_w1
+        b1 -= lr * grad_b1
+        w2 -= lr * grad_w2
+        b2 -= lr * grad_b2
+    return {
+        "head_kind": "mlp",
+        "hidden_dim": hidden_dim,
+        "w1": w1.tolist(),
+        "b1": b1.tolist(),
+        "w2": w2.tolist(),
+        "b2": b2.tolist(),
+    }
+
+
+def _predict_mlp_head(x_norm: np.ndarray, head: Dict[str, Any]) -> np.ndarray:
+    w1 = np.asarray(head.get("w1", []), dtype=np.float64)
+    b1 = np.asarray(head.get("b1", []), dtype=np.float64)
+    w2 = np.asarray(head.get("w2", []), dtype=np.float64)
+    b2 = np.asarray(head.get("b2", []), dtype=np.float64)
+    hidden = np.tanh(x_norm @ w1 + b1)
+    return hidden @ w2 + b2

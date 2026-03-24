@@ -20,7 +20,6 @@ from modules.pure_editing_how_much import (
 from modules.pure_editing_student import (
     derive_student_tool_and_region,
     fit_tool_conditioned_student,
-    load_student_model,
     predict_tool_conditioned_params,
     save_student_model,
 )
@@ -256,6 +255,11 @@ def _evaluate_rows(rows: List[Dict[str, Any]], *, model: Dict[str, Any], tedit) 
                 "heuristic_preservation_mae": heuristic_metrics["preservation_mae"],
                 "student_beats_heuristic": student_metrics["mae_vs_target"] < heuristic_metrics["mae_vs_target"],
                 "student_teacher_gap": student_metrics["mae_vs_target"] - teacher_metrics["mae_vs_target"],
+                "teacher_gap_closed": _teacher_gap_closed(
+                    heuristic_metrics["mae_vs_target"],
+                    teacher_metrics["mae_vs_target"],
+                    student_metrics["mae_vs_target"],
+                ),
             }
         )
 
@@ -273,6 +277,7 @@ def _evaluate_rows(rows: List[Dict[str, Any]], *, model: Dict[str, Any], tedit) 
             "teacher_mae_vs_target": float(np.mean([row["teacher_mae_vs_target"] for row in subset])),
             "heuristic_mae_vs_target": float(np.mean([row["heuristic_mae_vs_target"] for row in subset])),
             "student_better_rate_vs_heuristic": float(np.mean([1.0 if row["student_beats_heuristic"] else 0.0 for row in subset])),
+            "teacher_gap_closed": float(np.mean([row["teacher_gap_closed"] for row in subset])),
         }
 
     return {
@@ -286,10 +291,18 @@ def _evaluate_rows(rows: List[Dict[str, Any]], *, model: Dict[str, Any], tedit) 
             "heuristic_preservation_mae": _avg("heuristic_preservation_mae"),
             "student_better_rate_vs_heuristic": float(np.mean([1.0 if row["student_beats_heuristic"] else 0.0 for row in detailed])) if detailed else 0.0,
             "student_teacher_gap": _avg("student_teacher_gap"),
+            "teacher_gap_closed": _avg("teacher_gap_closed"),
         },
         "by_tool": tool_summary,
         "rows": detailed,
     }
+
+
+def _teacher_gap_closed(heuristic_mae: float, teacher_mae: float, student_mae: float) -> float:
+    gap = float(heuristic_mae) - float(teacher_mae)
+    if gap <= 1e-8:
+        return 0.0
+    return float((float(heuristic_mae) - float(student_mae)) / gap)
 
 
 def main() -> None:
@@ -299,6 +312,7 @@ def main() -> None:
     parser.add_argument("--train-ratio", type=float, default=0.8)
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--alpha", type=float, default=1.0)
+    parser.add_argument("--model-kind", choices=["linear", "quadratic", "mixed_capacity"], default="linear")
     parser.add_argument("--tedit-model", default="")
     parser.add_argument("--tedit-config", default="")
     parser.add_argument("--device", default="cpu")
@@ -320,11 +334,11 @@ def main() -> None:
 
     rows = _prepare_rows(samples, tedit=tedit)
     train_rows, heldout_rows = _split_rows(rows, train_ratio=args.train_ratio, seed=args.seed)
-    model = fit_tool_conditioned_student(train_rows, alpha=args.alpha)
+    model = fit_tool_conditioned_student(train_rows, alpha=args.alpha, model_kind=args.model_kind, seed=args.seed)
 
     out_root = Path(args.output_dir)
     out_root.mkdir(parents=True, exist_ok=True)
-    model_path = out_root / "tool_conditioned_pure_editing_student.json"
+    model_path = out_root / f"tool_conditioned_pure_editing_student_{args.model_kind}.json"
     save_student_model(model, str(model_path))
 
     teacher_dump_path = out_root / "teacher_dump.json"
@@ -341,6 +355,7 @@ def main() -> None:
     print(json.dumps({
         "teacher_dump": str(teacher_dump_path),
         "model_path": str(model_path),
+        "model_kind": args.model_kind,
         "train_count": len(train_rows),
         "heldout_count": len(heldout_rows),
         "heldout_eval": str(eval_path),
