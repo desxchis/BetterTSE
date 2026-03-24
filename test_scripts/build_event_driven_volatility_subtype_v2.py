@@ -141,12 +141,13 @@ def _refresh_noise_sample(sample: Dict[str, Any]) -> Dict[str, Any]:
     return refreshed_sample
 
 
-def _build_monotonic_noise_samples(
+def _build_noise_samples_for_subpattern(
     *,
     csv_path: str,
     dataset_name: str,
     seq_len: int,
     random_seed: int,
+    target_subpattern: str,
     needed_count: int,
     start_sample_index: int,
     max_attempts: int,
@@ -154,14 +155,14 @@ def _build_monotonic_noise_samples(
     rng = np.random.RandomState(random_seed)
     data_loader = CSVDataLoader(csv_path, dataset_name)
     injector_factory = InjectorFactory(random_seed)
-    monotonic_samples: List[Dict[str, Any]] = []
+    collected_samples: List[Dict[str, Any]] = []
     attempts = 0
 
-    while len(monotonic_samples) < needed_count:
+    while len(collected_samples) < needed_count:
         attempts += 1
         if attempts > max_attempts:
             raise RuntimeError(
-                f"could not collect {needed_count} monotonic_envelope samples after {max_attempts} attempts"
+                f"could not collect {needed_count} {target_subpattern} samples after {max_attempts} attempts"
             )
         feature = str(rng.choice(data_loader.features))
         start_idx = int(rng.randint(0, max(1, len(data_loader.data) - seq_len - 1)))
@@ -176,7 +177,7 @@ def _build_monotonic_noise_samples(
             np.asarray(target_ts[start_step : end_step + 1], dtype=np.float32),
             np.asarray(base_ts[start_step : end_step + 1], dtype=np.float32),
         )
-        if subpattern != "monotonic_envelope":
+        if subpattern != target_subpattern:
             continue
 
         feature_desc = data_loader.feature_descriptions.get(feature, injector_factory.get_feature_description(feature))
@@ -188,7 +189,7 @@ def _build_monotonic_noise_samples(
             base_ts=base_ts,
         )
         sample = EventDrivenSample(
-            sample_id=f"{start_sample_index + len(monotonic_samples):03d}",
+            sample_id=f"{start_sample_index + len(collected_samples):03d}",
             dataset_name=dataset_name,
             target_feature=feature,
             feature_description=feature_desc,
@@ -199,7 +200,7 @@ def _build_monotonic_noise_samples(
             gt_start=int(injection_config["start_step"]),
             gt_end=end_step,
             event_prompts=[],
-            technical_ground_truth=f"[Mainline VolSubtype v2] monotonic_envelope noise_injection {duration_bucket}",
+            technical_ground_truth=f"[Mainline VolSubtype v2] {target_subpattern} noise_injection {duration_bucket}",
             base_ts=np.asarray(base_ts, dtype=float).tolist(),
             target_ts=np.asarray(target_ts, dtype=float).tolist(),
             mask_gt=np.asarray(mask_gt, dtype=int).tolist(),
@@ -214,9 +215,9 @@ def _build_monotonic_noise_samples(
         payload["stress_metadata"]["strength_bucket"] = edit_intent_gt["strength"]
         payload["stress_metadata"]["target_energy_type"] = _target_energy_type(base_ts, target_ts, sample.gt_start, sample.gt_end)
         payload["stress_metadata"]["injection_type"] = "noise_injection"
-        monotonic_samples.append(_refresh_noise_sample(payload))
+        collected_samples.append(_refresh_noise_sample(payload))
 
-    return monotonic_samples
+    return collected_samples
 
 
 def refresh_benchmark(
@@ -225,6 +226,8 @@ def refresh_benchmark(
     output_dir: str,
     output_name: str | None = None,
     csv_path: str | None = None,
+    target_global_scale_count: int = 0,
+    target_local_burst_count: int = 0,
     target_monotonic_count: int = 0,
     random_seed: int = 41,
     max_attempts: int = 8000,
@@ -245,24 +248,40 @@ def refresh_benchmark(
         subtype_counts[updated["volatility_subtype_gt"]] += 1
         changed += 1
 
-    if target_monotonic_count > subtype_counts["envelope_monotonic"]:
+    if any(
+        [
+            target_global_scale_count > subtype_counts["global_scale"],
+            target_local_burst_count > subtype_counts["local_burst"],
+            target_monotonic_count > subtype_counts["envelope_monotonic"],
+        ]
+    ):
         if not csv_path:
-            raise ValueError("csv_path is required when target_monotonic_count exceeds current monotonic coverage")
-        needed = target_monotonic_count - subtype_counts["envelope_monotonic"]
+            raise ValueError("csv_path is required when subtype coverage targets exceed current coverage")
         next_index = max(int(str(sample.get("sample_id", "0"))) for sample in refreshed.get("samples", []) if str(sample.get("sample_id", "")).isdigit()) + 1
         seq_len = int(refreshed.get("metadata", {}).get("seq_len", 192))
         dataset_name = str(refreshed.get("metadata", {}).get("dataset_name", "ETTh1"))
-        supplement = _build_monotonic_noise_samples(
-            csv_path=csv_path,
-            dataset_name=dataset_name,
-            seq_len=seq_len,
-            random_seed=random_seed,
-            needed_count=needed,
-            start_sample_index=next_index,
-            max_attempts=max_attempts,
-        )
-        refreshed["samples"].extend(supplement)
-        subtype_counts["envelope_monotonic"] += len(supplement)
+        subtype_targets = [
+            ("uniform_variance", "global_scale", target_global_scale_count),
+            ("local_burst", "local_burst", target_local_burst_count),
+            ("monotonic_envelope", "envelope_monotonic", target_monotonic_count),
+        ]
+        for subpattern, subtype, target_count in subtype_targets:
+            current_count = subtype_counts[subtype]
+            if target_count <= current_count:
+                continue
+            supplement = _build_noise_samples_for_subpattern(
+                csv_path=csv_path,
+                dataset_name=dataset_name,
+                seq_len=seq_len,
+                random_seed=random_seed + next_index,
+                target_subpattern=subpattern,
+                needed_count=target_count - current_count,
+                start_sample_index=next_index,
+                max_attempts=max_attempts,
+            )
+            refreshed["samples"].extend(supplement)
+            subtype_counts[subtype] += len(supplement)
+            next_index += len(supplement)
 
     output_root = Path(output_dir)
     output_root.mkdir(parents=True, exist_ok=True)
@@ -300,6 +319,8 @@ def main() -> None:
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--output-name", default=None)
     parser.add_argument("--csv-path", default=None)
+    parser.add_argument("--target-global-scale-count", type=int, default=0)
+    parser.add_argument("--target-local-burst-count", type=int, default=0)
     parser.add_argument("--target-monotonic-count", type=int, default=0)
     parser.add_argument("--random-seed", type=int, default=41)
     parser.add_argument("--max-attempts", type=int, default=8000)
@@ -310,6 +331,8 @@ def main() -> None:
         output_dir=args.output_dir,
         output_name=args.output_name,
         csv_path=args.csv_path,
+        target_global_scale_count=args.target_global_scale_count,
+        target_local_burst_count=args.target_local_burst_count,
         target_monotonic_count=args.target_monotonic_count,
         random_seed=args.random_seed,
         max_attempts=args.max_attempts,

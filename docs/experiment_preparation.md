@@ -80,6 +80,7 @@ Current scope notes:
 - The volatility planner schema now includes an explicit `volatility_subtype` field and records `proposed_subtype / guarded_subtype / final_subtype` through the route path.
 - A post-integration routing analyzer is now available to diagnose whether volatility samples are being sent to the correct split sub-tool.
 - Pure-editing now also has a mainline benchmark refresh script that rewrites only volatility samples into subtype-aware prompts and labels, and can optionally supplement monotonic cases so the mainline pipeline can exercise `global_scale / local_burst / envelope_monotonic / preview_non_monotonic` semantics directly.
+- The subtype-aware mainline refresh has now been validated on a 56-sample sign-off rerun; current volatility work is considered system-level stable rather than still exploratory.
 - Controlled synthetic forecast-revision builders are ready after backbone artifacts exist.
 - Time-MMD projected revision is now exposed as a runnable benchmark path.
 - A single generic projected-target builder across the full standard LTSF dataset pool is still not exposed as one CLI entrypoint.

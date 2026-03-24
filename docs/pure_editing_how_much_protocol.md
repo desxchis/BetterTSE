@@ -418,6 +418,10 @@ Reference artifacts:
 - `tmp/pipeline_full_mainline24_volsubtype_v2_monotonic.json`
 - `tmp/pipeline_direct_mainline24_volsubtype_v2_monotonic.json`
 - `tmp/pipeline_full_mainline24_volsubtype_v2_monotonic_routing.json`
+- `tmp/event_driven_protocol50_volsubtype_v2/event_driven_testset_ETTh1_50_volsubtype_v2.json`
+- `tmp/pipeline_full_mainline50_volsubtype_v2.json`
+- `tmp/pipeline_direct_mainline50_volsubtype_v2.json`
+- `tmp/pipeline_full_mainline50_volsubtype_v2_routing.json`
 
 What changed:
 
@@ -535,6 +539,65 @@ Current interpretation:
 - once the benchmark text explicitly carries subtype semantics, the routed split policy remains stable in the live main pipeline, including `envelope_monotonic`
 - the remaining pure-editing volatility question is no longer about routing correctness on the current mainline v2 path
 
+## Mainline50 Volatility Split Stability Sign-Off
+
+Reference artifacts:
+
+- `tmp/event_driven_protocol50_volsubtype_v2/event_driven_testset_ETTh1_50_volsubtype_v2.json`
+- `tmp/pipeline_full_mainline50_volsubtype_v2.json`
+- `tmp/pipeline_direct_mainline50_volsubtype_v2.json`
+- `tmp/pipeline_full_mainline50_volsubtype_v2_routing.json`
+
+What changed:
+
+- the subtype-aware mainline refresh was scaled from the earlier 20/22-sample reruns to the existing 50-sample event-driven protocol benchmark
+- volatility coverage was explicitly supplemented until the supported routed subtypes all had non-trivial support:
+  - `global_scale = 3`
+  - `local_burst = 3`
+  - `envelope_monotonic = 3`
+  - `preview_non_monotonic = 8`
+- this produced a 56-sample subtype-aware mainline benchmark for stability sign-off
+
+Formal rerun on the 56-sample subtype-aware mainline benchmark:
+
+- `full_bettertse`
+  - target MAE `1.0931`
+  - target MSE `19.1847`
+  - t-IoU `0.3018`
+  - preservation MAE `0.4493`
+- `direct_edit`
+  - target MAE `1.3892`
+  - target MSE `22.2449`
+  - t-IoU `0.1321`
+  - preservation MAE `0.6937`
+
+Volatility routing diagnosis on the 56-sample rerun:
+
+- `total_volatility_cases`: `17`
+- `preview_case_count`: `8`
+- `fallback_or_unsupported_count`: `0`
+- `overall_route_correct_rate`: `1.00`
+- `overall_subtype_correct_rate`: `1.00`
+- `preview_not_misrouted_rate`: `1.00`
+
+Per-subpattern routed reading:
+
+- `uniform_variance`
+  - `3/3` routed to `volatility_global_scale`
+- `local_burst`
+  - `3/3` routed to `volatility_local_burst`
+- `monotonic_envelope`
+  - `3/3` routed to `volatility_envelope_monotonic`
+- `non_monotonic_envelope`
+  - `8/8` kept on preview-side routing with `final_subtype = preview_non_monotonic`
+
+Current interpretation:
+
+- the volatility split now has both system-closure evidence and mainline-scale stability evidence
+- supported subtype routing remains perfect on the current 56-sample sign-off rerun
+- `full_bettertse` remains clearly stronger than `direct_edit`, and preservation does not become a new blocking issue at this scale
+- at the current protocol scope, the volatility split can be treated as resolved at the system level
+
 ## Go / No-Go
 
 Go:
@@ -556,6 +619,6 @@ The next step is still not operator redesign or student work.
 
 It is:
 
-1. treat the subtype-aware mainline benchmark v2, with monotonic supplementation when needed, as the current volatility-aware pure-editing mainline
-2. if more statistical confidence is needed, scale the same v2 refresh procedure beyond 20 samples before reopening student discussions
-3. keep legacy generic volatility prompts as historical artifacts, not as the authoritative routing benchmark
+1. treat the subtype-aware mainline benchmark v2, with subtype-coverage supplementation when needed, as the current volatility-aware pure-editing mainline
+2. keep legacy generic volatility prompts as historical artifacts, not as the authoritative routing benchmark
+3. do not reopen volatility operator or routing work unless a larger future benchmark reveals a new failure mode
