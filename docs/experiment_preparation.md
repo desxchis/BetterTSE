@@ -57,6 +57,9 @@ Current scope notes:
 - Forecast-revision DLinear/PatchTST Time-MMD runs can now be staged through `run_multibackbone_forecast_revision.py`.
 - Forecast-revision how-much calibration now supports teacher-search pseudo labels and teacher-distilled runtime aliases.
 - Forecast-revision how-much now has a locked multi-seed evaluation protocol documented in `docs/how_much_protocol.md`.
+- Forecast-revision how-much calibrator artifacts are now model-kind specific and emit `group_coverage.json` for split auditing.
+- Forecast-revision runtime now hard-validates calibration strategy against the saved calibrator `model_type`.
+- The multi-seed protocol aggregate now includes `teacher_distilled_family_affine` in the main comparison table and dedicated oracle-gap outputs.
 - Controlled synthetic forecast-revision builders are ready after backbone artifacts exist.
 - Time-MMD projected revision is now exposed as a runnable benchmark path.
 - A single generic projected-target builder across the full standard LTSF dataset pool is still not exposed as one CLI entrypoint.

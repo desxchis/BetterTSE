@@ -1024,16 +1024,29 @@ def predict_edit_spec(
     model_path: str | None = None,
     plan_confidence: float | None = None,
 ) -> Dict[str, Any]:
+    def _load_and_validate_model(path: str, expected_types: set[str]) -> dict[str, Any]:
+        model = load_edit_spec_model(path)
+        model_type = str(model.get("model_type", ""))
+        if model_type not in expected_types:
+            raise ValueError(
+                f"calibration model type mismatch: expected one of {sorted(expected_types)}, got '{model_type}'"
+            )
+        return model
+
     shape = intent.get("shape")
     if shape in {None, "none"}:
         return _zero_edit_spec(strategy=strategy)
+    family_expected_types: set[str] | None = None
     if strategy == "teacher_distilled_linear":
+        family_expected_types = {"linear_edit_spec_calibrator"}
         strategy = "learned_linear"
     elif strategy == "teacher_distilled_shrunk":
         strategy = "learned_rule_shrunk"
     elif strategy == "teacher_distilled_family_affine":
+        family_expected_types = {"family_affine_edit_spec_calibrator"}
         strategy = "learned_linear"
     elif strategy == "teacher_distilled_family_duration_affine":
+        family_expected_types = {"family_duration_affine_edit_spec_calibrator"}
         strategy = "learned_linear"
     if strategy == "oracle_from_sample":
         if sample is None:
@@ -1056,7 +1069,15 @@ def predict_edit_spec(
     if strategy == "learned_linear":
         if not model_path:
             raise ValueError("model_path is required for learned_linear strategy")
-        model = load_edit_spec_model(model_path)
+        model = _load_and_validate_model(
+            model_path,
+            family_expected_types
+            or {
+                "linear_edit_spec_calibrator",
+                "family_affine_edit_spec_calibrator",
+                "family_duration_affine_edit_spec_calibrator",
+            },
+        )
         return predict_with_model(model, intent, region, history_ts, base_forecast, context_text)
     if strategy == "learned_rule_guarded":
         if not model_path:

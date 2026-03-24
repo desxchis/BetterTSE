@@ -11,6 +11,8 @@ from typing import Any, Dict, Iterable, List, Tuple
 METHOD_FILES = {
     "teacher_search_oracle": "teacher_search_oracle.json",
     "teacher_distilled_shrunk": "teacher_distilled_shrunk.json",
+    "teacher_distilled_family_affine": "teacher_distilled_family_affine.json",
+    "teacher_distilled_family_duration_affine": "teacher_distilled_family_duration_affine.json",
     "heuristic_revision": "heuristic_revision.json",
     "rule_local_stats": "rule_local_stats.json",
     "direct_delta_regression": "direct_delta_regression.json",
@@ -237,6 +239,54 @@ def _oracle_gap_table(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return table
 
 
+def _oracle_gap_table_for_method(rows: List[Dict[str, Any]], student_method: str) -> List[Dict[str, Any]]:
+    grouped: Dict[Tuple[str, int], Dict[str, Dict[str, Any]]] = defaultdict(dict)
+    for row in rows:
+        grouped[(row["backbone"], row["seed"])][row["method"]] = row
+
+    table: List[Dict[str, Any]] = []
+    for (backbone, seed), methods in sorted(grouped.items()):
+        oracle = methods.get("teacher_search_oracle")
+        distilled = methods.get(student_method)
+        heuristic = methods.get("heuristic_revision")
+        rule = methods.get("rule_local_stats")
+        if not oracle or not distilled:
+            continue
+        entry: Dict[str, Any] = {
+            "backbone": backbone,
+            "seed": seed,
+            "student_method": student_method,
+        }
+        for metric in LOWER_IS_BETTER_METRICS:
+            oracle_val = _safe_float(oracle.get(metric))
+            student_val = _safe_float(distilled.get(metric))
+            heuristic_val = _safe_float(heuristic.get(metric) if heuristic else None)
+            rule_val = _safe_float(rule.get(metric) if rule else None)
+            entry[f"{metric}_oracle"] = oracle_val
+            entry[f"{metric}_distilled"] = student_val
+            entry[f"{metric}_heuristic"] = heuristic_val
+            entry[f"{metric}_rule"] = rule_val
+            if heuristic_val is None or oracle_val is None or student_val is None:
+                entry[f"{metric}_gap_closed_vs_heuristic"] = None
+            else:
+                denom = heuristic_val - oracle_val
+                entry[f"{metric}_gap_closed_vs_heuristic"] = None if abs(denom) < 1e-12 else 1.0 - ((student_val - oracle_val) / denom)
+        for metric in HIGHER_IS_BETTER_METRICS:
+            oracle_val = _safe_float(oracle.get(metric))
+            student_val = _safe_float(distilled.get(metric))
+            heuristic_val = _safe_float(heuristic.get(metric) if heuristic else None)
+            entry[f"{metric}_oracle"] = oracle_val
+            entry[f"{metric}_distilled"] = student_val
+            entry[f"{metric}_heuristic"] = heuristic_val
+            if heuristic_val is None or oracle_val is None or student_val is None:
+                entry[f"{metric}_gap_closed_vs_heuristic"] = None
+            else:
+                denom = oracle_val - heuristic_val
+                entry[f"{metric}_gap_closed_vs_heuristic"] = None if abs(denom) < 1e-12 else 1.0 - ((oracle_val - student_val) / denom)
+        table.append(entry)
+    return table
+
+
 def _scan_runs(root_dir: Path) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     summary_rows: List[Dict[str, Any]] = []
     sample_rows: List[Dict[str, Any]] = []
@@ -311,9 +361,26 @@ def _write_markdown(output_path: Path, payload: Dict[str, Any]) -> None:
     lines.extend(
         [
             "",
+            "## Family-Affine vs Oracle Gap",
+            "",
+            "| Backbone | Seed | Target MAE gap closed vs heuristic | Revision gain gap closed vs heuristic | Future MAE gap closed vs heuristic |",
+            "| --- | ---: | ---: | ---: | ---: |",
+        ]
+    )
+    for row in payload["oracle_gap_family_affine_rows"]:
+        lines.append(
+            f"| {row['backbone']} | {row['seed']} | "
+            f"{_format_float(row.get('avg_edited_mae_vs_revision_target_gap_closed_vs_heuristic'))} | "
+            f"{_format_float(row.get('avg_revision_gain_gap_closed_vs_heuristic'))} | "
+            f"{_format_float(row.get('avg_edited_mae_vs_future_gt_gap_closed_vs_heuristic'))} |"
+        )
+    lines.extend(
+        [
+            "",
             "## Notes",
             "",
             "- Full per-sample bucket summaries are written to `aggregate_results.json`.",
+            "- `teacher_distilled_family_duration_affine` stays a preview method until it has full multi-seed coverage.",
             "- `gap_closed_vs_heuristic = 1` means the distilled student reached oracle on that metric relative to heuristic.",
             "- Lower-is-better metrics use target/future/calibration errors; higher-is-better metrics use revision gain and future t-IoU.",
             "",
@@ -336,6 +403,8 @@ def aggregate(root_dir: str, output_dir: str) -> Dict[str, Any]:
         "summary_rows": summary_rows,
         "summary_by_backbone_method": _aggregate_summary(summary_rows),
         "oracle_gap_rows": _oracle_gap_table(summary_rows),
+        "oracle_gap_family_affine_rows": _oracle_gap_table_for_method(summary_rows, "teacher_distilled_family_affine"),
+        "oracle_gap_family_duration_affine_rows": _oracle_gap_table_for_method(summary_rows, "teacher_distilled_family_duration_affine"),
         "bucket_summaries": bucket_payload,
     }
     out_root = Path(output_dir)

@@ -24,6 +24,38 @@ def _gt_region(sample: dict) -> list[int]:
     return [idx[0], idx[-1] + 1]
 
 
+def _model_filename(model_kind: str) -> str:
+    return {
+        "linear": "learned_linear_calibrator.json",
+        "family_affine": "learned_family_affine_calibrator.json",
+        "family_duration_affine": "learned_family_duration_affine_calibrator.json",
+    }[model_kind]
+
+
+def _build_group_coverage(train_samples: list[dict], model_kind: str) -> dict:
+    effect_counts: dict[str, int] = {}
+    family_duration_counts: dict[str, int] = {}
+    for sample in train_samples:
+        intent = dict(sample.get("intent") or {})
+        effect = str(intent.get("effect_family", "none"))
+        duration = str(intent.get("duration", "none"))
+        effect_counts[effect] = effect_counts.get(effect, 0) + 1
+        key = f"{effect}::{duration}"
+        family_duration_counts[key] = family_duration_counts.get(key, 0) + 1
+
+    payload = {
+        "model_kind": model_kind,
+        "effect_family_counts": effect_counts,
+        "effect_family_active_groups": sorted(key for key, count in effect_counts.items() if count >= 4),
+        "effect_family_skipped_groups": sorted(key for key, count in effect_counts.items() if count < 4),
+    }
+    if model_kind == "family_duration_affine":
+        payload["effect_family_duration_counts"] = family_duration_counts
+        payload["effect_family_duration_active_groups"] = sorted(key for key, count in family_duration_counts.items() if count >= 4)
+        payload["effect_family_duration_skipped_groups"] = sorted(key for key, count in family_duration_counts.items() if count < 4)
+    return payload
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Train a lightweight learned edit-spec calibrator.")
     parser.add_argument("--benchmark", required=True)
@@ -84,7 +116,7 @@ def main() -> None:
 
     out_root = Path(args.output_dir)
     out_root.mkdir(parents=True, exist_ok=True)
-    model_path = out_root / "learned_linear_calibrator.json"
+    model_path = out_root / _model_filename(args.model_kind)
     save_model(model, str(model_path))
 
     heldout_payload = dict(payload)
@@ -101,6 +133,12 @@ def main() -> None:
         teacher_path = out_root / "teacher_search_debug.json"
         teacher_path.write_text(json.dumps(teacher_debug, ensure_ascii=False, indent=2), encoding="utf-8")
 
+    coverage_path = out_root / "group_coverage.json"
+    coverage_path.write_text(
+        json.dumps(_build_group_coverage(train_samples, args.model_kind), ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
     print(json.dumps({
         "benchmark": args.benchmark,
         "train_count": len(train_samples),
@@ -112,6 +150,7 @@ def main() -> None:
         "seed": args.seed,
         "label_source": args.label_source,
         "model_kind": args.model_kind,
+        "group_coverage": str(coverage_path),
     }, ensure_ascii=False, indent=2))
 
 
