@@ -62,6 +62,7 @@ Current scope notes:
 - Forecast-revision runtime now hard-validates calibration strategy against the saved calibrator `model_type`.
 - The multi-seed protocol aggregate now includes `teacher_distilled_family_affine` in the main comparison table and dedicated oracle-gap outputs.
 - Pure-editing now has a standalone tool-conditioned teacher-search prototype for the parameter layer, separated from the main pipeline runner.
+- Pure-editing teacher protocol and bucket definitions are documented in `docs/pure_editing_how_much_protocol.md`.
 - Controlled synthetic forecast-revision builders are ready after backbone artifacts exist.
 - Time-MMD projected revision is now exposed as a runnable benchmark path.
 - A single generic projected-target builder across the full standard LTSF dataset pool is still not exposed as one CLI entrypoint.

@@ -1,0 +1,129 @@
+# Pure Editing How-Much Teacher Protocol
+
+This document records the current protocol for the pure-editing `how much` layer.
+
+## Scope
+
+- task line: `pure editing`
+- benchmark family: `event-driven controlled physical injection`
+- current phase: `teacher benchmark`, not student distillation
+- current goal:
+  - determine whether tool-conditioned teacher search systematically beats heuristic parameters
+  - determine which tool families are already learnable
+  - determine which tool families need tool-side redesign before student training
+
+## Locked comparison set
+
+The pure-editing teacher protocol currently compares only:
+
+1. `heuristic parameter layer`
+2. `tool-conditioned teacher_search`
+
+Do not introduce student variants into the main pure-editing table until the teacher benchmark is large enough to diagnose weak tool families.
+
+## Current teacher design
+
+The teacher is tool-conditioned and searches directly in each tool's native parameter space.
+
+Current search families:
+
+- `spike_inject`
+  - `center / width / amplitude`
+- `step_shift`
+  - `level_shift / left_ramp_steps / right_ramp_steps`
+- `hybrid_up`
+  - `math_shift`
+- `hybrid_down`
+  - `math_shift`
+- `volatility_increase`
+  - `amplify_factor`
+
+Current principle:
+
+- fix `GT tool + GT region`
+- search only the `how much` parameters
+- do not rewrite planner / localization when running this protocol
+
+## Required metrics
+
+Main metrics:
+
+- `mae_vs_target`
+- `mse_vs_target`
+- `preservation_mae`
+
+Current teacher diagnostics:
+
+- `peak_delta_error`
+- `signed_area_error`
+- `teacher_better_rate`
+
+`t-IoU` stays part of the pure-editing main pipeline, but it is not a teacher-protocol discriminator because the current teacher benchmark fixes region to GT.
+
+## Required buckets
+
+At minimum, report:
+
+- `tool_name`
+- `effect_family`
+- `shape`
+- `duration_bucket`
+- `strength_bucket`
+- `region_length_bucket`
+- `target_energy_type`
+
+`target_energy_type` is currently:
+
+- `peak_dominant`
+- `area_dominant`
+- `mixed`
+
+## Current 20-sample checkpoint
+
+Reference artifact:
+
+- `tmp/how_much/pure_editing/teacher_protocol_20.json`
+
+Current reading:
+
+- overall:
+  - teacher target MAE `0.5052`
+  - heuristic target MAE `0.5716`
+  - teacher MSE `11.2716`
+  - heuristic MSE `12.7835`
+  - teacher better rate `0.80`
+- strong positive tools:
+  - `spike_inject`
+  - `hybrid_up`
+  - `hybrid_down`
+- positive but weaker:
+  - `step_shift`
+  - `volatility_increase`
+
+Current interpretation:
+
+- the teacher route is valid
+- most main tool families already show positive signal
+- `volatility_increase` is still a weak tool family and should be audited before student distillation
+
+## Go / No-Go
+
+Go:
+
+- expand the teacher benchmark
+- add more tool-level and pattern-level diagnostics
+- audit weak tool families such as `volatility_increase`
+
+No-Go:
+
+- do not jump directly to a unified-spec student
+- do not treat pure editing as already solved just because revision has a stronger student line
+- do not blame student capacity before confirming the teacher and tool family are strong enough
+
+## Recommended next step
+
+The next step is:
+
+1. scale the pure-editing teacher benchmark beyond smoke size
+2. keep the comparison set fixed to `heuristic vs teacher`
+3. use the resulting tool-level gaps to decide whether student learning should stay tool-conditioned

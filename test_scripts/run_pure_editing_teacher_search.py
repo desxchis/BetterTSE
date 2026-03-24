@@ -81,7 +81,59 @@ def _summarize(results: List[Dict[str, Any]]) -> Dict[str, Any]:
     for key in keys:
         values = [float(item[key]) for item in results]
         summary[f"avg_{key}"] = float(np.mean(values))
+    summary["teacher_better_count"] = int(sum(1 for item in results if item["teacher_improves_target_mae"]))
+    summary["teacher_better_rate"] = float(summary["teacher_better_count"] / max(1, len(results)))
     return summary
+
+
+def _region_length_bucket(region: List[int], total_length: int) -> str:
+    length = max(1, int(region[1]) - int(region[0]))
+    ratio = float(length) / max(1, int(total_length))
+    if ratio <= 0.10:
+        return "short"
+    if ratio <= 0.22:
+        return "medium"
+    return "long"
+
+
+def _target_energy_type(base_ts: np.ndarray, target_ts: np.ndarray, region: List[int]) -> str:
+    start, end = int(region[0]), int(region[1])
+    delta = np.asarray(target_ts, dtype=np.float64) - np.asarray(base_ts, dtype=np.float64)
+    local = delta[start:end]
+    if local.size == 0:
+        return "none"
+    peak = float(np.max(np.abs(local)))
+    area = float(np.mean(np.abs(local)))
+    if peak <= 1e-8:
+        return "none"
+    if area <= peak * 0.30:
+        return "peak_dominant"
+    if area >= peak * 0.60:
+        return "area_dominant"
+    return "mixed"
+
+
+def _bucket_summary(results: List[Dict[str, Any]], field: str) -> List[Dict[str, Any]]:
+    buckets: Dict[str, List[Dict[str, Any]]] = {}
+    for row in results:
+        key = str(row.get(field, "none"))
+        buckets.setdefault(key, []).append(row)
+    summary_rows = []
+    for key, rows in sorted(buckets.items()):
+        summary_rows.append(
+            {
+                field: key,
+                "count": len(rows),
+                "teacher_mae_vs_target": float(np.mean([r["teacher_mae_vs_target"] for r in rows])),
+                "heuristic_mae_vs_target": float(np.mean([r["heuristic_mae_vs_target"] for r in rows])),
+                "teacher_mse_vs_target": float(np.mean([r["teacher_mse_vs_target"] for r in rows])),
+                "heuristic_mse_vs_target": float(np.mean([r["heuristic_mse_vs_target"] for r in rows])),
+                "teacher_preservation_mae": float(np.mean([r["teacher_preservation_mae"] for r in rows])),
+                "heuristic_preservation_mae": float(np.mean([r["heuristic_preservation_mae"] for r in rows])),
+                "teacher_better_rate": float(np.mean([1.0 if r["teacher_improves_target_mae"] else 0.0 for r in rows])),
+            }
+        )
+    return summary_rows
 
 
 def main() -> None:
@@ -121,9 +173,15 @@ def main() -> None:
             continue
         region = list((labels["localization_label"] or {}).get("region", [0, len(sample.get("base_ts", []))]))
         direction = str((labels["intent_label"] or {}).get("direction", "up"))
+        effect_family = str((labels["intent_label"] or {}).get("effect_family", "none"))
+        shape = str((labels["intent_label"] or {}).get("shape", "none"))
+        duration_bucket = str((labels["intent_label"] or {}).get("duration", "none"))
+        strength_bucket = str((labels["intent_label"] or {}).get("strength", "none"))
 
         base_ts = np.asarray(sample["base_ts"], dtype=np.float32)
         target_ts = np.asarray(sample["target_ts"], dtype=np.float32)
+        region_length_bucket = _region_length_bucket(region, len(base_ts))
+        target_energy_type = _target_energy_type(base_ts, target_ts, region)
 
         heuristic_ts = _heuristic_execute(
             tool_name=tool_name,
@@ -150,6 +208,12 @@ def main() -> None:
             {
                 "sample_id": sample.get("sample_id"),
                 "tool_name": tool_name,
+                "effect_family": effect_family,
+                "shape": shape,
+                "duration_bucket": duration_bucket,
+                "strength_bucket": strength_bucket,
+                "region_length_bucket": region_length_bucket,
+                "target_energy_type": target_energy_type,
                 "direction": direction,
                 "region": region,
                 "teacher_params": teacher.params,
@@ -175,6 +239,15 @@ def main() -> None:
         "testset": args.testset,
         "max_samples": args.max_samples,
         "summary": _summarize(results),
+        "bucket_summaries": {
+            "tool_name": _bucket_summary(results, "tool_name"),
+            "effect_family": _bucket_summary(results, "effect_family"),
+            "shape": _bucket_summary(results, "shape"),
+            "duration_bucket": _bucket_summary(results, "duration_bucket"),
+            "strength_bucket": _bucket_summary(results, "strength_bucket"),
+            "region_length_bucket": _bucket_summary(results, "region_length_bucket"),
+            "target_energy_type": _bucket_summary(results, "target_energy_type"),
+        },
         "results": results,
     }
     output_path = Path(args.output)
