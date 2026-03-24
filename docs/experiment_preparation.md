@@ -18,6 +18,7 @@ Current runnable entrypoints:
 - `test_scripts/train_forecast_revision_calibrator.py --label-source gt|teacher_search --model-kind linear|family_affine|family_duration_affine`
 - `test_scripts/run_multibackbone_forecast_revision.py --dataset-kind timemmd`
 - `test_scripts/aggregate_revision_how_much_protocol.py --root-dir <run_root> --output-dir <aggregate_dir>`
+- `test_scripts/run_pure_editing_teacher_search.py --testset <event_driven_json> --output <teacher_json>`
 
 It does not start:
 
@@ -60,6 +61,7 @@ Current scope notes:
 - Forecast-revision how-much calibrator artifacts are now model-kind specific and emit `group_coverage.json` for split auditing.
 - Forecast-revision runtime now hard-validates calibration strategy against the saved calibrator `model_type`.
 - The multi-seed protocol aggregate now includes `teacher_distilled_family_affine` in the main comparison table and dedicated oracle-gap outputs.
+- Pure-editing now has a standalone tool-conditioned teacher-search prototype for the parameter layer, separated from the main pipeline runner.
 - Controlled synthetic forecast-revision builders are ready after backbone artifacts exist.
 - Time-MMD projected revision is now exposed as a runnable benchmark path.
 - A single generic projected-target builder across the full standard LTSF dataset pool is still not exposed as one CLI entrypoint.
