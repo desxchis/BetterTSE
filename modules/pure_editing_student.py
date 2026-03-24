@@ -85,7 +85,7 @@ MONOTONIC_UP_HINTS = ("逐渐加剧", "越来越乱", "后面更乱", "持续加
 MONOTONIC_DOWN_HINTS = ("逐渐恢复", "慢慢恢复", "前面更乱", "逐步平稳")
 
 VALID_STUDENT_MODEL_KINDS = ("linear", "quadratic", "mixed_capacity")
-VALID_PREDICTION_VARIANTS = ("v1", "clip", "clip_guard")
+VALID_PREDICTION_VARIANTS = ("v1", "clip", "clip_guard", "clip_softguard")
 
 
 def _safe_region(region: List[int], length: int) -> tuple[int, int]:
@@ -154,6 +154,16 @@ def _tool_name_from_sample(sample: dict[str, Any]) -> str | None:
             return "volatility_envelope_monotonic"
         return None
     return None
+
+
+def _tool_guard_config(tool_name: str) -> dict[str, float]:
+    if tool_name in {"step_shift", "hybrid_down"}:
+        return {"support_mult": 1.8, "clip_delta_tol": 1.2, "softguard_gain": 0.15}
+    if tool_name in {"spike_inject", "hybrid_up", "volatility_local_burst"}:
+        return {"support_mult": 1.35, "clip_delta_tol": 0.7, "softguard_gain": 0.45}
+    if tool_name in {"volatility_global_scale", "volatility_envelope_monotonic"}:
+        return {"support_mult": 1.10, "clip_delta_tol": 0.35, "softguard_gain": 0.85}
+    return {"support_mult": 1.25, "clip_delta_tol": 0.5, "softguard_gain": 0.5}
 
 
 def build_heuristic_params_for_tool(
@@ -525,16 +535,33 @@ def predict_tool_conditioned_params(
             clipped = bool(np.any(np.abs(clipped_prediction - raw_prediction) > 1e-8))
     guard_triggered = False
     guard_reason = None
+    guard_weight = 0.0
     if prediction_variant == "clip_guard":
-        support_limit = float(head.get("feature_abs_z_p95", 4.0)) * 1.10
+        config = _tool_guard_config(tool_name)
+        support_limit = float(head.get("feature_abs_z_p95", 4.0)) * config["support_mult"]
         if support_score > support_limit:
             guard_triggered = True
             guard_reason = "low_support"
         elif clipped:
             delta = float(np.max(np.abs(clipped_prediction - raw_prediction)))
-            if delta > 0.5:
+            if delta > config["clip_delta_tol"]:
                 guard_triggered = True
                 guard_reason = "aggressive_clip"
+    elif prediction_variant == "clip_softguard":
+        config = _tool_guard_config(tool_name)
+        support_limit = float(head.get("feature_abs_z_p95", 4.0)) * config["support_mult"]
+        support_risk = max(0.0, (support_score - support_limit) / max(support_limit, 1e-6))
+        clip_risk = 0.0
+        if clipped:
+            delta = float(np.max(np.abs(clipped_prediction - raw_prediction)))
+            clip_risk = max(0.0, (delta - config["clip_delta_tol"]) / max(config["clip_delta_tol"], 1e-6))
+        if np.any(np.isnan(raw_prediction)) or np.any(np.isinf(raw_prediction)):
+            support_risk = max(support_risk, 1.0)
+            clip_risk = max(clip_risk, 1.0)
+        guard_weight = float(np.clip(config["softguard_gain"] * max(support_risk, clip_risk), 0.0, 1.0))
+        if guard_weight >= 0.999:
+            guard_triggered = True
+            guard_reason = "softguard_full_fallback"
     if guard_triggered:
         fallback = build_heuristic_params_for_tool(
             tool_name=tool_name,
@@ -549,9 +576,24 @@ def predict_tool_conditioned_params(
                 "support_score": support_score,
                 "guard_reason": guard_reason,
                 "clipped": clipped,
+                "guard_weight": 1.0,
             }
         return fallback
     prediction = clipped_prediction if prediction_variant in {"clip", "clip_guard"} else raw_prediction
+    if prediction_variant == "clip_softguard":
+        heuristic_params = build_heuristic_params_for_tool(
+            tool_name=tool_name,
+            base_ts=np.asarray(base_ts, dtype=np.float64),
+            region=region,
+            prompt_text=prompt_text,
+        )
+        heuristic_target = params_to_target_vector(
+            tool_name=tool_name,
+            params=heuristic_params,
+            base_ts=np.asarray(base_ts, dtype=np.float64),
+            region=region,
+        )
+        prediction = (1.0 - guard_weight) * clipped_prediction + guard_weight * heuristic_target
     params = target_vector_to_params(
         tool_name=tool_name,
         target=prediction,
@@ -561,10 +603,11 @@ def predict_tool_conditioned_params(
     if return_metadata:
         return {
             "params": params,
-            "source": "student",
+            "source": "softguard_blend" if prediction_variant == "clip_softguard" and guard_weight > 1e-6 else "student",
             "support_score": support_score,
             "guard_reason": guard_reason,
             "clipped": clipped,
+            "guard_weight": guard_weight,
         }
     return target_vector_to_params(
         tool_name=tool_name,
@@ -612,6 +655,7 @@ def build_student_runtime_override(
         "guard_reason": predicted.get("guard_reason"),
         "support_score": float(predicted.get("support_score", 0.0)),
         "clipped": bool(predicted.get("clipped", False)),
+        "guard_weight": float(predicted.get("guard_weight", 0.0)),
     }
 
 

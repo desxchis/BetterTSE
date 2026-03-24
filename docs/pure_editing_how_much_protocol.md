@@ -124,6 +124,11 @@ To reduce runtime mismatch, the current student path now supports:
 3. `clip_guard`
    - apply clipping
    - if the sample is in low-support space or the prediction is clipped too aggressively, fallback to heuristic how-much
+4. `clip_softguard`
+   - apply clipping
+   - use per-tool risk calibration instead of a single global guard
+   - only raise fallback pressure when low support and large support-domain deviation appear together
+   - blend student and heuristic parameters with a risk-dependent soft fallback before any hard fallback is allowed
 
 Current ETTh1 56-sample heldout reading for `mixed_capacity`:
 
@@ -139,27 +144,47 @@ Current ETTh1 56-sample heldout reading for `mixed_capacity`:
   - student MAE `0.4906`
   - teacher gap closed `0.3028`
   - fallback rate `0.82`
+- `clip_softguard`
+  - student MAE `0.4594`
+  - teacher gap closed `0.1513`
+  - fallback rate `0.27`
+  - softguard rate `0.45`
+  - avg guard weight `0.3836`
 
-Current ETTh1 3-sample runtime smoke:
+Current ETTh1+ETTm1 combined heldout reading for `mixed_capacity clip_softguard`:
+
+- student MAE `0.5324`
+- heuristic MAE `0.4877`
+- teacher gap closed `-3.8722`
+- fallback rate `0.00`
+- softguard rate `0.125`
+
+Current ETTh1 20-sample runtime smoke:
 
 - frozen teacher-backed full chain
-  - target MAE `0.5354`
-  - preservation MAE `0.3627`
+  - target MAE `1.1404`
+  - preservation MAE `0.6114`
 - `mixed_capacity v1`
-  - target MAE `0.8045`
-  - preservation MAE `0.6218`
+  - target MAE `1.3280`
+  - preservation MAE `0.6657`
 - `mixed_capacity clip`
-  - target MAE `0.7108`
-  - preservation MAE `0.4883`
+  - target MAE `1.3673`
+  - preservation MAE `0.7071`
 - `mixed_capacity clip_guard`
   - target MAE `0.6552`
   - preservation MAE `0.4189`
+  - note: this was only validated on the earlier 3-sample smoke because the global guard was too conservative
+- `mixed_capacity clip_softguard`
+  - target MAE `1.1805`
+  - preservation MAE `0.6181`
 
 Current interpretation:
 
-- runtime-safe guards do reduce the deployment mismatch relative to the raw student path
-- `clip_guard` is the current safest runtime student variant
-- however, the student path still does not beat the frozen teacher-backed full chain, so student remains outside the locked mainline
+- the best current student is still `mixed_capacity`
+- naive clipping helps heldout MAE but hurts runtime
+- per-tool softguard materially improves deployment safety relative to raw `v1` and plain `clip`
+- however, the student path still does not beat the frozen teacher-backed full chain, and the cross-distribution heldout result remains below heuristic
+- the current bottleneck is therefore deployment calibration for the hardest heads, not taxonomy, routing, or volatility split design
 
 ## Current teacher design
 

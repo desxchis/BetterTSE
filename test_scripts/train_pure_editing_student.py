@@ -212,6 +212,7 @@ def _evaluate_rows(rows: List[Dict[str, Any]], *, model: Dict[str, Any], tedit, 
                 "student_guard_reason": student_pred.get("guard_reason"),
                 "student_support_score": float(student_pred.get("support_score", 0.0)),
                 "student_clipped": bool(student_pred.get("clipped", False)),
+                "student_guard_weight": float(student_pred.get("guard_weight", 0.0)),
                 "student_mae_vs_target": student_metrics["mae_vs_target"],
                 "teacher_mae_vs_target": teacher_metrics["mae_vs_target"],
                 "heuristic_mae_vs_target": heuristic_metrics["mae_vs_target"],
@@ -244,6 +245,8 @@ def _evaluate_rows(rows: List[Dict[str, Any]], *, model: Dict[str, Any], tedit, 
             "student_better_rate_vs_heuristic": float(np.mean([1.0 if row["student_beats_heuristic"] else 0.0 for row in subset])),
             "teacher_gap_closed": float(np.mean([row["teacher_gap_closed"] for row in subset])),
             "fallback_rate": float(np.mean([1.0 if row["student_prediction_source"] == "heuristic_fallback" else 0.0 for row in subset])),
+            "softguard_rate": float(np.mean([1.0 if row["student_prediction_source"] == "softguard_blend" else 0.0 for row in subset])),
+            "avg_guard_weight": float(np.mean([row["student_guard_weight"] for row in subset])),
         }
 
     return {
@@ -259,6 +262,8 @@ def _evaluate_rows(rows: List[Dict[str, Any]], *, model: Dict[str, Any], tedit, 
             "student_teacher_gap": _avg("student_teacher_gap"),
             "teacher_gap_closed": _avg("teacher_gap_closed"),
             "fallback_rate": float(np.mean([1.0 if row["student_prediction_source"] == "heuristic_fallback" else 0.0 for row in detailed])) if detailed else 0.0,
+            "softguard_rate": float(np.mean([1.0 if row["student_prediction_source"] == "softguard_blend" else 0.0 for row in detailed])) if detailed else 0.0,
+            "avg_guard_weight": _avg("student_guard_weight"),
         },
         "by_tool": tool_summary,
         "rows": detailed,
@@ -280,7 +285,7 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--alpha", type=float, default=1.0)
     parser.add_argument("--model-kind", choices=["linear", "quadratic", "mixed_capacity"], default="linear")
-    parser.add_argument("--prediction-variant", choices=["v1", "clip", "clip_guard"], default="v1")
+    parser.add_argument("--prediction-variant", choices=["v1", "clip", "clip_guard", "clip_softguard"], default="v1")
     parser.add_argument("--tedit-model", default="")
     parser.add_argument("--tedit-config", default="")
     parser.add_argument("--device", default="cpu")

@@ -271,6 +271,7 @@ def run_pipeline(
                         "guard_reason": student_override.get("guard_reason"),
                         "support_score": student_override.get("support_score"),
                         "clipped": student_override.get("clipped"),
+                        "guard_weight": student_override.get("guard_weight"),
                     }
             region = plan.get("parameters", {}).get("region", [0, len(base_ts)])
             logger.info(
@@ -770,7 +771,7 @@ def main() -> None:
     parser.add_argument(
         "--how-much-student-variant",
         default="v1",
-        choices=["v1", "clip", "clip_guard"],
+        choices=["v1", "clip", "clip_guard", "clip_softguard"],
         help="student 参数层预测变体：原始 v1、分位裁剪 clip、带守卫回退的 clip_guard。",
     )
 

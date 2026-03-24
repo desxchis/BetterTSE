@@ -83,7 +83,12 @@ Current scope notes:
 - Pure-editing now also has a mainline benchmark refresh script that rewrites only volatility samples into subtype-aware prompts and labels, and can optionally supplement monotonic cases so the mainline pipeline can exercise `global_scale / local_burst / envelope_monotonic / preview_non_monotonic` semantics directly.
 - The subtype-aware mainline refresh has now been validated on both the 56-sample ETTh1 sign-off rerun and a frozen second-distribution ETTm1 rerun; current volatility work is considered system-level stable rather than still exploratory.
 - Pure-editing now also has an experimental tool-conditioned student path: teacher pseudo labels can be dumped and trained with `test_scripts/train_pure_editing_student.py`, and `run_pipeline.py` can optionally inject the learned parameter layer through `--how-much-student-model`.
-- Current student status is still experimental: the current best student is `mixed_capacity`, and runtime-safe variants (`clip`, `clip_guard`) are now available through `run_pipeline.py --how-much-student-variant ...`. They reduce runtime mismatch, but are still not strong enough to replace the frozen teacher-backed pure-editing chain.
+- Current student status is still experimental: the current best student is `mixed_capacity`, and runtime-safe variants (`clip`, `clip_guard`, `clip_softguard`) are now available through `run_pipeline.py --how-much-student-variant ...`.
+- The newest guarded student result is more specific:
+  - plain `clip` is best for ETTh1 heldout MAE
+  - `clip_softguard` is best for runtime safety on the 20-sample ETTh1 mainline smoke
+  - neither variant yet replaces the frozen teacher-backed pure-editing chain, and cross-distribution heldout still trails heuristic
+- Current pure-editing student work should therefore be treated as per-tool deployment calibration, not as a system-design or taxonomy problem.
 - Controlled synthetic forecast-revision builders are ready after backbone artifacts exist.
 - Time-MMD projected revision is now exposed as a runnable benchmark path.
 - A single generic projected-target builder across the full standard LTSF dataset pool is still not exposed as one CLI entrypoint.
