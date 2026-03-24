@@ -19,6 +19,7 @@ Current runnable entrypoints:
 - `test_scripts/run_multibackbone_forecast_revision.py --dataset-kind timemmd`
 - `test_scripts/aggregate_revision_how_much_protocol.py --root-dir <run_root> --output-dir <aggregate_dir>`
 - `test_scripts/run_pure_editing_teacher_search.py --testset <event_driven_json> --output <teacher_json>`
+- `test_scripts/build_pure_editing_how_much_stress_benchmark.py --csv-path <csv> --output-dir <stress_dir>`
 
 It does not start:
 
@@ -63,6 +64,7 @@ Current scope notes:
 - The multi-seed protocol aggregate now includes `teacher_distilled_family_affine` in the main comparison table and dedicated oracle-gap outputs.
 - Pure-editing now has a standalone tool-conditioned teacher-search prototype for the parameter layer, separated from the main pipeline runner.
 - Pure-editing teacher protocol and bucket definitions are documented in `docs/pure_editing_how_much_protocol.md`.
+- Pure-editing now also has a tool-balanced stress benchmark builder for how-much diagnosis, independent of slow event-prompt generation.
 - Controlled synthetic forecast-revision builders are ready after backbone artifacts exist.
 - Time-MMD projected revision is now exposed as a runnable benchmark path.
 - A single generic projected-target builder across the full standard LTSF dataset pool is still not exposed as one CLI entrypoint.

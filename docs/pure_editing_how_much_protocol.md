@@ -106,6 +106,37 @@ Current interpretation:
 - most main tool families already show positive signal
 - `volatility_increase` is still a weak tool family and should be audited before student distillation
 
+## Current 50-sample stress checkpoint
+
+Reference artifacts:
+
+- `tmp/how_much/pure_editing/stress50/pure_editing_how_much_stress_ETTh1_50.json`
+- `tmp/how_much/pure_editing/teacher_protocol_stress50.json`
+
+This stress benchmark is tool-balanced and parameter-coverage oriented. It is the preferred diagnostic benchmark when the goal is to study `how much`, not prompt diversity.
+
+Current reading:
+
+- overall:
+  - teacher target MAE `0.9882`
+  - heuristic target MAE `1.1541`
+  - teacher MSE `36.3692`
+  - heuristic MSE `41.5909`
+  - teacher better rate `0.86`
+- tool-level:
+  - `hybrid_down`: better rate `0.90`
+  - `hybrid_up`: better rate `1.00`
+  - `spike_inject`: better rate `0.90`
+  - `step_shift`: better rate `0.90`
+  - `volatility_increase`: better rate `0.60`
+
+Current interpretation:
+
+- the teacher route remains strong under tool-balanced stress sampling
+- three main tool families are now clearly stable: `spike_inject`, `hybrid_up/down`, `step_shift`
+- `volatility_increase` remains the only clearly weak family
+- this means the next step is tool audit, not student distillation
+
 ## Go / No-Go
 
 Go:
@@ -127,3 +158,7 @@ The next step is:
 1. scale the pure-editing teacher benchmark beyond smoke size
 2. keep the comparison set fixed to `heuristic vs teacher`
 3. use the resulting tool-level gaps to decide whether student learning should stay tool-conditioned
+4. for `volatility_increase`, run tool-side ablations before any student work:
+   - broader search space
+   - burst-local noise operator
+   - simple envelope-based noise operator
