@@ -21,7 +21,7 @@ from test_scripts.build_event_driven_testset import (
 )
 
 
-INJECTION_TYPES = [
+DEFAULT_INJECTION_TYPES = [
     "trend_injection",
     "step_change",
     "multiplier",
@@ -106,6 +106,7 @@ def build_stress_benchmark(
     num_samples: int,
     seq_len: int,
     random_seed: int,
+    injection_types: List[str] | None = None,
 ) -> Dict[str, Any]:
     rng = np.random.RandomState(random_seed)
     data_loader = CSVDataLoader(csv_path, dataset_name)
@@ -113,16 +114,17 @@ def build_stress_benchmark(
     output_root = Path(output_dir)
     output_root.mkdir(parents=True, exist_ok=True)
 
-    per_type_base = num_samples // len(INJECTION_TYPES)
-    remainder = num_samples % len(INJECTION_TYPES)
+    chosen_types = list(injection_types or DEFAULT_INJECTION_TYPES)
+    per_type_base = num_samples // len(chosen_types)
+    remainder = num_samples % len(chosen_types)
     target_counts = {
         injection_type: per_type_base + (1 if idx < remainder else 0)
-        for idx, injection_type in enumerate(INJECTION_TYPES)
+        for idx, injection_type in enumerate(chosen_types)
     }
 
     samples: List[Dict[str, Any]] = []
     sample_idx = 1
-    for injection_type in INJECTION_TYPES:
+    for injection_type in chosen_types:
         for local_idx in range(target_counts[injection_type]):
             duration_bucket = ["short", "medium", "long"][local_idx % 3]
             feature = str(rng.choice(data_loader.features))
@@ -192,6 +194,7 @@ def build_stress_benchmark(
         "seq_len": seq_len,
         "num_samples": len(samples),
         "random_seed": random_seed,
+        "injection_types": chosen_types,
         "tool_quota": target_counts,
         "samples": samples,
     }
@@ -223,7 +226,12 @@ def main() -> None:
     parser.add_argument("--num-samples", type=int, default=50)
     parser.add_argument("--seq-len", type=int, default=192)
     parser.add_argument("--random-seed", type=int, default=7)
+    parser.add_argument("--injection-types", default="")
     args = parser.parse_args()
+
+    injection_types = None
+    if args.injection_types.strip():
+        injection_types = [token.strip() for token in args.injection_types.split(",") if token.strip()]
 
     result = build_stress_benchmark(
         csv_path=args.csv_path,
@@ -232,6 +240,7 @@ def main() -> None:
         num_samples=args.num_samples,
         seq_len=args.seq_len,
         random_seed=args.random_seed,
+        injection_types=injection_types,
     )
     print(json.dumps(result, ensure_ascii=False, indent=2))
 

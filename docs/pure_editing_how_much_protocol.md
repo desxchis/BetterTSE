@@ -137,6 +137,54 @@ Current interpretation:
 - `volatility_increase` remains the only clearly weak family
 - this means the next step is tool audit, not student distillation
 
+## Volatility Audit Checkpoint
+
+Reference artifacts:
+
+- `tmp/how_much/pure_editing/volatility24/pure_editing_how_much_stress_ETTh1_24.json`
+- `tmp/how_much/pure_editing/volatility24_audit.json`
+
+Audit setup:
+
+- benchmark: volatility-only stress subset
+- comparison anchor: current heuristic volatility operator
+- ablations:
+  - `global_subwindow`
+  - `burst_local`
+  - `envelope_noise`
+
+Additional volatility-specific metrics:
+
+- `local_std_error`
+- `roughness_error`
+- `windowed_energy_profile_error`
+
+Current reading:
+
+- `global_subwindow`
+  - teacher better rate `0.29`
+  - reduces variance/energy diagnostics, but usually not enough on target MAE
+- `burst_local`
+  - teacher better rate `0.50`
+  - helps `medium` windows and some burst cases, but remains unstable
+- `envelope_noise`
+  - teacher better rate `0.58`
+  - best current operator
+  - clearly improves `local_std_error`, `roughness_error`, and `windowed_energy_profile_error`
+  - still fails the current go threshold
+
+Pattern reading for `envelope_noise`:
+
+- `local_burst`: better rate `0.75`
+- `uniform_variance`: better rate `0.67`
+- `time_varying_envelope`: better rate `0.50`
+
+Current interpretation:
+
+- the weakness is not only search-space width; the original global operator is too coarse
+- moving from global variance amplification to envelope-shaped synthetic noise is directionally correct
+- even the best current redesign is not strong enough to unlock student distillation
+
 ## Go / No-Go
 
 Go:
@@ -150,6 +198,7 @@ No-Go:
 - do not jump directly to a unified-spec student
 - do not treat pure editing as already solved just because revision has a stronger student line
 - do not blame student capacity before confirming the teacher and tool family are strong enough
+- do not start volatility student work unless the operator audit reaches the target gate
 
 ## Recommended next step
 
@@ -162,3 +211,14 @@ The next step is:
    - broader search space
    - burst-local noise operator
    - simple envelope-based noise operator
+
+Current volatility gate:
+
+- target:
+  - best operator teacher better rate `>= 0.75`
+  - `local_std_error` clearly below heuristic
+  - `preservation_mae` not materially worse than heuristic
+- current status:
+  - best operator is `envelope_noise`
+  - teacher better rate is only `0.58`
+  - therefore volatility remains in tool-audit mode
