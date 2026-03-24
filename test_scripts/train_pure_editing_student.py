@@ -18,6 +18,7 @@ from modules.pure_editing_how_much import (
     teacher_search_pure_editing_params,
 )
 from modules.pure_editing_student import (
+    build_heuristic_params_for_tool,
     derive_student_tool_and_region,
     fit_tool_conditioned_student,
     predict_tool_conditioned_params,
@@ -88,54 +89,6 @@ def _execute_tool(
     raise ValueError(f"unsupported tool_name: {tool_name}")
 
 
-def _heuristic_params(tool_name: str, base_ts: np.ndarray, region: List[int]) -> Dict[str, Any]:
-    start, end = int(region[0]), int(region[1])
-    local = np.asarray(base_ts[start:end], dtype=np.float64)
-    local_std = max(float(np.std(local)), float(np.std(base_ts)) * 0.25, 1e-3)
-    region_len = max(1, end - start)
-    if tool_name == "spike_inject":
-        return {
-            "amplitude": local_std * 2.0,
-            "width": max(2.0, region_len / 6.0),
-            "center": int((start + end) // 2),
-        }
-    if tool_name == "step_shift":
-        return {
-            "level_shift": local_std * 2.0,
-            "left_ramp_steps": max(1, region_len // 10),
-            "right_ramp_steps": max(1, region_len // 5),
-        }
-    if tool_name == "hybrid_up":
-        return {"math_shift": local_std * 2.0}
-    if tool_name == "hybrid_down":
-        return {"math_shift": -local_std * 2.0}
-    if tool_name == "volatility_global_scale":
-        return {
-            "base_noise_scale": 1.0,
-            "local_std_target_ratio": 2.0,
-            "baseline_offset_ratio": 0.05,
-            "trend_preserve": 0.0,
-        }
-    if tool_name == "volatility_local_burst":
-        return {
-            "background_scale": 0.5,
-            "burst_center": 0.5,
-            "burst_width": 0.25,
-            "burst_amplitude": 2.4,
-            "burst_envelope_sharpness": 0.8,
-            "baseline_offset_ratio": 0.05,
-        }
-    if tool_name == "volatility_envelope_monotonic":
-        return {
-            "base_noise_scale": 1.0,
-            "start_scale": 0.3,
-            "end_scale": 2.0,
-            "baseline_offset_ratio": 0.05,
-            "trend_preserve": 0.0,
-        }
-    raise ValueError(f"unsupported heuristic tool_name: {tool_name}")
-
-
 def _load_samples(testsets: List[str]) -> List[Dict[str, Any]]:
     samples: List[Dict[str, Any]] = []
     for path in testsets:
@@ -203,7 +156,7 @@ def _split_rows(rows: List[Dict[str, Any]], *, train_ratio: float, seed: int) ->
     return train_rows, heldout_rows
 
 
-def _evaluate_rows(rows: List[Dict[str, Any]], *, model: Dict[str, Any], tedit) -> Dict[str, Any]:
+def _evaluate_rows(rows: List[Dict[str, Any]], *, model: Dict[str, Any], tedit, prediction_variant: str) -> Dict[str, Any]:
     detailed = []
     for row in rows:
         base_ts = np.asarray(row["base_ts"], dtype=np.float32)
@@ -214,17 +167,25 @@ def _evaluate_rows(rows: List[Dict[str, Any]], *, model: Dict[str, Any], tedit) 
         prompt_text = str(row["prompt_text"])
 
         teacher_params = dict(row["teacher_params"])
-        heuristic_params = _heuristic_params(tool_name, base_ts, region)
-        student_params = predict_tool_conditioned_params(
+        heuristic_params = build_heuristic_params_for_tool(
+            tool_name=tool_name,
+            base_ts=base_ts,
+            region=region,
+            prompt_text=prompt_text,
+        )
+        student_pred = predict_tool_conditioned_params(
             model=model,
             tool_name=tool_name,
             base_ts=base_ts,
             region=region,
             prompt_text=prompt_text,
             intent=intent,
+            prediction_variant=prediction_variant,
+            return_metadata=True,
         )
-        if student_params is None:
+        if student_pred is None:
             continue
+        student_params = dict(student_pred["params"])
 
         teacher_ts = _execute_tool(tool_name=tool_name, params=teacher_params, base_ts=base_ts, region=region, tedit=tedit)
         heuristic_ts = _execute_tool(tool_name=tool_name, params=heuristic_params, base_ts=base_ts, region=region, tedit=tedit)
@@ -247,6 +208,10 @@ def _evaluate_rows(rows: List[Dict[str, Any]], *, model: Dict[str, Any], tedit) 
                 "student_params": student_params,
                 "teacher_params": teacher_params,
                 "heuristic_params": heuristic_params,
+                "student_prediction_source": student_pred["source"],
+                "student_guard_reason": student_pred.get("guard_reason"),
+                "student_support_score": float(student_pred.get("support_score", 0.0)),
+                "student_clipped": bool(student_pred.get("clipped", False)),
                 "student_mae_vs_target": student_metrics["mae_vs_target"],
                 "teacher_mae_vs_target": teacher_metrics["mae_vs_target"],
                 "heuristic_mae_vs_target": heuristic_metrics["mae_vs_target"],
@@ -278,6 +243,7 @@ def _evaluate_rows(rows: List[Dict[str, Any]], *, model: Dict[str, Any], tedit) 
             "heuristic_mae_vs_target": float(np.mean([row["heuristic_mae_vs_target"] for row in subset])),
             "student_better_rate_vs_heuristic": float(np.mean([1.0 if row["student_beats_heuristic"] else 0.0 for row in subset])),
             "teacher_gap_closed": float(np.mean([row["teacher_gap_closed"] for row in subset])),
+            "fallback_rate": float(np.mean([1.0 if row["student_prediction_source"] == "heuristic_fallback" else 0.0 for row in subset])),
         }
 
     return {
@@ -292,6 +258,7 @@ def _evaluate_rows(rows: List[Dict[str, Any]], *, model: Dict[str, Any], tedit) 
             "student_better_rate_vs_heuristic": float(np.mean([1.0 if row["student_beats_heuristic"] else 0.0 for row in detailed])) if detailed else 0.0,
             "student_teacher_gap": _avg("student_teacher_gap"),
             "teacher_gap_closed": _avg("teacher_gap_closed"),
+            "fallback_rate": float(np.mean([1.0 if row["student_prediction_source"] == "heuristic_fallback" else 0.0 for row in detailed])) if detailed else 0.0,
         },
         "by_tool": tool_summary,
         "rows": detailed,
@@ -313,6 +280,7 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--alpha", type=float, default=1.0)
     parser.add_argument("--model-kind", choices=["linear", "quadratic", "mixed_capacity"], default="linear")
+    parser.add_argument("--prediction-variant", choices=["v1", "clip", "clip_guard"], default="v1")
     parser.add_argument("--tedit-model", default="")
     parser.add_argument("--tedit-config", default="")
     parser.add_argument("--device", default="cpu")
@@ -348,7 +316,7 @@ def main() -> None:
     heldout_path = out_root / "heldout_split.json"
     heldout_path.write_text(json.dumps(heldout_rows, ensure_ascii=False, indent=2), encoding="utf-8")
 
-    eval_payload = _evaluate_rows(heldout_rows, model=model, tedit=tedit)
+    eval_payload = _evaluate_rows(heldout_rows, model=model, tedit=tedit, prediction_variant=args.prediction_variant)
     eval_path = out_root / "heldout_eval.json"
     eval_path.write_text(json.dumps(eval_payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
@@ -356,6 +324,7 @@ def main() -> None:
         "teacher_dump": str(teacher_dump_path),
         "model_path": str(model_path),
         "model_kind": args.model_kind,
+        "prediction_variant": args.prediction_variant,
         "train_count": len(train_rows),
         "heldout_count": len(heldout_rows),
         "heldout_eval": str(eval_path),

@@ -85,6 +85,7 @@ MONOTONIC_UP_HINTS = ("逐渐加剧", "越来越乱", "后面更乱", "持续加
 MONOTONIC_DOWN_HINTS = ("逐渐恢复", "慢慢恢复", "前面更乱", "逐步平稳")
 
 VALID_STUDENT_MODEL_KINDS = ("linear", "quadratic", "mixed_capacity")
+VALID_PREDICTION_VARIANTS = ("v1", "clip", "clip_guard")
 
 
 def _safe_region(region: List[int], length: int) -> tuple[int, int]:
@@ -153,6 +154,64 @@ def _tool_name_from_sample(sample: dict[str, Any]) -> str | None:
             return "volatility_envelope_monotonic"
         return None
     return None
+
+
+def build_heuristic_params_for_tool(
+    *,
+    tool_name: str,
+    base_ts: np.ndarray,
+    region: List[int],
+    prompt_text: str = "",
+) -> Dict[str, Any]:
+    start, end = int(region[0]), int(region[1])
+    local = np.asarray(base_ts[start:end], dtype=np.float64)
+    local_std = max(float(np.std(local)), float(np.std(base_ts)) * 0.25, 1e-3)
+    region_len = max(1, end - start)
+    prompt = str(prompt_text or "")
+    if tool_name == "spike_inject":
+        sign = -1.0 if any(token in prompt for token in ("回落", "下降", "下滑", "更低")) else 1.0
+        return {
+            "amplitude": sign * local_std * 2.0,
+            "width": max(2.0, region_len / 6.0),
+            "center": int((start + end) // 2),
+        }
+    if tool_name == "step_shift":
+        sign = -1.0 if any(token in prompt for token in ("回落", "下降", "下滑", "更低")) else 1.0
+        return {
+            "level_shift": sign * local_std * 2.0,
+            "left_ramp_steps": max(1, region_len // 10),
+            "right_ramp_steps": max(1, region_len // 5),
+        }
+    if tool_name == "hybrid_up":
+        return {"math_shift": local_std * 2.0}
+    if tool_name == "hybrid_down":
+        return {"math_shift": -local_std * 2.0}
+    if tool_name == "volatility_global_scale":
+        return {
+            "base_noise_scale": 1.0,
+            "local_std_target_ratio": 2.0,
+            "baseline_offset_ratio": 0.05,
+            "trend_preserve": 0.0,
+        }
+    if tool_name == "volatility_local_burst":
+        return {
+            "background_scale": 0.5,
+            "burst_center": 0.5,
+            "burst_width": 0.25,
+            "burst_amplitude": 2.4,
+            "burst_envelope_sharpness": 0.8,
+            "baseline_offset_ratio": 0.05,
+        }
+    if tool_name == "volatility_envelope_monotonic":
+        descending = any(token in prompt for token in MONOTONIC_DOWN_HINTS)
+        return {
+            "base_noise_scale": 1.0,
+            "start_scale": 2.0 if descending else 0.3,
+            "end_scale": 0.3 if descending else 2.0,
+            "baseline_offset_ratio": 0.05,
+            "trend_preserve": 0.0,
+        }
+    raise ValueError(f"unsupported tool_name: {tool_name}")
 
 
 def derive_student_tool_and_region(sample: dict[str, Any]) -> dict[str, Any] | None:
@@ -409,6 +468,9 @@ def fit_tool_conditioned_student(
             "feature_std": feat_std.tolist(),
             "target_keys": list(TOOL_PARAM_KEYS[tool_name]),
             "train_count": len(rows),
+            "target_p05": np.quantile(Y_arr, 0.05, axis=0).tolist(),
+            "target_p95": np.quantile(Y_arr, 0.95, axis=0).tolist(),
+            "feature_abs_z_p95": float(np.quantile(np.max(np.abs(X_norm), axis=1), 0.95)),
             **head_payload,
         }
     return model
@@ -422,7 +484,11 @@ def predict_tool_conditioned_params(
     region: List[int],
     prompt_text: str,
     intent: Dict[str, Any],
+    prediction_variant: str = "v1",
+    return_metadata: bool = False,
 ) -> Dict[str, Any] | None:
+    if prediction_variant not in VALID_PREDICTION_VARIANTS:
+        raise ValueError(f"unsupported prediction_variant: {prediction_variant}")
     head = (model.get("tool_heads") or {}).get(tool_name)
     if not isinstance(head, dict):
         return None
@@ -440,14 +506,66 @@ def predict_tool_conditioned_params(
     if features.size != feat_mean.size:
         raise ValueError(f"feature size mismatch for {tool_name}: got {features.size}, expected {feat_mean.size}")
     x_norm = (features - feat_mean) / feat_std
+    support_score = float(np.max(np.abs(x_norm))) if x_norm.size else 0.0
     if head_kind in {"linear", "quadratic"}:
         weights = np.asarray(head.get("weights", []), dtype=np.float64)
         x_aug = _expand_feature_vector(x_norm, head_kind)
-        prediction = x_aug @ weights
+        raw_prediction = x_aug @ weights
     elif head_kind == "mlp":
-        prediction = _predict_mlp_head(x_norm, head)
+        raw_prediction = _predict_mlp_head(x_norm, head)
     else:
         raise ValueError(f"unsupported head_kind: {head_kind}")
+    clipped_prediction = np.asarray(raw_prediction, dtype=np.float64).copy()
+    clipped = False
+    if prediction_variant in {"clip", "clip_guard"}:
+        p05 = np.asarray(head.get("target_p05", []), dtype=np.float64)
+        p95 = np.asarray(head.get("target_p95", []), dtype=np.float64)
+        if p05.size == clipped_prediction.size == p95.size:
+            clipped_prediction = np.clip(clipped_prediction, p05, p95)
+            clipped = bool(np.any(np.abs(clipped_prediction - raw_prediction) > 1e-8))
+    guard_triggered = False
+    guard_reason = None
+    if prediction_variant == "clip_guard":
+        support_limit = float(head.get("feature_abs_z_p95", 4.0)) * 1.10
+        if support_score > support_limit:
+            guard_triggered = True
+            guard_reason = "low_support"
+        elif clipped:
+            delta = float(np.max(np.abs(clipped_prediction - raw_prediction)))
+            if delta > 0.5:
+                guard_triggered = True
+                guard_reason = "aggressive_clip"
+    if guard_triggered:
+        fallback = build_heuristic_params_for_tool(
+            tool_name=tool_name,
+            base_ts=np.asarray(base_ts, dtype=np.float64),
+            region=region,
+            prompt_text=prompt_text,
+        )
+        if return_metadata:
+            return {
+                "params": fallback,
+                "source": "heuristic_fallback",
+                "support_score": support_score,
+                "guard_reason": guard_reason,
+                "clipped": clipped,
+            }
+        return fallback
+    prediction = clipped_prediction if prediction_variant in {"clip", "clip_guard"} else raw_prediction
+    params = target_vector_to_params(
+        tool_name=tool_name,
+        target=prediction,
+        base_ts=np.asarray(base_ts, dtype=np.float64),
+        region=region,
+    )
+    if return_metadata:
+        return {
+            "params": params,
+            "source": "student",
+            "support_score": support_score,
+            "guard_reason": guard_reason,
+            "clipped": clipped,
+        }
     return target_vector_to_params(
         tool_name=tool_name,
         target=prediction,
@@ -462,6 +580,7 @@ def build_student_runtime_override(
     plan: Dict[str, Any],
     base_ts: np.ndarray,
     prompt_text: str,
+    prediction_variant: str = "v1",
 ) -> Dict[str, Any] | None:
     routing = dict(plan.get("volatility_routing") or {})
     if str(routing.get("final_subtype", "")) == "preview_non_monotonic":
@@ -480,12 +599,20 @@ def build_student_runtime_override(
         region=region,
         prompt_text=prompt_text,
         intent=intent,
+        prediction_variant=prediction_variant,
+        return_metadata=True,
     )
     if predicted is None:
         return None
-    override = dict(predicted)
+    override = dict(predicted["params"])
     override["region"] = region
-    return override
+    return {
+        "parameters": override,
+        "source": str(predicted.get("source", "student")),
+        "guard_reason": predicted.get("guard_reason"),
+        "support_score": float(predicted.get("support_score", 0.0)),
+        "clipped": bool(predicted.get("clipped", False)),
+    }
 
 
 def save_student_model(model: Dict[str, Any], path: str) -> None:

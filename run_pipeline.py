@@ -113,6 +113,7 @@ def run_pipeline(
     save_visualizations: bool = True,
     max_samples: Optional[int] = None,
     how_much_student_model: Optional[str] = None,
+    how_much_student_variant: str = "v1",
 ) -> Dict[str, Any]:
     """
     运行完整评估 pipeline。
@@ -257,12 +258,20 @@ def run_pipeline(
                     plan=plan,
                     base_ts=base_ts,
                     prompt_text=vague_prompt,
+                    prediction_variant=how_much_student_variant,
                 )
                 if student_override is not None:
-                    plan.setdefault("parameters", {}).update(student_override)
-                    plan.setdefault("execution", {}).setdefault("parameters", {}).update(student_override)
-                    plan["how_much_source"] = "tool_conditioned_student"
-                    plan["how_much_student_override"] = dict(student_override)
+                    override_params = dict(student_override["parameters"])
+                    plan.setdefault("parameters", {}).update(override_params)
+                    plan.setdefault("execution", {}).setdefault("parameters", {}).update(override_params)
+                    plan["how_much_source"] = str(student_override.get("source", "tool_conditioned_student"))
+                    plan["how_much_student_override"] = dict(override_params)
+                    plan["how_much_student_variant"] = how_much_student_variant
+                    plan["how_much_student_guard"] = {
+                        "guard_reason": student_override.get("guard_reason"),
+                        "support_score": student_override.get("support_score"),
+                        "clipped": student_override.get("clipped"),
+                    }
             region = plan.get("parameters", {}).get("region", [0, len(base_ts)])
             logger.info(
                 f"  Pipeline mode={mode}  tool={plan.get('tool_name')}  "
@@ -758,6 +767,12 @@ def main() -> None:
         default=None,
         help="可选的 pure-editing tool-conditioned how-much student 模型 JSON；提供后将覆写执行参数层。",
     )
+    parser.add_argument(
+        "--how-much-student-variant",
+        default="v1",
+        choices=["v1", "clip", "clip_guard"],
+        help="student 参数层预测变体：原始 v1、分位裁剪 clip、带守卫回退的 clip_guard。",
+    )
 
     args = parser.parse_args()
     run_pipeline(
@@ -771,6 +786,7 @@ def main() -> None:
         save_visualizations=not args.no_save_vis,
         max_samples=args.max_samples,
         how_much_student_model=args.how_much_student_model,
+        how_much_student_variant=args.how_much_student_variant,
     )
 
 

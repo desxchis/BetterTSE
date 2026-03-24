@@ -114,6 +114,53 @@ Current runtime note:
 - 3-sample ETTh1 smoke confirms `mixed_capacity` runtime override works and is less damaging than the initial linear kickoff
 - it is still worse than the frozen teacher-backed `full_bettertse` path, so student remains experimental rather than promoted
 
+## Runtime-Safe Student Variants
+
+To reduce runtime mismatch, the current student path now supports:
+
+1. `v1`
+2. `clip`
+   - clip each head to its teacher-label training quantile band
+3. `clip_guard`
+   - apply clipping
+   - if the sample is in low-support space or the prediction is clipped too aggressively, fallback to heuristic how-much
+
+Current ETTh1 56-sample heldout reading for `mixed_capacity`:
+
+- `v1`
+  - student MAE `0.4843`
+  - teacher gap closed `0.4563`
+  - fallback rate `0.00`
+- `clip`
+  - student MAE `0.4614`
+  - teacher gap closed `0.3083`
+  - fallback rate `0.00`
+- `clip_guard`
+  - student MAE `0.4906`
+  - teacher gap closed `0.3028`
+  - fallback rate `0.82`
+
+Current ETTh1 3-sample runtime smoke:
+
+- frozen teacher-backed full chain
+  - target MAE `0.5354`
+  - preservation MAE `0.3627`
+- `mixed_capacity v1`
+  - target MAE `0.8045`
+  - preservation MAE `0.6218`
+- `mixed_capacity clip`
+  - target MAE `0.7108`
+  - preservation MAE `0.4883`
+- `mixed_capacity clip_guard`
+  - target MAE `0.6552`
+  - preservation MAE `0.4189`
+
+Current interpretation:
+
+- runtime-safe guards do reduce the deployment mismatch relative to the raw student path
+- `clip_guard` is the current safest runtime student variant
+- however, the student path still does not beat the frozen teacher-backed full chain, so student remains outside the locked mainline
+
 ## Current teacher design
 
 The teacher is tool-conditioned and searches directly in each tool's native parameter space.
