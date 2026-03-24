@@ -139,21 +139,21 @@ def _audit_objective(metrics: Dict[str, float]) -> float:
 
 def _global_scale_objective(metrics: Dict[str, float]) -> float:
     return (
-        0.60 * metrics["mae_vs_target"]
+        0.38 * metrics["mae_vs_target"]
         + 0.01 * metrics["mse_vs_target"]
-        + 0.20 * metrics["local_std_error"]
+        + 0.32 * metrics["local_std_error"]
         + 0.05 * metrics["roughness_error"]
-        + 0.05 * metrics["windowed_energy_profile_error"]
+        + 0.10 * metrics["windowed_energy_profile_error"]
     )
 
 
 def _local_burst_objective(metrics: Dict[str, float]) -> float:
     return (
-        0.55 * metrics["mae_vs_target"]
+        0.42 * metrics["mae_vs_target"]
         + 0.01 * metrics["mse_vs_target"]
         + 0.10 * metrics["local_std_error"]
-        + 0.15 * metrics["roughness_error"]
-        + 0.25 * metrics["windowed_energy_profile_error"]
+        + 0.17 * metrics["roughness_error"]
+        + 0.30 * metrics["windowed_energy_profile_error"]
     )
 
 
@@ -190,6 +190,14 @@ def _base_trend_and_residual(base_ts: np.ndarray, start: int, end: int) -> Tuple
     return trend.astype(np.float64), residual.astype(np.float64)
 
 
+def _global_series_stats(base_ts: np.ndarray) -> Tuple[float, float, float]:
+    arr = np.asarray(base_ts, dtype=np.float64)
+    data_min = float(np.min(arr))
+    data_range = max(float(np.max(arr) - data_min), 1e-3)
+    data_std = max(float(np.std(arr)), 1e-3)
+    return data_min, data_range, data_std
+
+
 def volatility_global_subwindow(
     base_ts: np.ndarray,
     region: List[int],
@@ -222,12 +230,23 @@ def volatility_global_subwindow(
 def volatility_global_scale(
     base_ts: np.ndarray,
     region: List[int],
-    amplify_factor: float,
+    base_noise_scale: float,
+    local_std_target_ratio: float,
+    baseline_offset_ratio: float,
+    trend_preserve: float,
+    seed: int = 41,
 ) -> np.ndarray:
     base = np.asarray(base_ts, dtype=np.float64).copy()
     start, end = _safe_region(region, len(base))
-    trend, residual = _base_trend_and_residual(base, start, end)
-    new_region = trend + residual * amplify_factor
+    trend, _ = _base_trend_and_residual(base, start, end)
+    region_len = end - start
+    data_min, data_range, data_std = _global_series_stats(base)
+    baseline = data_min + data_range * baseline_offset_ratio
+    rng = np.random.RandomState(seed + start + end + int(round(local_std_target_ratio * 10)))
+    noise_std = data_std * local_std_target_ratio
+    region_noise = rng.normal(loc=0.0, scale=noise_std * base_noise_scale, size=region_len)
+    trend_component = trend_preserve * (trend - float(np.mean(trend)))
+    new_region = baseline + trend_component + region_noise
     base[start:end] = new_region
     return base.astype(np.float32)
 
@@ -235,29 +254,29 @@ def volatility_global_scale(
 def volatility_burst_local(
     base_ts: np.ndarray,
     region: List[int],
-    noise_scale: float,
-    active_len_ratio: float,
-    center_ratio: float,
-    envelope_strength: float,
+    background_scale: float,
+    burst_center: float,
+    burst_width: float,
+    burst_amplitude: float,
+    burst_envelope_sharpness: float,
+    baseline_offset_ratio: float,
     seed: int = 7,
 ) -> np.ndarray:
     base = np.asarray(base_ts, dtype=np.float64).copy()
     start, end = _safe_region(region, len(base))
-    trend, residual = _base_trend_and_residual(base, start, end)
+    _, residual = _base_trend_and_residual(base, start, end)
     region_len = end - start
-    active_len = max(3, min(region_len, int(round(region_len * active_len_ratio))))
-    center = start + int(round(center_ratio * max(region_len - 1, 1)))
-    active_start = max(start, min(center - active_len // 2, end - active_len))
-    active_end = min(end, active_start + active_len)
-    envelope = np.zeros(region_len, dtype=np.float64)
-    rel_start = active_start - start
-    rel_end = active_end - start
-    xs = np.linspace(-1.0, 1.0, rel_end - rel_start)
-    envelope[rel_start:rel_end] = np.exp(-0.5 * np.square(xs / max(envelope_strength, 0.2)))
-    rng = np.random.RandomState(seed + start + end + int(round(noise_scale * 10)))
-    residual_std = max(float(np.std(residual)), 1e-3)
-    burst_noise = rng.normal(loc=0.0, scale=residual_std * noise_scale, size=region_len)
-    new_region = trend + residual + burst_noise * envelope
+    data_min, data_range, data_std = _global_series_stats(base)
+    baseline = data_min + data_range * baseline_offset_ratio
+    xs = np.linspace(0.0, 1.0, region_len, dtype=np.float64)
+    width = max(float(burst_width), 0.08)
+    center = float(np.clip(burst_center, 0.0, 1.0))
+    envelope = np.exp(-0.5 * np.square((xs - center) / max(width * burst_envelope_sharpness, 0.05)))
+    envelope = np.clip(envelope, 0.0, 1.0)
+    rng = np.random.RandomState(seed + start + end + int(round(burst_amplitude * 10)))
+    background_noise = rng.normal(loc=0.0, scale=data_std * background_scale, size=region_len)
+    burst_noise = rng.normal(loc=0.0, scale=max(float(np.std(residual)), 1e-3) * burst_amplitude, size=region_len)
+    new_region = baseline + background_noise + burst_noise * envelope
     base[start:end] = new_region
     return base.astype(np.float32)
 
@@ -355,7 +374,20 @@ def heuristic_volatility_operator(base_ts: np.ndarray, region: List[int]) -> np.
 
 def _candidate_grid(operator_name: str) -> List[Dict[str, Any]]:
     if operator_name == "volatility_global_scale":
-        return [{"amplify_factor": float(v)} for v in (0.8, 1.0, 1.2, 1.5, 2.0, 2.6, 3.2)]
+        grid = []
+        for base_noise_scale in (0.8, 1.0, 1.2):
+            for std_ratio in (1.2, 1.6, 2.0, 2.6, 3.2):
+                for baseline_offset in (0.02, 0.05, 0.08, 0.12):
+                    for trend_preserve in (0.0, 0.1, 0.2):
+                        grid.append(
+                            {
+                                "base_noise_scale": float(base_noise_scale),
+                                "local_std_target_ratio": float(std_ratio),
+                                "baseline_offset_ratio": float(baseline_offset),
+                                "trend_preserve": float(trend_preserve),
+                            }
+                        )
+        return grid
     if operator_name == "global_subwindow":
         grid = []
         for amplify in (1.0, 1.2, 1.5, 2.0, 2.5, 3.0):
@@ -373,18 +405,22 @@ def _candidate_grid(operator_name: str) -> List[Dict[str, Any]]:
         return grid
     if operator_name == "burst_local":
         grid = []
-        for scale in (0.8, 1.2, 1.6, 2.0, 2.6, 3.2):
-            for active_len in (0.2, 0.35, 0.5, 0.7):
-                for center in (0.2, 0.5, 0.8):
-                    for envelope in (0.25, 0.45, 0.7):
-                        grid.append(
-                            {
-                                "noise_scale": float(scale),
-                                "active_len_ratio": float(active_len),
-                                "center_ratio": float(center),
-                                "envelope_strength": float(envelope),
-                            }
-                        )
+        for background_scale in (0.2, 0.5, 0.8):
+            for center in (0.25, 0.5, 0.75):
+                for width in (0.15, 0.25, 0.4):
+                    for amplitude in (1.2, 1.8, 2.4, 3.0):
+                        for sharpness in (0.5, 0.8, 1.1):
+                            for baseline_offset in (0.02, 0.05, 0.08):
+                                grid.append(
+                                    {
+                                        "background_scale": float(background_scale),
+                                        "burst_center": float(center),
+                                        "burst_width": float(width),
+                                        "burst_amplitude": float(amplitude),
+                                        "burst_envelope_sharpness": float(sharpness),
+                                        "baseline_offset_ratio": float(baseline_offset),
+                                    }
+                                )
         return grid
     if operator_name == "envelope_noise":
         grid = []
