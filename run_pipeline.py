@@ -54,7 +54,7 @@ from modules.experiment_visualization import (
     build_visualization_path,
     save_pipeline_visualization,
 )
-from modules.pure_editing_volatility import infer_volatility_subtool_from_text
+from modules.pure_editing_volatility import resolve_volatility_subtype_route
 from modules.region_localizer import infer_duration_steps, infer_position_bucket, infer_shape_hint
 from tool.ts_editors import EDIT_TOOL_SPECS, execute_llm_tool, normalize_llm_plan
 from tool.tedit_wrapper import TEditWrapper, get_tedit_instance
@@ -415,9 +415,6 @@ def _direct_tool_choice(prompt_text: str) -> tuple[str, str]:
 
     if shape == "step":
         return "step_shift", EDIT_TOOL_SPECS["step_shift"]["canonical_tool"]
-    if shape == "irregular_noise":
-        routed = infer_volatility_subtool_from_text(text)
-        return routed["tool_name"], routed["canonical_tool"]
     if shape == "hump":
         return "spike_inject", EDIT_TOOL_SPECS["spike_inject"]["canonical_tool"]
     if shape == "flatline":
@@ -430,15 +427,13 @@ def _direct_tool_choice(prompt_text: str) -> tuple[str, str]:
 
 
 def _build_direct_edit_plan(prompt_text: str, ts_length: int) -> Dict[str, Any]:
-    tool_name, canonical_tool = _direct_tool_choice(prompt_text)
-    spec = EDIT_TOOL_SPECS.get(tool_name, {})
     bucket = infer_position_bucket(prompt_text, fallback="mid")
     shape_hint = infer_shape_hint(prompt_text)
     duration = infer_duration_steps(
         prompt_text,
         ts_length,
-        effect_family=str(spec.get("effect_family", "")),
-        canonical_tool=canonical_tool,
+        effect_family="volatility" if shape_hint == "irregular_noise" else "",
+        canonical_tool="volatility_global_scale" if shape_hint == "irregular_noise" else "",
         shape=shape_hint,
     )
     if bucket == "full":
@@ -452,28 +447,52 @@ def _build_direct_edit_plan(prompt_text: str, ts_length: int) -> Dict[str, Any]:
         start = max(0, (ts_length - duration) // 2)
         region = [start, min(ts_length, start + duration)]
 
-    return normalize_llm_plan(
-        {
-            "thought": "direct text-to-executor ablation",
-            "intent": {
-                "effect_family": spec.get("effect_family", "trend"),
-                "direction": spec.get("direction", "neutral"),
-                "shape": shape_hint or spec.get("shape", "linear"),
-                "duration": spec.get("duration", "medium"),
-                "strength": spec.get("strength", "medium"),
-            },
-            "localization": {
-                "position_bucket": bucket,
-                "region": region,
-            },
-            "execution": {
-                "tool_name": tool_name,
-                "canonical_tool": canonical_tool,
-                "parameters": {"region": region},
-            },
+    volatility_route = None
+    if shape_hint == "irregular_noise":
+        volatility_route = resolve_volatility_subtype_route(
+            text=prompt_text,
+            region=region,
+            ts_length=ts_length,
+        )
+        tool_name = volatility_route["tool_name"]
+        canonical_tool = volatility_route["canonical_tool"]
+    else:
+        tool_name, canonical_tool = _direct_tool_choice(prompt_text)
+
+    spec = EDIT_TOOL_SPECS.get(tool_name, {})
+    plan: Dict[str, Any] = {
+        "thought": "direct text-to-executor ablation",
+        "intent": {
+            "effect_family": spec.get("effect_family", "trend"),
+            "direction": spec.get("direction", "neutral"),
+            "shape": shape_hint or spec.get("shape", "linear"),
+            "duration": spec.get("duration", "medium"),
+            "strength": spec.get("strength", "medium"),
         },
-        ts_length=ts_length,
-    )
+        "localization": {
+            "position_bucket": bucket,
+            "region": region,
+        },
+        "execution": {
+            "tool_name": tool_name,
+            "canonical_tool": canonical_tool,
+            "parameters": {"region": region},
+        },
+    }
+    if volatility_route is not None:
+        plan["volatility_subtype"] = volatility_route["final_subtype"]
+        plan["volatility_routing"] = {
+            "proposed_subtype": volatility_route["proposed_subtype"],
+            "guarded_subtype": volatility_route["guarded_subtype"],
+            "final_subtype": volatility_route["final_subtype"],
+            "guard_reason": volatility_route["guard_reason"],
+            "is_preview": volatility_route["is_preview"],
+        }
+        plan["intent"]["volatility_subtype"] = volatility_route["proposed_subtype"]
+        plan["execution"]["volatility_subtype"] = volatility_route["final_subtype"]
+        plan["execution"]["parameters"].update(volatility_route["parameters"])
+
+    return normalize_llm_plan(plan, ts_length=ts_length)
 
 
 def _apply_pipeline_mode(
@@ -498,8 +517,25 @@ def _apply_pipeline_mode(
         ablated["execution"]["parameters"]["region"] = full_region
         return normalize_llm_plan(ablated, ts_length=ts_length)
     if mode == "wo_canonical_layer":
-        tool_name, _ = _direct_tool_choice(prompt_text)
         ablated = normalize_llm_plan(normalized, ts_length=ts_length)
+        tool_name, _ = _direct_tool_choice(prompt_text)
+        if str((ablated.get("intent") or {}).get("shape", "")) == "irregular_noise":
+            routed = resolve_volatility_subtype_route(
+                text=prompt_text,
+                proposed_subtype=ablated.get("volatility_subtype") or (ablated.get("intent") or {}).get("volatility_subtype"),
+                region=(ablated.get("parameters") or {}).get("region"),
+                ts_length=ts_length,
+            )
+            tool_name = routed["tool_name"]
+            ablated["volatility_subtype"] = routed["final_subtype"]
+            ablated["volatility_routing"] = {
+                "proposed_subtype": routed["proposed_subtype"],
+                "guarded_subtype": routed["guarded_subtype"],
+                "final_subtype": routed["final_subtype"],
+                "guard_reason": routed["guard_reason"],
+                "is_preview": routed["is_preview"],
+            }
+            ablated.setdefault("intent", {})["volatility_subtype"] = routed["proposed_subtype"]
         ablated.pop("canonical_tool", None)
         ablated["tool_name"] = tool_name
         ablated.setdefault("execution", {})

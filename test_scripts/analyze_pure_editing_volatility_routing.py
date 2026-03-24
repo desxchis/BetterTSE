@@ -20,6 +20,12 @@ EXPECTED_TOOL_BY_SUBPATTERN = {
     "local_burst": "volatility_local_burst",
     "monotonic_envelope": "volatility_envelope_monotonic",
 }
+EXPECTED_SUBTYPE_BY_SUBPATTERN = {
+    "uniform_variance": "global_scale",
+    "local_burst": "local_burst",
+    "monotonic_envelope": "envelope_monotonic",
+    "non_monotonic_envelope": "preview_non_monotonic",
+}
 
 
 def _mean(values: List[float]) -> float:
@@ -47,14 +53,33 @@ def analyze(testset_path: str, result_path: str) -> Dict[str, Any]:
             or (row.get("experiment_record") or {}).get("prediction", {}).get("hybrid_tool_label")
             or "none"
         )
+        routing = (row.get("llm_plan") or {}).get("volatility_routing") or {}
+        proposed_subtype = (
+            routing.get("proposed_subtype")
+            or (row.get("llm_plan") or {}).get("intent", {}).get("volatility_subtype")
+            or (row.get("llm_plan") or {}).get("volatility_subtype")
+            or "none"
+        )
+        guarded_subtype = routing.get("guarded_subtype") or proposed_subtype
+        final_subtype = (
+            routing.get("final_subtype")
+            or (row.get("llm_plan") or {}).get("volatility_subtype")
+            or "none"
+        )
         expected_tool = EXPECTED_TOOL_BY_SUBPATTERN.get(subpattern)
+        expected_subtype = EXPECTED_SUBTYPE_BY_SUBPATTERN.get(subpattern)
         volatility_rows.append(
             {
                 "sample_id": row["sample_id"],
                 "subpattern": subpattern,
+                "expected_subtype": expected_subtype,
+                "proposed_subtype": proposed_subtype,
+                "guarded_subtype": guarded_subtype,
+                "final_subtype": final_subtype,
                 "expected_tool": expected_tool,
                 "predicted_tool": predicted_tool,
                 "route_correct": bool(expected_tool is not None and predicted_tool == expected_tool),
+                "subtype_correct": bool(expected_subtype is not None and final_subtype == expected_subtype),
                 "is_preview_case": subpattern == "non_monotonic_envelope",
                 "target_mae": float((row.get("metrics") or {}).get("mae_vs_target", 0.0)),
                 "preservation_mae": float((row.get("metrics") or {}).get("preservation_mae", 0.0)),
@@ -77,8 +102,11 @@ def analyze(testset_path: str, result_path: str) -> Dict[str, Any]:
         by_subpattern[subpattern] = {
             "count": len(subset),
             "expected_tool": EXPECTED_TOOL_BY_SUBPATTERN.get(subpattern),
+            "expected_subtype": EXPECTED_SUBTYPE_BY_SUBPATTERN.get(subpattern),
             "routed_tools": {tool: sum(1 for row in subset if row["predicted_tool"] == tool) for tool in sorted({row["predicted_tool"] for row in subset})},
+            "final_subtypes": {subtype: sum(1 for row in subset if row["final_subtype"] == subtype) for subtype in sorted({row["final_subtype"] for row in subset})},
             "route_correct_rate": _mean([1.0 if row["route_correct"] else 0.0 for row in subset if not row["is_preview_case"]]),
+            "subtype_correct_rate": _mean([1.0 if row["subtype_correct"] else 0.0 for row in subset]),
             "avg_target_mae": _mean([row["target_mae"] for row in subset]),
         }
 
@@ -90,6 +118,14 @@ def analyze(testset_path: str, result_path: str) -> Dict[str, Any]:
             if (not row["is_preview_case"]) and row["predicted_tool"] not in set(EXPECTED_TOOL_BY_SUBPATTERN.values())
         ),
         "overall_route_correct_rate": _mean([1.0 if row["route_correct"] else 0.0 for row in volatility_rows if not row["is_preview_case"]]),
+        "overall_subtype_correct_rate": _mean([1.0 if row["subtype_correct"] else 0.0 for row in volatility_rows]),
+        "preview_not_misrouted_rate": _mean(
+            [
+                1.0 if row["final_subtype"] == "preview_non_monotonic" else 0.0
+                for row in volatility_rows
+                if row["is_preview_case"]
+            ]
+        ),
     }
 
     return {

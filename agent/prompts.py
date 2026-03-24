@@ -126,6 +126,7 @@ CRITICAL CONSTRAINTS:
 Return STRICT JSON with this schema:
 {{
   "thought": "brief reasoning from time anchor -> region -> canonical intent -> execution tool",
+  "volatility_subtype": "<global_scale|local_burst|envelope_monotonic|preview_non_monotonic|none>",
   "intent": {{
     "effect_family": "<trend|seasonality|volatility|impulse|level|shutdown>",
     "direction": "<up|down|neutral>",
@@ -153,6 +154,8 @@ Return STRICT JSON with this schema:
 }}
 
 Parameter rules:
+- `volatility_subtype` is required when `intent.effect_family=volatility` or `intent.shape=irregular_noise`
+- Use `preview_non_monotonic` for multi-stage / non-monotonic envelope cases; these remain preview-side cases
 - `hybrid_up`, `hybrid_down`, `trend_quadratic_up`, `trend_quadratic_down`:
   may include either `math_shift` or `shift_factor`
 - `volatility_global_scale`:

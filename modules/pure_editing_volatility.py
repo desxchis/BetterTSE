@@ -7,7 +7,10 @@ import numpy as np
 
 
 LOCAL_BURST_HINTS = (
-    "局部", "一段", "短时", "短窗口", "突发", "骤然", "瞬时", "片段", "某段",
+    "局部短时", "短时片段", "突发", "骤然", "瞬时", "burst", "爆发式", "突发式",
+)
+GLOBAL_SCALE_HINTS = (
+    "整体", "全段", "全程", "普遍", "总体", "整体波动", "整体更乱", "整体更噪", "整体不稳定",
 )
 MONOTONIC_UP_HINTS = (
     "逐渐加剧", "越来越乱", "逐步失真", "持续恶化", "波动逐步放大", "后面更乱",
@@ -15,6 +18,16 @@ MONOTONIC_UP_HINTS = (
 MONOTONIC_DOWN_HINTS = (
     "逐渐恢复", "逐步恢复", "逐步平稳", "慢慢恢复", "波动逐步减弱", "前面更乱",
 )
+PREVIEW_NON_MONOTONIC_HINTS = (
+    "先高后低再高", "先低后高再低", "反复起伏", "双峰", "多段变化", "忽强忽弱", "来回波动",
+)
+
+VALID_VOLATILITY_SUBTYPES = {
+    "global_scale",
+    "local_burst",
+    "envelope_monotonic",
+    "preview_non_monotonic",
+}
 
 
 @dataclass
@@ -37,53 +50,144 @@ class VolatilityAuditResult:
         }
 
 
-def infer_volatility_subtool_from_text(text: str) -> Dict[str, Any]:
+def infer_volatility_subtype_from_text(text: str) -> str:
     normalized = str(text or "")
+    if any(token in normalized for token in PREVIEW_NON_MONOTONIC_HINTS):
+        return "preview_non_monotonic"
     if any(token in normalized for token in LOCAL_BURST_HINTS):
+        return "local_burst"
+    if any(token in normalized for token in MONOTONIC_UP_HINTS) or any(token in normalized for token in MONOTONIC_DOWN_HINTS):
+        return "envelope_monotonic"
+    if any(token in normalized for token in GLOBAL_SCALE_HINTS):
+        return "global_scale"
+    return "global_scale"
+
+
+def _normalize_subtype(value: Any) -> str:
+    subtype = str(value or "").strip().lower()
+    if subtype in VALID_VOLATILITY_SUBTYPES:
+        return subtype
+    return ""
+
+
+def _is_short_region(region: List[int] | Tuple[int, int] | None, ts_length: int | None) -> bool:
+    if not region or ts_length is None or ts_length <= 0 or len(region) != 2:
+        return False
+    start = int(region[0])
+    end = int(region[1])
+    width = max(1, end - start)
+    return (width / max(ts_length, 1)) <= 0.22
+
+
+def _is_long_region(region: List[int] | Tuple[int, int] | None, ts_length: int | None) -> bool:
+    if not region or ts_length is None or ts_length <= 0 or len(region) != 2:
+        return False
+    start = int(region[0])
+    end = int(region[1])
+    width = max(1, end - start)
+    return (width / max(ts_length, 1)) >= 0.35
+
+
+def _default_params_for_subtype(subtype: str, text: str) -> Dict[str, Any]:
+    if subtype == "local_burst":
         return {
-            "tool_name": "volatility_local_burst",
-            "canonical_tool": "volatility_local_burst",
-            "parameters": {
-                "background_scale": 0.5,
-                "burst_center": 0.5,
-                "burst_width": 0.25,
-                "burst_amplitude": 2.4,
-                "burst_envelope_sharpness": 0.8,
-                "baseline_offset_ratio": 0.05,
-            },
+            "background_scale": 0.5,
+            "burst_center": 0.5,
+            "burst_width": 0.25,
+            "burst_amplitude": 2.4,
+            "burst_envelope_sharpness": 0.8,
+            "baseline_offset_ratio": 0.05,
         }
-    if any(token in normalized for token in MONOTONIC_UP_HINTS):
+    if subtype == "envelope_monotonic":
+        if any(token in str(text or "") for token in MONOTONIC_DOWN_HINTS):
+            start_scale, end_scale = 2.0, 0.3
+        else:
+            start_scale, end_scale = 0.3, 2.0
         return {
-            "tool_name": "volatility_envelope_monotonic",
-            "canonical_tool": "volatility_envelope_monotonic",
-            "parameters": {
-                "base_noise_scale": 1.0,
-                "start_scale": 0.3,
-                "end_scale": 2.0,
-                "baseline_offset_ratio": 0.05,
-                "trend_preserve": 0.0,
-            },
-        }
-    if any(token in normalized for token in MONOTONIC_DOWN_HINTS):
-        return {
-            "tool_name": "volatility_envelope_monotonic",
-            "canonical_tool": "volatility_envelope_monotonic",
-            "parameters": {
-                "base_noise_scale": 1.0,
-                "start_scale": 2.0,
-                "end_scale": 0.3,
-                "baseline_offset_ratio": 0.05,
-                "trend_preserve": 0.0,
-            },
-        }
-    return {
-        "tool_name": "volatility_global_scale",
-        "canonical_tool": "volatility_global_scale",
-        "parameters": {
             "base_noise_scale": 1.0,
-            "local_std_target_ratio": 2.0,
+            "start_scale": start_scale,
+            "end_scale": end_scale,
             "baseline_offset_ratio": 0.05,
             "trend_preserve": 0.0,
+        }
+    return {
+        "base_noise_scale": 1.0,
+        "local_std_target_ratio": 2.0,
+        "baseline_offset_ratio": 0.05,
+        "trend_preserve": 0.0,
+    }
+
+
+def resolve_volatility_subtype_route(
+    *,
+    text: str,
+    proposed_subtype: str | None = None,
+    region: List[int] | Tuple[int, int] | None = None,
+    ts_length: int | None = None,
+) -> Dict[str, Any]:
+    normalized = str(text or "")
+    proposed = _normalize_subtype(proposed_subtype) or infer_volatility_subtype_from_text(normalized)
+    guarded = proposed
+    guard_reason = "planner_subtype"
+
+    if any(token in normalized for token in PREVIEW_NON_MONOTONIC_HINTS):
+        guarded = "preview_non_monotonic"
+        guard_reason = "preview_non_monotonic_text_guard"
+    elif any(token in normalized for token in LOCAL_BURST_HINTS):
+        if guarded not in {"preview_non_monotonic", "envelope_monotonic"}:
+            guarded = "local_burst"
+            guard_reason = "local_burst_text_guard"
+    elif any(token in normalized for token in MONOTONIC_UP_HINTS) or any(token in normalized for token in MONOTONIC_DOWN_HINTS):
+        if guarded != "preview_non_monotonic":
+            guarded = "envelope_monotonic"
+            guard_reason = "monotonic_envelope_text_guard"
+    elif any(token in normalized for token in GLOBAL_SCALE_HINTS):
+        if guarded != "preview_non_monotonic":
+            guarded = "global_scale"
+            guard_reason = "global_scale_text_guard"
+    elif _is_short_region(region, ts_length):
+        if guarded not in {"preview_non_monotonic", "envelope_monotonic"}:
+            guarded = "local_burst"
+            guard_reason = "short_region_burst_guard"
+    elif _is_long_region(region, ts_length) and any(token in normalized for token in ("逐渐", "持续", "越来越", "慢慢")):
+        if guarded != "preview_non_monotonic":
+            guarded = "envelope_monotonic"
+            guard_reason = "long_region_monotonic_guard"
+
+    final_subtype = guarded
+    is_preview = final_subtype == "preview_non_monotonic"
+    routed_subtype = "global_scale" if is_preview else final_subtype
+    tool_name = {
+        "global_scale": "volatility_global_scale",
+        "local_burst": "volatility_local_burst",
+        "envelope_monotonic": "volatility_envelope_monotonic",
+    }[routed_subtype]
+    canonical_tool = tool_name
+    return {
+        "proposed_subtype": proposed,
+        "guarded_subtype": guarded,
+        "final_subtype": final_subtype,
+        "guard_reason": guard_reason,
+        "is_preview": is_preview,
+        "tool_name": tool_name,
+        "canonical_tool": canonical_tool,
+        "parameters": _default_params_for_subtype(routed_subtype, normalized),
+    }
+
+
+def infer_volatility_subtool_from_text(text: str) -> Dict[str, Any]:
+    routed = resolve_volatility_subtype_route(text=text)
+    return {
+        "tool_name": routed["tool_name"],
+        "canonical_tool": routed["canonical_tool"],
+        "parameters": routed["parameters"],
+        "volatility_subtype": routed["final_subtype"],
+        "volatility_routing": {
+            "proposed_subtype": routed["proposed_subtype"],
+            "guarded_subtype": routed["guarded_subtype"],
+            "final_subtype": routed["final_subtype"],
+            "guard_reason": routed["guard_reason"],
+            "is_preview": routed["is_preview"],
         },
     }
 

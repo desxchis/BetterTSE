@@ -320,7 +320,7 @@ Current interpretation:
 - the canonical layer remains positive after integration
 - there is no sign that routing the volatility family through split tools damaged the non-volatility tool families in this small formal rerun
 
-Volatility routing diagnosis:
+Initial volatility routing diagnosis:
 
 - `total_volatility_cases`: `6`
 - `preview_case_count`: `3`
@@ -337,6 +337,74 @@ Current conclusion:
 
 - the volatility split itself is now integrated and does not break the pure-editing mainline
 - the new primary bottleneck is no longer operator adequacy; it is route correctness from prompt semantics into the split volatility sub-tools
+
+## Volatility Subtype Schema And Route Closure
+
+Reference artifacts:
+
+- `tmp/how_much/pure_editing/volroute24_seed37/pure_editing_volatility_route_closure_ETTh1_24.json`
+- `tmp/how_much/pure_editing/volroute24_seed37_route_closure_text_v2.json`
+- `tmp/how_much/pure_editing/volroute24_seed37_route_closure_llm4.json`
+- `tmp/pipeline_full_mainline20_volroutefix.json`
+- `tmp/pipeline_direct_mainline20_volroutefix.json`
+- `tmp/pipeline_full_mainline20_volroutefix_routing.json`
+
+What changed:
+
+- `volatility_subtype` is now an explicit planner schema field
+- routing is recorded as `proposed_subtype -> guarded_subtype -> final_subtype`
+- supported subtype set is:
+  - `global_scale`
+  - `local_burst`
+  - `envelope_monotonic`
+- `preview_non_monotonic` remains outside the supported route and maps to the preview-side generic path
+
+Stable route-only closure result on the subtype-aware benchmark:
+
+- benchmark:
+  - `uniform_variance`, `local_burst`, `monotonic_envelope`, `non_monotonic_envelope`
+  - each collected with quota `6`
+- `text_guard_only` closure:
+  - `supported_route_accuracy = 1.00`
+  - `preview_not_misrouted_rate = 1.00`
+- `planner_llm` smoke:
+  - `max_samples = 4`
+  - `supported_route_accuracy = 1.00`
+  - `preview_not_misrouted_rate = 1.00`
+
+Important boundary:
+
+- the subtype-aware route closure benchmark is now the authoritative routing benchmark
+- legacy event-driven mainline prompts still often describe volatility only as generic `持续异常 / 杂乱跳变 / 无规律波动`
+- those prompts are often too coarse to fully determine subtype semantics
+
+Post-route-fix formal rerun:
+
+- `full_bettertse`
+  - target MAE `1.1026`
+  - target MSE `21.2810`
+  - t-IoU `0.2993`
+  - preservation MAE `0.5854`
+- `direct_edit`
+  - `1.5485 / 30.8101 / 0.1593 / 0.8214`
+
+Updated volatility routing diagnosis on the rerun:
+
+- `total_volatility_cases`: `6`
+- `preview_case_count`: `3`
+- `fallback_or_unsupported_count`: `0`
+- `overall_route_correct_rate`: `0.67`
+- `overall_subtype_correct_rate`: `0.33`
+- subpattern reading:
+  - `local_burst`: `2/2` routed correctly
+  - `uniform_variance`: `0/1` because planner still proposed `local_burst`
+  - `non_monotonic_envelope`: `0/3` because legacy generic prompts still under-specify preview semantics
+
+Current interpretation:
+
+- the route closure itself is solved on the correct subtype-aware benchmark
+- the remaining mainline volatility routing errors come from coarse prompt semantics, not from subtool inadequacy
+- this means the current bottleneck has shifted from `route correctness` in the closure sense to `upstream subtype expressivity` in legacy generic prompts
 
 ## Go / No-Go
 
@@ -355,24 +423,11 @@ No-Go:
 
 ## Recommended next step
 
-The next step is:
+The next step is no longer operator redesign or student work.
 
-1. scale the pure-editing teacher benchmark beyond smoke size
-2. keep the comparison set fixed to `heuristic vs teacher`
-3. use the resulting tool-level gaps to decide whether student learning should stay tool-conditioned
-4. for `volatility_increase`, run tool-side ablations before any student work:
-   - broader search space
-   - burst-local noise operator
-   - simple envelope-based noise operator
+It is:
 
-Current volatility gate:
-
-- target:
-  - best operator teacher better rate `>= 0.75`
-  - `local_std_error` clearly below heuristic
-  - `preservation_mae` not materially worse than heuristic
-- current status:
-  - best MAE operator is still `envelope_noise`
-  - strongest structure-matching operator is `piecewise_envelope_noise`
-  - neither crosses the gate
-  - therefore volatility remains in tool-audit mode
+1. keep the validated volatility split and subtype router fixed
+2. treat the subtype-aware closure benchmark as the routing authority
+3. if needed, enrich legacy generic volatility prompts or benchmark labels so that mainline prompts carry subtype semantics more explicitly
+4. only after that, reconsider pure-editing student work

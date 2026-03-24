@@ -34,7 +34,10 @@ except ImportError:  # pragma: no cover - optional dependency
 
     class BaseChatModel:  # type: ignore[override]
         pass
-from modules.pure_editing_volatility import infer_volatility_subtool_from_text
+from modules.pure_editing_volatility import (
+    infer_volatility_subtype_from_text,
+    resolve_volatility_subtype_route,
+)
 from modules.region_localizer import infer_shape_hint, localize_region
 from tool.ts_editors import normalize_llm_plan
 
@@ -53,13 +56,54 @@ def _infer_direction_hint(text: str) -> str:
     return ""
 
 
-def _apply_explicit_prompt_hints(plan: Dict[str, Any], instruction_text: str) -> Dict[str, Any]:
+def _apply_volatility_route(plan: Dict[str, Any], instruction_text: str, ts_length: int | None = None) -> Dict[str, Any]:
+    normalized = normalize_llm_plan(plan, ts_length=ts_length)
+    intent = normalized.setdefault("intent", {})
+    execution = normalized.setdefault("execution", {})
+    parameters = normalized.setdefault("parameters", {})
+    localization = normalized.setdefault("localization", {})
+
+    shape = str(intent.get("shape") or infer_shape_hint(instruction_text) or "")
+    effect_family = str(intent.get("effect_family", ""))
+    if shape != "irregular_noise" and effect_family != "volatility":
+        return normalized
+
+    region = parameters.get("region")
+    if not isinstance(region, list):
+        region = localization.get("region")
+    routed = resolve_volatility_subtype_route(
+        text=instruction_text,
+        proposed_subtype=normalized.get("volatility_subtype") or intent.get("volatility_subtype"),
+        region=region if isinstance(region, list) else None,
+        ts_length=ts_length,
+    )
+    normalized["volatility_subtype"] = routed["final_subtype"]
+    intent["volatility_subtype"] = routed["proposed_subtype"]
+    normalized["volatility_routing"] = {
+        "proposed_subtype": routed["proposed_subtype"],
+        "guarded_subtype": routed["guarded_subtype"],
+        "final_subtype": routed["final_subtype"],
+        "guard_reason": routed["guard_reason"],
+        "is_preview": routed["is_preview"],
+    }
+    execution["canonical_tool"] = routed["canonical_tool"]
+    execution["tool_name"] = routed["tool_name"]
+    execution["volatility_subtype"] = routed["final_subtype"]
+    execution.setdefault("parameters", {})
+    execution["parameters"].update(routed["parameters"])
+    parameters.update(routed["parameters"])
+    normalized["canonical_tool"] = routed["canonical_tool"]
+    normalized["tool_name"] = routed["tool_name"]
+    return normalize_llm_plan(normalized, ts_length=ts_length)
+
+
+def _apply_explicit_prompt_hints(plan: Dict[str, Any], instruction_text: str, ts_length: int | None = None) -> Dict[str, Any]:
     """Override obviously wrong intent/tool fields using explicit lexical cues.
 
     This is intentionally narrow: only strong, high-precision text hints should
     be allowed to overrule the LLM plan.
     """
-    normalized = normalize_llm_plan(plan)
+    normalized = normalize_llm_plan(plan, ts_length=ts_length)
     intent = normalized.setdefault("intent", {})
     execution = normalized.setdefault("execution", {})
     params = normalized.setdefault("parameters", {})
@@ -85,10 +129,11 @@ def _apply_explicit_prompt_hints(plan: Dict[str, Any], instruction_text: str) ->
         elif shape_hint == "irregular_noise":
             intent["effect_family"] = "volatility"
             intent["direction"] = "neutral"
-            routed = infer_volatility_subtool_from_text(instruction_text)
-            execution["canonical_tool"] = routed["canonical_tool"]
-            execution["tool_name"] = routed["tool_name"]
-            execution.setdefault("parameters", {}).update(routed.get("parameters", {}))
+            proposed_subtype = normalized.get("volatility_subtype") or intent.get("volatility_subtype")
+            if not proposed_subtype:
+                proposed_subtype = infer_volatility_subtype_from_text(instruction_text)
+            normalized["volatility_subtype"] = proposed_subtype
+            intent["volatility_subtype"] = proposed_subtype
         elif shape_hint == "hump":
             intent["effect_family"] = "impulse"
             execution["canonical_tool"] = "impulse_spike"
@@ -112,7 +157,8 @@ def _apply_explicit_prompt_hints(plan: Dict[str, Any], instruction_text: str) ->
     normalized["tool_name"] = execution.get("tool_name", normalized.get("tool_name"))
     normalized["canonical_tool"] = execution.get("canonical_tool", normalized.get("canonical_tool"))
     execution.setdefault("parameters", params)
-    return normalize_llm_plan(normalized)
+    normalized = normalize_llm_plan(normalized, ts_length=ts_length)
+    return _apply_volatility_route(normalized, instruction_text, ts_length=ts_length)
 
 
 # Define a customized LLM client implementing the invoke method
@@ -390,7 +436,7 @@ def get_event_driven_plan(
         try:
             plan = json.loads(json_match.group())
             normalized = normalize_llm_plan(plan, ts_length=ts_length)
-            normalized = _apply_explicit_prompt_hints(normalized, instruction_text)
+            normalized = _apply_explicit_prompt_hints(normalized, instruction_text, ts_length=ts_length)
             refined_localization = localize_region(
                 prompt_text=instruction_text,
                 ts_length=ts_length,
@@ -400,6 +446,7 @@ def get_event_driven_plan(
             normalized.setdefault("parameters", {})["region"] = refined_localization["region"]
             normalized.setdefault("execution", {}).setdefault("parameters", {})
             normalized["execution"]["parameters"]["region"] = refined_localization["region"]
+            normalized = _apply_volatility_route(normalized, instruction_text, ts_length=ts_length)
             return normalize_llm_plan(normalized, ts_length=ts_length)
         except json.JSONDecodeError as e:
             raise ValueError(f"Failed to parse LLM response as JSON: {e}\nResponse: {content}")

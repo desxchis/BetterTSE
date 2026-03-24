@@ -21,8 +21,10 @@ Current runnable entrypoints:
 - `test_scripts/run_pure_editing_teacher_search.py --testset <event_driven_json> --output <teacher_json>`
 - `test_scripts/build_pure_editing_how_much_stress_benchmark.py --csv-path <csv> --output-dir <stress_dir>`
 - `test_scripts/build_pure_editing_volatility_closure_benchmark.py --csv-path <csv> --output-dir <closure_dir>`
+- `test_scripts/build_pure_editing_volatility_route_closure_benchmark.py --csv-path <csv> --output-dir <route_closure_dir>`
 - `test_scripts/run_pure_editing_volatility_audit.py --testset <volatility_json> --output <audit_json>`
 - `test_scripts/run_pure_editing_volatility_split_validation.py --testset <volatility_json> --output <split_json>`
+- `test_scripts/run_pure_editing_volatility_route_closure.py --testset <volatility_json> --output <route_json> --routing-source planner_llm|text_guard_only`
 - `test_scripts/analyze_pure_editing_volatility_routing.py --testset <event_json> --result <pipeline_json> --output <routing_json>`
 
 It does not start:
@@ -73,6 +75,8 @@ Current scope notes:
 - Pure-editing now also has an audit-only validator for minimal volatility canonical split hypotheses; it was used to decide the current registry split.
 - Pure-editing now also has a volatility closure benchmark builder for split stability retests.
 - The validated volatility split tools are now connected back to the pure-editing routing and execution path, while `non_monotonic_envelope` remains outside the main route.
+- Pure-editing now also has a subtype-aware volatility route-closure benchmark and a route-only closure runner with `planner_llm` and `text_guard_only` modes.
+- The volatility planner schema now includes an explicit `volatility_subtype` field and records `proposed_subtype / guarded_subtype / final_subtype` through the route path.
 - A post-integration routing analyzer is now available to diagnose whether volatility samples are being sent to the correct split sub-tool.
 - Controlled synthetic forecast-revision builders are ready after backbone artifacts exist.
 - Time-MMD projected revision is now exposed as a runnable benchmark path.
