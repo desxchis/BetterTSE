@@ -8,6 +8,7 @@ from typing import Any, Dict, List
 
 import numpy as np
 
+from modules.experiment_logging import build_revision_record
 from modules.experiment_visualization import (
     build_visualization_dir,
     build_visualization_path,
@@ -22,6 +23,7 @@ from modules.forecast_revision import (
     evaluate_revision_sample,
     extract_gt_edit_spec,
     heuristic_revision_plan,
+    normalize_position_bucket,
     predict_edit_spec,
     project_edit_spec_to_params,
 )
@@ -64,7 +66,7 @@ def _oracle_plan(sample: Dict[str, Any], region: List[int]) -> Dict[str, Any]:
             "strength": sample["strength_bucket_gt"],
         },
         "localization": {
-            "position_bucket": sample["revision_operator_params"].get("bucket", "mid_horizon"),
+            "position_bucket": normalize_position_bucket(sample["revision_operator_params"].get("bucket", "mid")),
             "region": region,
         },
         "tool_name": "oracle",
@@ -92,6 +94,95 @@ def _apply_tool_family_override(intent: Dict[str, Any], tool_name: str) -> Dict[
         overridden["shape"] = "plateau"
         overridden["direction"] = "down"
     return overridden
+
+
+def _strength_scale(strength: str) -> float:
+    return {
+        "none": 0.0,
+        "weak": 0.7,
+        "medium": 1.0,
+        "strong": 1.35,
+    }.get(str(strength or "medium"), 1.0)
+
+
+def _default_no_parameter_edit_spec(intent: Dict[str, Any]) -> Dict[str, Any]:
+    shape = str(intent.get("shape", "none"))
+    if shape in {"none", ""}:
+        return _zero_edit_spec(strategy="wo_parameter_calibration")
+    spec = _zero_edit_spec(strategy="wo_parameter_calibration")
+    spec["duration_ratio"] = 1.0
+    if shape == "flatline":
+        spec.update({"delta_level_z": -1.0, "floor_ratio": 1.0, "recovery_ratio": 0.0})
+    elif shape == "irregular_noise":
+        spec.update({"vol_ratio": 1.5, "amp_ratio": 1.0, "recovery_ratio": 0.0})
+    elif shape == "hump":
+        spec.update({"delta_level_z": 0.9, "amp_ratio": 1.1, "slope_ratio": 1.1, "recovery_ratio": 0.7})
+    elif shape == "plateau":
+        spec.update({"delta_level_z": 1.0, "amp_ratio": 1.0, "slope_ratio": 1.0, "recovery_ratio": 0.35})
+    else:
+        spec.update({"delta_level_z": 1.0, "amp_ratio": 1.0, "slope_ratio": 1.0, "recovery_ratio": 0.0})
+    return spec
+
+
+def _predict_heuristic_params(
+    *,
+    intent: Dict[str, Any],
+    region: List[int],
+    history_ts: np.ndarray,
+    base_forecast: np.ndarray,
+) -> tuple[Dict[str, Any], Dict[str, Any]]:
+    edit_spec = predict_edit_spec(
+        intent=intent,
+        region=region,
+        history_ts=history_ts,
+        base_forecast=base_forecast,
+        context_text="",
+        strategy="discrete_strength_table",
+    )
+    params = project_edit_spec_to_params(
+        edit_spec=edit_spec,
+        intent=intent,
+        region=region,
+        history_ts=history_ts,
+        base_forecast=base_forecast,
+    )
+    return edit_spec, params
+
+
+def _apply_direct_delta_regression(
+    *,
+    base_forecast: np.ndarray,
+    region: List[int],
+    intent: Dict[str, Any],
+    seed: int = 7,
+) -> tuple[np.ndarray, Dict[str, Any], Dict[str, Any]]:
+    shape = str(intent.get("shape", "none"))
+    if shape in {"none", ""}:
+        return np.asarray(base_forecast, dtype=np.float64).copy(), _zero_edit_spec(strategy="direct_delta_regression"), {}
+
+    base = np.asarray(base_forecast, dtype=np.float64).flatten()
+    start = max(0, min(int(region[0]), len(base)))
+    end = max(start, min(int(region[1]), len(base)))
+    region_len = max(1, end - start)
+    local = base[start:end] if end > start else base
+    local_scale = max(float(np.std(local)) if local.size else 0.0, float(np.std(base)) if base.size else 0.0, 1e-3)
+    amplitude = local_scale * _strength_scale(str(intent.get("strength", "medium")))
+    params = {
+        "amplitude": amplitude,
+        "duration": region_len,
+        "recovery_rate": 0.35 if shape in {"hump", "plateau"} else 0.0,
+        "volatility_scale": 1.4,
+        "floor_value": float(np.min(local) - local_scale) if local.size else float(np.min(base) - local_scale),
+    }
+    edited, _ = apply_revision_profile(base, intent, region, params, seed=seed)
+    spec = _zero_edit_spec(strategy="direct_delta_regression")
+    spec["delta_level_z"] = float(amplitude / local_scale) if local_scale > 1e-8 else 0.0
+    spec["duration_ratio"] = 1.0
+    if shape == "irregular_noise":
+        spec["vol_ratio"] = params["volatility_scale"]
+    else:
+        spec["amp_ratio"] = 1.0
+    return edited, spec, params
 
 
 def _predict_params(
@@ -236,6 +327,11 @@ def run_revision(
 
     results: List[Dict[str, Any]] = []
     for sample in samples:
+        sample = {
+            **sample,
+            "baseline_name": payload.get("baseline_name"),
+            "target_regime": payload.get("target_regime"),
+        }
         history_ts = np.asarray(sample["history_ts"], dtype=np.float64)
         future_gt = np.asarray(sample["future_gt"], dtype=np.float64)
         base_forecast = np.asarray(sample["base_forecast"], dtype=np.float64)
@@ -251,6 +347,80 @@ def run_revision(
             params: Dict[str, Any] = {}
             pred_region = [0, 0]
             execution_metadata: Dict[str, Any] = {"executor": revision_executor, "tool_name": "none"}
+        elif mode == "heuristic_revision":
+            plan = heuristic_revision_plan(sample["context_text"], sample["forecast_horizon"])
+            pred_region = plan["localization"]["region"]
+            if plan["revision_needed"]:
+                edit_spec, params = _predict_heuristic_params(
+                    intent=plan["intent"],
+                    region=pred_region,
+                    history_ts=history_ts,
+                    base_forecast=base_forecast,
+                )
+                edited, execution_metadata = _apply_with_executor(
+                    revision_executor=revision_executor,
+                    history_ts=history_ts,
+                    base_forecast=base_forecast,
+                    intent=plan["intent"],
+                    region=pred_region,
+                    params=params,
+                    tool_name=plan.get("tool_name"),
+                    tedit_model_path=tedit_model_path,
+                    tedit_config_path=tedit_config_path,
+                    tedit_device=tedit_device,
+                    sample_metadata=sample,
+                )
+            else:
+                edited = base_forecast.copy()
+                edit_spec = _zero_edit_spec(strategy="heuristic_revision")
+                params = {}
+                execution_metadata = {"executor": revision_executor, "tool_name": "none"}
+        elif mode == "direct_delta_regression":
+            plan = heuristic_revision_plan(sample["context_text"], sample["forecast_horizon"])
+            pred_region = plan["localization"]["region"]
+            if plan["revision_needed"]:
+                edited, edit_spec, params = _apply_direct_delta_regression(
+                    base_forecast=base_forecast,
+                    region=pred_region,
+                    intent=plan["intent"],
+                    seed=int(sample.get("sample_id", "0") or 0) if str(sample.get("sample_id", "")).isdigit() else 7,
+                )
+                execution_metadata = {"executor": "direct_delta_regression", "tool_name": plan.get("tool_name")}
+            else:
+                edited = base_forecast.copy()
+                edit_spec = _zero_edit_spec(strategy="direct_delta_regression")
+                params = {}
+                execution_metadata = {"executor": "direct_delta_regression", "tool_name": "none"}
+        elif mode == "wo_parameter_calibration":
+            plan = heuristic_revision_plan(sample["context_text"], sample["forecast_horizon"])
+            pred_region = plan["localization"]["region"]
+            if plan["revision_needed"]:
+                edit_spec = _default_no_parameter_edit_spec(plan["intent"])
+                params = project_edit_spec_to_params(
+                    edit_spec=edit_spec,
+                    intent=plan["intent"],
+                    region=pred_region,
+                    history_ts=history_ts,
+                    base_forecast=base_forecast,
+                )
+                edited, execution_metadata = _apply_with_executor(
+                    revision_executor=revision_executor,
+                    history_ts=history_ts,
+                    base_forecast=base_forecast,
+                    intent=plan["intent"],
+                    region=pred_region,
+                    params=params,
+                    tool_name=plan.get("tool_name"),
+                    tedit_model_path=tedit_model_path,
+                    tedit_config_path=tedit_config_path,
+                    tedit_device=tedit_device,
+                    sample_metadata=sample,
+                )
+            else:
+                edited = base_forecast.copy()
+                edit_spec = _zero_edit_spec(strategy="wo_parameter_calibration")
+                params = {}
+                execution_metadata = {"executor": revision_executor, "tool_name": "none"}
         elif mode == "oracle_region":
             plan = heuristic_revision_plan(sample["context_text"], sample["forecast_horizon"])
             pred_region = gt_region
@@ -512,17 +682,34 @@ def run_revision(
                 context_text=sample["context_text"],
                 metrics=metrics,
                 save_path=save_path,
+                display_text=((sample.get("revision_operator_params") or {}).get("raw_text") or {}).get("pred"),
             )
             result["visualization_path"] = str(save_path)
+        result["experiment_record"] = build_revision_record(
+            sample=sample,
+            mode=mode,
+            plan=plan,
+            pred_region=pred_region,
+            metrics=metrics,
+            calibration=params,
+            calibration_metrics=calibration_metrics,
+            intent_alignment=intent_alignment,
+            visualization_path=result.get("visualization_path"),
+            calibration_strategy=calibration_strategy,
+            revision_executor=revision_executor,
+        )
         results.append(result)
 
     summary = _summarize_results(results)
     output_payload = {
         "summary": summary,
+        "per_domain_summary": _summarize_domain_results(results),
+        "normalized_summary": _summarize_normalized_results(results),
         "run_timestamp_utc": datetime.now(timezone.utc).isoformat(),
         "visualization_dir": str(vis_dir_obj) if vis_dir_obj is not None else None,
         "calibration_strategy": calibration_strategy,
         "revision_executor": revision_executor,
+        "mode": mode,
         "results": results,
     }
     output_file = Path(output_path)
@@ -601,6 +788,77 @@ def _summarize_results(results: List[Dict[str, Any]]) -> Dict[str, Any]:
     return summary
 
 
+def _extract_domain_name(dataset_name: str) -> str:
+    parts = str(dataset_name or "").split("_")
+    if len(parts) >= 2:
+        return parts[1]
+    return str(dataset_name or "unknown")
+
+
+def _summarize_domain_results(results: List[Dict[str, Any]]) -> Dict[str, Any]:
+    grouped: Dict[str, List[Dict[str, Any]]] = {}
+    for result in results:
+        domain = _extract_domain_name(result.get("dataset_name", "unknown"))
+        grouped.setdefault(domain, []).append(result)
+    return {domain: _summarize_results(items) for domain, items in sorted(grouped.items())}
+
+
+def _safe_ratio(num: float, den: float, fallback: float = 0.0) -> float:
+    if abs(float(den)) < 1e-8:
+        return float(fallback)
+    return float(num / den)
+
+
+def _summarize_normalized_results(results: List[Dict[str, Any]]) -> Dict[str, Any]:
+    if not results:
+        return {"total": 0}
+
+    target_improvement = []
+    future_improvement = []
+    target_error_ratio = []
+    future_error_ratio = []
+    applicable_target_improvement = []
+    applicable_future_improvement = []
+    applicable_target_error_ratio = []
+    applicable_future_error_ratio = []
+
+    for result in results:
+        metrics = result.get("metrics", {})
+        base_target = float(metrics.get("base_mae_vs_revision_target", 0.0))
+        edit_target = float(metrics.get("edited_mae_vs_revision_target", 0.0))
+        base_future = float(metrics.get("base_mae_vs_future_gt", 0.0))
+        edit_future = float(metrics.get("edited_mae_vs_future_gt", 0.0))
+
+        target_impr = _safe_ratio(base_target - edit_target, base_target, fallback=0.0)
+        future_impr = _safe_ratio(base_future - edit_future, base_future, fallback=0.0)
+        target_ratio = _safe_ratio(edit_target, base_target, fallback=1.0)
+        future_ratio = _safe_ratio(edit_future, base_future, fallback=1.0)
+
+        target_improvement.append(target_impr)
+        future_improvement.append(future_impr)
+        target_error_ratio.append(target_ratio)
+        future_error_ratio.append(future_ratio)
+
+        if bool(result.get("revision_applicable_gt", False)):
+            applicable_target_improvement.append(target_impr)
+            applicable_future_improvement.append(future_impr)
+            applicable_target_error_ratio.append(target_ratio)
+            applicable_future_error_ratio.append(future_ratio)
+
+    return {
+        "total": len(results),
+        "avg_target_improvement_ratio": float(np.mean(target_improvement)) if target_improvement else None,
+        "avg_future_improvement_ratio": float(np.mean(future_improvement)) if future_improvement else None,
+        "avg_target_error_ratio": float(np.mean(target_error_ratio)) if target_error_ratio else None,
+        "avg_future_error_ratio": float(np.mean(future_error_ratio)) if future_error_ratio else None,
+        "applicable_count": len(applicable_target_improvement),
+        "applicable_avg_target_improvement_ratio": float(np.mean(applicable_target_improvement)) if applicable_target_improvement else None,
+        "applicable_avg_future_improvement_ratio": float(np.mean(applicable_future_improvement)) if applicable_future_improvement else None,
+        "applicable_avg_target_error_ratio": float(np.mean(applicable_target_error_ratio)) if applicable_target_error_ratio else None,
+        "applicable_avg_future_error_ratio": float(np.mean(applicable_future_error_ratio)) if applicable_future_error_ratio else None,
+    }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run CPU-safe forecast revision experiments.")
     parser.add_argument("--benchmark", required=True)
@@ -610,6 +868,9 @@ def main() -> None:
         default="localized_full_revision",
         choices=[
             "base_only",
+            "heuristic_revision",
+            "direct_delta_regression",
+            "wo_parameter_calibration",
             "global_revision_only",
             "localized_full_revision",
             "oracle_region",
@@ -624,7 +885,19 @@ def main() -> None:
     parser.add_argument(
         "--calibration-strategy",
         default="rule_local_stats",
-        choices=["text_direct_numeric", "discrete_strength_table", "rule_local_stats", "learned_linear", "learned_rule_guarded", "learned_rule_shrunk", "learned_confidence_gated", "learned_reliability_gated"],
+        choices=[
+            "text_direct_numeric",
+            "discrete_strength_table",
+            "rule_local_stats",
+            "teacher_search_oracle",
+            "learned_linear",
+            "teacher_distilled_linear",
+            "learned_rule_guarded",
+            "learned_rule_shrunk",
+            "teacher_distilled_shrunk",
+            "learned_confidence_gated",
+            "learned_reliability_gated",
+        ],
     )
     parser.add_argument("--calibration-model", default=None)
     parser.add_argument("--revision-executor", default="profile", choices=["profile", "tedit_hybrid"])

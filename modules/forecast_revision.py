@@ -19,6 +19,48 @@ CALIBRATION_SPEC_KEYS = (
     "floor_ratio",
 )
 
+TEACHER_SEARCH_SEED_STRATEGIES = (
+    "rule_local_stats",
+    "discrete_strength_table",
+    "text_direct_numeric",
+)
+
+POSITION_BUCKET_VALUES = ("early", "mid", "late", "full", "none")
+POSITION_BUCKET_ALIASES = {
+    "early": "early",
+    "mid": "mid",
+    "middle": "mid",
+    "late": "late",
+    "full": "full",
+    "none": "none",
+    "early_horizon": "early",
+    "mid_horizon": "mid",
+    "middle_horizon": "mid",
+    "late_horizon": "late",
+    "full_horizon": "full",
+}
+
+REVISION_SAMPLE_SOURCE_OF_TRUTH_FIELDS = (
+    "history_ts",
+    "future_gt",
+    "base_forecast",
+    "revision_target",
+    "edit_mask_gt",
+    "edit_intent_gt",
+    "revision_applicable_gt",
+    "revision_operator_params",
+)
+
+REVISION_SAMPLE_DERIVED_CACHE_FIELDS = (
+    "effect_family_gt",
+    "direction_gt",
+    "shape_gt",
+    "strength_bucket_gt",
+    "duration_bucket_gt",
+    "revision_operator_family",
+    "edit_spec_gt",
+)
+
 
 @dataclass
 class ForecastRevisionSample:
@@ -50,6 +92,10 @@ class ForecastRevisionSample:
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
+
+
+def normalize_position_bucket(bucket: str, fallback: str = "mid") -> str:
+    return POSITION_BUCKET_ALIASES.get(str(bucket or "").strip().lower(), fallback)
 
 
 def summarize_stats(values: np.ndarray) -> Dict[str, float]:
@@ -120,6 +166,34 @@ def _zero_edit_spec(strategy: str = "none") -> Dict[str, Any]:
     return spec
 
 
+def _sanitize_edit_spec(intent: Dict[str, Any], spec: Dict[str, Any], strategy: str) -> Dict[str, Any]:
+    shape = str(intent.get("shape", "none"))
+    clean = {key: float(spec.get(key, 0.0)) for key in CALIBRATION_SPEC_KEYS}
+    clean["delta_level_z"] = _clamp(clean["delta_level_z"], -4.0, 4.0)
+    clean["slope_ratio"] = _clamp(clean["slope_ratio"], 0.0, 4.0)
+    clean["amp_ratio"] = _clamp(clean["amp_ratio"], 0.0, 4.0)
+    clean["vol_ratio"] = _clamp(clean["vol_ratio"], 0.0, 4.0)
+    clean["duration_ratio"] = _clamp(clean["duration_ratio"], 0.0, 1.0)
+    clean["recovery_ratio"] = _clamp(clean["recovery_ratio"], 0.0, 1.0)
+    clean["floor_ratio"] = _clamp(clean["floor_ratio"], 0.0, 4.0)
+
+    if shape in {"step", "plateau", "hump"}:
+        clean["vol_ratio"] = 0.0
+        clean["floor_ratio"] = 0.0
+    elif shape == "flatline":
+        clean["slope_ratio"] = 0.0
+        clean["vol_ratio"] = 0.0
+        clean["amp_ratio"] = 0.0
+        clean["delta_level_z"] = _clamp(clean["delta_level_z"], -4.0, 0.0)
+    elif shape == "irregular_noise":
+        clean["delta_level_z"] = 0.0
+        clean["amp_ratio"] = 1.0
+        clean["recovery_ratio"] = 0.0
+        clean["floor_ratio"] = 0.0
+    clean["strategy"] = strategy
+    return clean
+
+
 def _duration_ratio_from_bucket(bucket: str) -> float:
     return {
         "none": 0.0,
@@ -127,6 +201,7 @@ def _duration_ratio_from_bucket(bucket: str) -> float:
         "medium": 0.8,
         "long": 1.0,
         "full_horizon": 1.0,
+        "full": 1.0,
     }.get(bucket, 0.8)
 
 
@@ -432,22 +507,165 @@ def _reliability_gated_learned_spec(
     return kept
 
 
+def _teacher_candidate_scales(shape: str) -> List[Dict[str, float]]:
+    if shape == "irregular_noise":
+        return [
+            {"duration_ratio": ds, "vol_ratio": vs}
+            for ds in (0.8, 1.0, 1.2)
+            for vs in (0.8, 1.0, 1.25, 1.5)
+        ]
+    if shape == "flatline":
+        return [
+            {"delta_level_z": ds, "duration_ratio": dur, "floor_ratio": fs}
+            for ds in (0.8, 1.0, 1.2, 1.4)
+            for dur in (0.8, 1.0, 1.2)
+            for fs in (0.8, 1.0, 1.25)
+        ]
+    if shape == "hump":
+        return [
+            {"delta_level_z": ds, "duration_ratio": dur, "amp_ratio": amp, "recovery_ratio": rec}
+            for ds in (0.75, 1.0, 1.2, 1.4)
+            for dur in (0.8, 1.0, 1.2)
+            for amp in (0.85, 1.0, 1.15)
+            for rec in (0.8, 1.0, 1.2)
+        ]
+    if shape == "step":
+        return [
+            {"delta_level_z": ds, "duration_ratio": dur, "amp_ratio": amp, "recovery_ratio": rec}
+            for ds in (0.75, 1.0, 1.2, 1.4)
+            for dur in (0.8, 1.0, 1.2)
+            for amp in (0.9, 1.0, 1.1)
+            for rec in (0.0, 0.35, 0.6)
+        ]
+    return [
+        {"delta_level_z": ds, "duration_ratio": dur, "amp_ratio": amp, "recovery_ratio": rec}
+        for ds in (0.75, 1.0, 1.2, 1.4)
+        for dur in (0.8, 1.0, 1.2)
+        for amp in (0.9, 1.0, 1.15)
+        for rec in (0.8, 1.0, 1.2)
+    ]
+
+
+def _apply_teacher_candidate(base_spec: Dict[str, Any], scales: Dict[str, float]) -> Dict[str, Any]:
+    candidate = {key: float(base_spec.get(key, 0.0)) for key in CALIBRATION_SPEC_KEYS}
+    for key, scale in scales.items():
+        if key == "duration_ratio" or key == "recovery_ratio":
+            candidate[key] = float(candidate.get(key, 0.0)) * float(scale)
+        else:
+            candidate[key] = float(candidate.get(key, 0.0)) * float(scale)
+    return candidate
+
+
+def search_teacher_edit_spec(
+    *,
+    intent: Dict[str, Any],
+    region: List[int],
+    history_ts: np.ndarray,
+    base_forecast: np.ndarray,
+    revision_target: np.ndarray,
+    future_gt: np.ndarray,
+    gt_mask: np.ndarray,
+    context_text: str = "",
+    seed_strategies: Tuple[str, ...] = TEACHER_SEARCH_SEED_STRATEGIES,
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    shape = str(intent.get("shape", "none"))
+    if shape in {"none", ""}:
+        return _zero_edit_spec(strategy="teacher_search"), {"candidate_count": 0, "best_objective": 0.0}
+
+    seeds: List[Tuple[str, Dict[str, Any]]] = []
+    for strategy in seed_strategies:
+        spec = predict_edit_spec(
+            intent=intent,
+            region=region,
+            history_ts=history_ts,
+            base_forecast=base_forecast,
+            context_text=context_text,
+            strategy=strategy,
+        )
+        seeds.append((strategy, spec))
+
+    best_spec: Dict[str, Any] | None = None
+    best_metrics: Dict[str, Any] | None = None
+    best_objective: float | None = None
+    candidate_count = 0
+
+    for seed_name, seed_spec in seeds:
+        sanitized_seed = _sanitize_edit_spec(intent, seed_spec, strategy=f"teacher_seed:{seed_name}")
+        for scales in _teacher_candidate_scales(shape):
+            candidate_count += 1
+            raw_candidate = _apply_teacher_candidate(sanitized_seed, scales)
+            candidate = _sanitize_edit_spec(intent, raw_candidate, strategy=f"teacher_search:{seed_name}")
+            params = project_edit_spec_to_params(
+                edit_spec=candidate,
+                intent=intent,
+                region=region,
+                history_ts=history_ts,
+                base_forecast=base_forecast,
+            )
+            edited, _ = apply_revision_profile(base_forecast, intent, region, params)
+            metrics = evaluate_revision_sample(
+                base_forecast=base_forecast,
+                edited_forecast=edited,
+                future_gt=future_gt,
+                revision_target=revision_target,
+                pred_region=region,
+                gt_mask=gt_mask,
+            )
+            objective = (
+                float(metrics["edited_mae_vs_revision_target"])
+                + 0.12 * max(0.0, 1.0 - float(metrics["outside_region_preservation"]))
+                + 0.08 * float(metrics["over_edit_rate"])
+                + 0.04 * float(metrics["edited_mae_vs_future_gt"])
+            )
+            if best_objective is None or objective < best_objective:
+                best_objective = objective
+                best_spec = candidate
+                best_metrics = {
+                    "seed_strategy": seed_name,
+                    "scales": dict(scales),
+                    "objective": float(objective),
+                    **metrics,
+                }
+
+    if best_spec is None or best_metrics is None or best_objective is None:
+        fallback = predict_edit_spec(
+            intent=intent,
+            region=region,
+            history_ts=history_ts,
+            base_forecast=base_forecast,
+            context_text=context_text,
+            strategy="rule_local_stats",
+        )
+        return _sanitize_edit_spec(intent, fallback, strategy="teacher_search:fallback_rule"), {
+            "candidate_count": candidate_count,
+            "best_objective": None,
+        }
+    best_spec["strategy"] = f"teacher_search:{best_metrics['seed_strategy']}"
+    return best_spec, {
+        "candidate_count": candidate_count,
+        "best_objective": float(best_objective),
+        "best_metrics": best_metrics,
+    }
+
+
 def infer_future_bucket(text: str) -> str:
     normalized = text or ""
     if any(token in normalized for token in ("整个预测窗口", "全窗口", "全时段", "full horizon", "full_horizon")):
-        return "full_horizon"
-    if any(token in normalized for token in ("前段", "开始阶段", "刚进入预测窗口", "最开始")):
-        return "early_horizon"
-    if any(token in normalized for token in ("中段", "中期", "一半左右")):
-        return "mid_horizon"
-    if any(token in normalized for token in ("后段", "临近结束", "末段", "快到窗口末尾")):
-        return "late_horizon"
-    return "mid_horizon"
+        return "full"
+    if any(token in normalized for token in ("前段", "开始阶段", "刚进入预测窗口", "最开始", "short term", "short-term", "next 1-3 months", "in the short term")):
+        return "early"
+    if any(token in normalized for token in ("中段", "中期", "一半左右", "mid term", "mid-term")):
+        return "mid"
+    if any(token in normalized for token in ("后段", "临近结束", "末段", "快到窗口末尾", "late term", "late-term")):
+        return "late"
+    return "mid"
 
 
 def heuristic_revision_plan(context_text: str, horizon: int) -> Dict[str, Any]:
     normalized = context_text or ""
+    prompt_section = normalized.split("\n\n")[-1].strip() if "\n\n" in normalized else normalized
     lowered = normalized.lower()
+    prompt_lowered = prompt_section.lower()
 
     structured_direction = None
     structured_shape = None
@@ -488,14 +706,14 @@ def heuristic_revision_plan(context_text: str, horizon: int) -> Dict[str, Any]:
         structured_strength = "strong"
     elif "strength=none" in lowered:
         structured_strength = "none"
-    if "bucket=full_horizon" in lowered:
-        structured_bucket = "full_horizon"
-    elif "bucket=early_horizon" in lowered:
-        structured_bucket = "early_horizon"
-    elif "bucket=mid_horizon" in lowered:
-        structured_bucket = "mid_horizon"
-    elif "bucket=late_horizon" in lowered:
-        structured_bucket = "late_horizon"
+    if "bucket=full_horizon" in lowered or "bucket=full" in lowered:
+        structured_bucket = "full"
+    elif "bucket=early_horizon" in lowered or "bucket=early" in lowered:
+        structured_bucket = "early"
+    elif "bucket=mid_horizon" in lowered or "bucket=middle" in lowered or "bucket=mid" in lowered:
+        structured_bucket = "mid"
+    elif "bucket=late_horizon" in lowered or "bucket=late" in lowered:
+        structured_bucket = "late"
     elif "bucket=none" in lowered:
         structured_bucket = "none"
 
@@ -532,7 +750,7 @@ def heuristic_revision_plan(context_text: str, horizon: int) -> Dict[str, Any]:
         else:
             effect_family = "level"
             tool_name = "hybrid_down" if structured_direction == "down" else "hybrid_up"
-        bucket = structured_bucket or infer_future_bucket(normalized)
+        bucket = normalize_position_bucket(structured_bucket or infer_future_bucket(normalized))
         duration_bucket = structured_duration or "medium"
         return {
             "revision_needed": True,
@@ -545,7 +763,7 @@ def heuristic_revision_plan(context_text: str, horizon: int) -> Dict[str, Any]:
                 "strength": structured_strength or "medium",
             },
             "localization": {
-                "position_bucket": bucket,
+                "position_bucket": normalize_position_bucket(bucket, fallback="mid"),
                 "region": localize_future_region(bucket, duration_bucket, horizon),
             },
             "tool_name": tool_name,
@@ -568,21 +786,93 @@ def heuristic_revision_plan(context_text: str, horizon: int) -> Dict[str, Any]:
             },
             "tool_name": "none",
         }
-    bucket = infer_future_bucket(normalized)
-    finance_down = any(token in lowered for token in ("bearish", "downgrade", "cut guidance", "crashing", "negative outlook"))
-    finance_up = any(token in lowered for token in ("bullish", "upgrade", "positive outlook", "beats estimates", "raising guidance"))
+    bucket = normalize_position_bucket(infer_future_bucket(prompt_section))
+    finance_down = any(token in prompt_lowered for token in ("bearish", "downgrade", "cut guidance", "negative outlook"))
+    finance_up = any(token in prompt_lowered for token in ("bullish", "upgrade", "positive outlook", "beats estimates", "raising guidance"))
+    if any(token in prompt_lowered for token in ("no meaningful change", "no major change", "remain unchanged", "little change expected")):
+        return {
+            "revision_needed": False,
+            "confidence": 0.82,
+            "intent": {
+                "effect_family": "none",
+                "direction": "neutral",
+                "shape": "none",
+                "duration": "none",
+                "strength": "none",
+            },
+            "localization": {"position_bucket": "none", "region": [0, 0]},
+            "tool_name": "none",
+        }
     if any(token in normalized for token in ("flatline", "停摆", "中断", "低位运行", "极低水平")):
         shape = "flatline"
         effect_family = "shutdown"
         direction = "down"
         tool_name = "hybrid_down"
         strength = "strong"
+    elif any(token in prompt_lowered for token in (
+        "remain stable", "remain relatively stable", "stabilize", "stabilise",
+        "remain stable or decrease slightly", "remain stable or increase slightly",
+        "rebound or stabilize", "fluctuate around the current level", "stable to slightly lower",
+        "stable to slightly higher", "slow pace", "modest pace", "continue to hover around",
+        "decrease or remain stable", "increase or remain stable"
+    )):
+        shape = "plateau"
+        effect_family = "level"
+        if any(token in prompt_lowered for token in ("decrease slightly", "slight decrease", "decrease or remain stable", "decline", "fall", "widen", "lower", "downward")):
+            direction = "down"
+        elif any(token in prompt_lowered for token in ("increase slightly", "slight increase", "increase or remain stable", "increase", "rise", "grow", "narrow", "higher", "upward")):
+            direction = "up"
+        else:
+            return {
+                "revision_needed": False,
+                "confidence": 0.7,
+                "intent": {
+                    "effect_family": "none",
+                    "direction": "neutral",
+                    "shape": "none",
+                    "duration": "none",
+                    "strength": "none",
+                },
+                "localization": {"position_bucket": "none", "region": [0, 0]},
+                "tool_name": "none",
+            }
+        tool_name = "hybrid_down" if direction == "down" else "hybrid_up"
+        strength = "weak"
     elif any(token in normalized for token in ("重新定价", "预期上修", "预期下修", "评级上调", "评级下调", "指引上修", "指引下修")) or finance_up or finance_down:
         shape = "step"
         effect_family = "level"
         direction = "down" if (finance_down or any(token in normalized for token in ("下修", "下调", "偏空", "利空"))) else "up"
         tool_name = "step_shift"
         strength = "medium"
+    elif any(token in prompt_lowered for token in (
+        "continue to increase", "continue to decrease", "continue to decline", "continue to rise",
+        "continue to widen", "continue to narrow", "remain wide", "remain positive", "overall trend will remain positive",
+        "likely that gasoline prices will continue", "likely that vehicle miles traveled will continue",
+        "trade deficit will continue", "prices may rise", "prices may fall", "likely increase", "likely decrease",
+        "continued increase", "continued decrease", "continue to grow", "continue growing", "continue to expand",
+        "will continue to grow", "will continue to increase", "will continue to decline", "will continue to decrease",
+        "likely to continue to increase", "likely to continue to decrease", "likely to remain above", "likely to remain below",
+        "travel will continue", "vmt will continue", "gasoline prices are likely to continue",
+        "sustained growth", "growth trend continues", "reach a new high", "vehicle miles traveled will reach",
+        "vmt growth", "population growth and urbanization", "estimated increase", "continue to narrow"
+    )):
+        shape = "plateau"
+        effect_family = "level"
+        if any(token in prompt_lowered for token in ("decrease", "decline", "fall", "widen", "narrow", "lower", "below")):
+            direction = "down"
+        else:
+            direction = "up"
+        tool_name = "hybrid_down" if direction == "down" else "hybrid_up"
+        strength = "medium"
+    elif any(token in prompt_lowered for token in (
+        "begin to decrease", "begin to increase", "start to decrease", "start to increase",
+        "may decrease", "may increase", "is expected to decrease", "is expected to increase"
+    )):
+        shape = "plateau"
+        effect_family = "level"
+        direction = "down" if any(token in prompt_lowered for token in ("decrease", "lower", "narrow")) else "up"
+        tool_name = "hybrid_down" if direction == "down" else "hybrid_up"
+        strength = "weak"
     elif any(token in normalized for token in ("趋势抬升", "趋势走弱", "持续偏高", "持续偏低", "drift")):
         shape = "plateau"
         effect_family = "level"
@@ -595,7 +885,7 @@ def heuristic_revision_plan(context_text: str, horizon: int) -> Dict[str, Any]:
         direction = "down" if any(token in normalized for token in ("低位", "更受限", "下降")) else "up"
         tool_name = "step_shift"
         strength = "strong"
-    elif any(token in normalized for token in ("噪声", "失真", "无规律波动", "杂乱")):
+    elif any(token in normalized for token in ("噪声", "失真", "无规律波动", "杂乱")) or any(token in prompt_lowered for token in ("volatile", "volatility", "erratic", "high variability")):
         shape = "irregular_noise"
         effect_family = "volatility"
         direction = "neutral"
@@ -615,9 +905,9 @@ def heuristic_revision_plan(context_text: str, horizon: int) -> Dict[str, Any]:
         strength = "medium"
 
     duration_bucket = "medium"
-    if any(token in normalized for token in ("短时", "短暂", "很快")):
+    if any(token in normalized for token in ("短时", "短暂", "很快")) or any(token in prompt_lowered for token in ("short term", "short-term", "next 1-3 months", "in the short term")):
         duration_bucket = "short"
-    elif any(token in normalized for token in ("持续", "一段时间", "较长时间")):
+    elif any(token in normalized for token in ("持续", "一段时间", "较长时间")) or any(token in prompt_lowered for token in ("long term", "long-term", "next 4-18 months")):
         duration_bucket = "long"
 
     region = localize_future_region(bucket, duration_bucket, horizon)
@@ -633,7 +923,7 @@ def heuristic_revision_plan(context_text: str, horizon: int) -> Dict[str, Any]:
             "strength": strength,
         },
         "localization": {
-            "position_bucket": bucket,
+            "position_bucket": normalize_position_bucket(bucket, fallback="mid"),
             "region": region,
         },
         "tool_name": tool_name,
@@ -641,7 +931,8 @@ def heuristic_revision_plan(context_text: str, horizon: int) -> Dict[str, Any]:
 
 
 def localize_future_region(bucket: str, duration_bucket: str, horizon: int) -> List[int]:
-    if bucket == "full_horizon":
+    bucket = normalize_position_bucket(bucket)
+    if bucket == "full":
         return [0, int(horizon)]
     if duration_bucket == "short":
         win = max(4, horizon // 6)
@@ -650,9 +941,9 @@ def localize_future_region(bucket: str, duration_bucket: str, horizon: int) -> L
     else:
         win = max(6, horizon // 4)
 
-    if bucket == "early_horizon":
+    if bucket == "early":
         start = 0
-    elif bucket == "late_horizon":
+    elif bucket == "late":
         start = max(0, horizon - win)
     else:
         start = max(0, (horizon - win) // 2)
@@ -736,10 +1027,28 @@ def predict_edit_spec(
     shape = intent.get("shape")
     if shape in {None, "none"}:
         return _zero_edit_spec(strategy=strategy)
+    if strategy == "teacher_distilled_linear":
+        strategy = "learned_linear"
+    elif strategy == "teacher_distilled_shrunk":
+        strategy = "learned_rule_shrunk"
     if strategy == "oracle_from_sample":
         if sample is None:
             raise ValueError("sample is required for oracle_from_sample strategy")
         return extract_gt_edit_spec(sample, history_ts=history_ts, base_forecast=base_forecast)
+    if strategy == "teacher_search_oracle":
+        if sample is None:
+            raise ValueError("sample is required for teacher_search_oracle strategy")
+        spec, _ = search_teacher_edit_spec(
+            intent=intent,
+            region=region,
+            history_ts=history_ts,
+            base_forecast=base_forecast,
+            revision_target=np.asarray(sample["revision_target"], dtype=np.float64),
+            future_gt=np.asarray(sample["future_gt"], dtype=np.float64),
+            gt_mask=np.asarray(sample["edit_mask_gt"], dtype=np.float64),
+            context_text=context_text,
+        )
+        return spec
     if strategy == "learned_linear":
         if not model_path:
             raise ValueError("model_path is required for learned_linear strategy")
@@ -863,7 +1172,7 @@ def predict_edit_spec(
         }.get(strength, 0.62)
         spec["delta_level_z"] = float(spec.get("delta_level_z", 0.0)) * hint_scale
         spec["amp_ratio"] = min(float(spec.get("amp_ratio", 1.0)), 0.9 if strength == "weak" else 1.0)
-        if hinted_bucket == "full_horizon":
+        if normalize_position_bucket(hinted_bucket, fallback="mid") == "full":
             spec["duration_ratio"] = 1.0
             spec["recovery_ratio"] = 0.0
     return spec
