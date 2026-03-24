@@ -22,6 +22,7 @@ Current runnable entrypoints:
 - `test_scripts/build_pure_editing_how_much_stress_benchmark.py --csv-path <csv> --output-dir <stress_dir>`
 - `test_scripts/build_pure_editing_volatility_closure_benchmark.py --csv-path <csv> --output-dir <closure_dir>`
 - `test_scripts/build_pure_editing_volatility_route_closure_benchmark.py --csv-path <csv> --output-dir <route_closure_dir>`
+- `test_scripts/build_event_driven_volatility_subtype_v2.py --benchmark <event_json> --output-dir <v2_dir>`
 - `test_scripts/run_pure_editing_volatility_audit.py --testset <volatility_json> --output <audit_json>`
 - `test_scripts/run_pure_editing_volatility_split_validation.py --testset <volatility_json> --output <split_json>`
 - `test_scripts/run_pure_editing_volatility_route_closure.py --testset <volatility_json> --output <route_json> --routing-source planner_llm|text_guard_only`
@@ -78,6 +79,7 @@ Current scope notes:
 - Pure-editing now also has a subtype-aware volatility route-closure benchmark and a route-only closure runner with `planner_llm` and `text_guard_only` modes.
 - The volatility planner schema now includes an explicit `volatility_subtype` field and records `proposed_subtype / guarded_subtype / final_subtype` through the route path.
 - A post-integration routing analyzer is now available to diagnose whether volatility samples are being sent to the correct split sub-tool.
+- Pure-editing now also has a mainline benchmark refresh script that rewrites only volatility samples into subtype-aware prompts and labels, so the mainline pipeline can exercise `global_scale / local_burst / preview_non_monotonic` semantics directly.
 - Controlled synthetic forecast-revision builders are ready after backbone artifacts exist.
 - Time-MMD projected revision is now exposed as a runnable benchmark path.
 - A single generic projected-target builder across the full standard LTSF dataset pool is still not exposed as one CLI entrypoint.

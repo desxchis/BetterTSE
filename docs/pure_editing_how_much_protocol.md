@@ -406,6 +406,70 @@ Current interpretation:
 - the remaining mainline volatility routing errors come from coarse prompt semantics, not from subtool inadequacy
 - this means the current bottleneck has shifted from `route correctness` in the closure sense to `upstream subtype expressivity` in legacy generic prompts
 
+## Mainline Volatility-Subtype-Aware Benchmark v2
+
+Reference artifacts:
+
+- `tmp/event_driven_mainline20_volsubtype_v2/event_driven_testset_ETTh1_20_volsubtype_v2.json`
+- `tmp/pipeline_full_mainline20_volsubtype_v2.json`
+- `tmp/pipeline_direct_mainline20_volsubtype_v2.json`
+- `tmp/pipeline_full_mainline20_volsubtype_v2_routing.json`
+
+What changed:
+
+- the mainline benchmark now refreshes only volatility samples
+- non-volatility samples remain unchanged
+- volatility prompts and labels are rewritten to expose explicit subtype semantics:
+  - `global_scale`
+  - `local_burst`
+  - `envelope_monotonic`
+  - `preview_non_monotonic`
+- `preview_non_monotonic` remains a preview-side route target and is not forced into the supported tool path
+
+Current volatility distribution on the 20-sample mainline v2 benchmark:
+
+- `global_scale`: `1`
+- `local_burst`: `2`
+- `envelope_monotonic`: `0`
+- `preview_non_monotonic`: `3`
+
+Formal rerun on mainline v2:
+
+- `full_bettertse`
+  - target MAE `1.1490`
+  - target MSE `20.9370`
+  - t-IoU `0.3080`
+  - preservation MAE `0.6095`
+- `direct_edit`
+  - target MAE `1.3092`
+  - target MSE `23.6511`
+  - t-IoU `0.1682`
+  - preservation MAE `0.5664`
+
+Volatility routing diagnosis on mainline v2:
+
+- `total_volatility_cases`: `6`
+- `preview_case_count`: `3`
+- `fallback_or_unsupported_count`: `0`
+- `overall_route_correct_rate`: `1.00`
+- `overall_subtype_correct_rate`: `1.00`
+- `preview_not_misrouted_rate`: `1.00`
+
+Per-subpattern routed reading:
+
+- `local_burst`
+  - `2/2` routed to `volatility_local_burst`
+- `uniform_variance`
+  - `1/1` routed to `volatility_global_scale`
+- `non_monotonic_envelope`
+  - `3/3` kept on preview-side routing with `final_subtype = preview_non_monotonic`
+
+Current interpretation:
+
+- the subtype schema and split routing are now fully exercised by a mainline benchmark that actually exposes subtype semantics
+- the previous mainline routing failures were benchmark-prompt granularity failures, not routing-system failures
+- once benchmark volatility prompts are made subtype-aware, the route bottleneck disappears on the current 20-sample rerun
+
 ## Go / No-Go
 
 Go:
@@ -423,11 +487,10 @@ No-Go:
 
 ## Recommended next step
 
-The next step is no longer operator redesign or student work.
+The next step is still not operator redesign or student work.
 
 It is:
 
-1. keep the validated volatility split and subtype router fixed
-2. treat the subtype-aware closure benchmark as the routing authority
-3. if needed, enrich legacy generic volatility prompts or benchmark labels so that mainline prompts carry subtype semantics more explicitly
-4. only after that, reconsider pure-editing student work
+1. treat the subtype-aware mainline benchmark v2 as the current volatility-aware pure-editing mainline
+2. if more statistical confidence is needed, scale the same v2 refresh procedure beyond 20 samples before reopening student discussions
+3. keep legacy generic volatility prompts as historical artifacts, not as the authoritative routing benchmark
