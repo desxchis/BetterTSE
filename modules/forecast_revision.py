@@ -1031,6 +1031,10 @@ def predict_edit_spec(
         strategy = "learned_linear"
     elif strategy == "teacher_distilled_shrunk":
         strategy = "learned_rule_shrunk"
+    elif strategy == "teacher_distilled_family_affine":
+        strategy = "learned_linear"
+    elif strategy == "teacher_distilled_family_duration_affine":
+        strategy = "learned_linear"
     if strategy == "oracle_from_sample":
         if sample is None:
             raise ValueError("sample is required for oracle_from_sample strategy")

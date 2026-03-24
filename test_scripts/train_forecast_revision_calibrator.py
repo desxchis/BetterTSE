@@ -32,6 +32,7 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--alpha", type=float, default=1.0)
     parser.add_argument("--label-source", choices=["gt", "teacher_search"], default="gt")
+    parser.add_argument("--model-kind", choices=["linear", "family_affine", "family_duration_affine"], default="linear")
     args = parser.parse_args()
 
     payload = json.loads(Path(args.benchmark).read_text(encoding="utf-8"))
@@ -79,7 +80,7 @@ def main() -> None:
         else:
             heldout_samples.append(sample)
 
-    model = fit_linear_calibrator(train_samples, alpha=args.alpha)
+    model = fit_linear_calibrator(train_samples, alpha=args.alpha, model_kind=args.model_kind)
 
     out_root = Path(args.output_dir)
     out_root.mkdir(parents=True, exist_ok=True)
@@ -110,6 +111,7 @@ def main() -> None:
         "alpha": args.alpha,
         "seed": args.seed,
         "label_source": args.label_source,
+        "model_kind": args.model_kind,
     }, ensure_ascii=False, indent=2))
 
 

@@ -16,6 +16,8 @@ The protocol should be reported with the following methods:
 
 - `teacher_search_oracle`
 - `teacher_distilled_shrunk`
+- `teacher_distilled_family_affine`
+- `teacher_distilled_family_duration_affine`
 - `heuristic_revision`
 - `rule_local_stats`
 - `direct_delta_regression`
@@ -32,6 +34,13 @@ Use a larger benchmark than the earlier 20-sample smoke runs and keep the split 
 - teacher-label source: `teacher_search`
 
 The current linear calibrator is deterministic once the train split is fixed, so the seed axis mainly stress-tests split sensitivity rather than optimizer noise.
+
+When `teacher_distilled_shrunk` already shows positive trend but not enough backbone-robust margin, the only approved capacity upgrade is:
+
+- `effect_family` conditioned affine shrink
+- `effect_family x duration_bucket` conditioned affine shrink
+
+Do not replace the teacher, benchmark, or comparison set when making this upgrade.
 
 ## Core questions
 

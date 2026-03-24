@@ -23,6 +23,28 @@ STRENGTH_VALUES = ("none", "weak", "medium", "strong")
 EFFECT_VALUES = ("none", "impulse", "level", "shutdown", "volatility")
 
 
+def _fit_affine_1d(x: np.ndarray, y: np.ndarray, alpha: float = 1.0) -> tuple[float, float]:
+    x_arr = np.asarray(x, dtype=np.float64).reshape(-1)
+    y_arr = np.asarray(y, dtype=np.float64).reshape(-1)
+    if x_arr.size == 0 or y_arr.size == 0:
+        return 1.0, 0.0
+    A = np.column_stack([x_arr, np.ones_like(x_arr)])
+    reg = alpha * np.eye(2, dtype=np.float64)
+    reg[-1, -1] = 0.0
+    coeff = np.linalg.solve(A.T @ A + reg, A.T @ y_arr)
+    return float(coeff[0]), float(coeff[1])
+
+
+def _group_key(intent: dict[str, Any], model_type: str) -> str:
+    effect = str(intent.get("effect_family", "none"))
+    if model_type == "family_affine_edit_spec_calibrator":
+        return effect
+    if model_type == "family_duration_affine_edit_spec_calibrator":
+        duration = str(intent.get("duration", "none"))
+        return f"{effect}::{duration}"
+    return "__global__"
+
+
 def _safe_div(num: float, den: float, fallback: float = 0.0) -> float:
     if abs(den) < 1e-8:
         return float(fallback)
@@ -168,12 +190,34 @@ def _postprocess_spec(intent: dict[str, Any], values: np.ndarray) -> dict[str, A
     return spec
 
 
-def fit_linear_calibrator(samples: list[dict[str, Any]], alpha: float = 1.0) -> dict[str, Any]:
+def _apply_group_affine(pred: np.ndarray, *, intent: dict[str, Any], model: dict[str, Any]) -> np.ndarray:
+    model_type = str(model.get("model_type", "linear_edit_spec_calibrator"))
+    if model_type == "linear_edit_spec_calibrator":
+        return pred
+    group_affine = model.get("group_affine") or {}
+    params = group_affine.get(_group_key(intent, model_type))
+    if not params:
+        return pred
+    adjusted = np.asarray(pred, dtype=np.float64).copy()
+    scales = params.get("scales", {})
+    biases = params.get("biases", {})
+    for idx, key in enumerate(SPEC_KEYS):
+        adjusted[idx] = float(scales.get(key, 1.0)) * adjusted[idx] + float(biases.get(key, 0.0))
+    return adjusted
+
+
+def fit_linear_calibrator(
+    samples: list[dict[str, Any]],
+    alpha: float = 1.0,
+    model_kind: str = "linear",
+) -> dict[str, Any]:
     X = []
     Y = []
+    intents = []
     for sample in samples:
         if "intent" not in sample or "region" not in sample or "edit_spec_gt" not in sample:
             continue
+        intents.append(dict(sample["intent"]))
         X.append(build_feature_vector(
             intent=sample["intent"],
             region=sample["region"],
@@ -194,14 +238,53 @@ def fit_linear_calibrator(samples: list[dict[str, Any]], alpha: float = 1.0) -> 
     reg = alpha * np.eye(X_aug.shape[1], dtype=np.float64)
     reg[-1, -1] = 0.0
     weights = np.linalg.solve(X_aug.T @ X_aug + reg, X_aug.T @ Y_arr)
-    return {
-        "model_type": "linear_edit_spec_calibrator",
+    model_type = {
+        "linear": "linear_edit_spec_calibrator",
+        "family_affine": "family_affine_edit_spec_calibrator",
+        "family_duration_affine": "family_duration_affine_edit_spec_calibrator",
+    }.get(model_kind)
+    if model_type is None:
+        raise ValueError(f"Unsupported model_kind: {model_kind}")
+    model = {
+        "model_type": model_type,
         "alpha": float(alpha),
         "spec_keys": list(SPEC_KEYS),
         "feature_mean": feat_mean.tolist(),
         "feature_std": feat_std.tolist(),
         "weights": weights.tolist(),
     }
+    if model_type != "linear_edit_spec_calibrator":
+        base_pred = X_aug @ weights
+        grouped: dict[str, dict[str, list[float]]] = {}
+        for idx, intent in enumerate(intents):
+            key = _group_key(intent, model_type)
+            bucket = grouped.setdefault(key, {})
+            for spec_idx, spec_key in enumerate(SPEC_KEYS):
+                bucket.setdefault(f"{spec_key}_x", []).append(float(base_pred[idx, spec_idx]))
+                bucket.setdefault(f"{spec_key}_y", []).append(float(Y_arr[idx, spec_idx]))
+        group_affine: dict[str, dict[str, Any]] = {}
+        for key, bucket in grouped.items():
+            count = len(bucket.get(f"{SPEC_KEYS[0]}_x", []))
+            if count < 4:
+                continue
+            scales: dict[str, float] = {}
+            biases: dict[str, float] = {}
+            for spec_key in SPEC_KEYS:
+                scale, bias = _fit_affine_1d(
+                    np.asarray(bucket[f"{spec_key}_x"], dtype=np.float64),
+                    np.asarray(bucket[f"{spec_key}_y"], dtype=np.float64),
+                    alpha=max(1e-6, alpha * 0.25),
+                )
+                scales[spec_key] = scale
+                biases[spec_key] = bias
+            group_affine[key] = {
+                "count": count,
+                "scales": scales,
+                "biases": biases,
+            }
+        model["group_affine"] = group_affine
+        model["grouping"] = "effect_family" if model_type == "family_affine_edit_spec_calibrator" else "effect_family_duration"
+    return model
 
 
 def save_model(model: dict[str, Any], path: str) -> None:
@@ -229,6 +312,11 @@ def predict_with_model(
     x_norm = (x - mean_arr) / std_arr
     x_aug = np.concatenate([x_norm, np.array([1.0], dtype=np.float64)])
     pred = x_aug @ weights
+    pred = _apply_group_affine(np.asarray(pred, dtype=np.float64), intent=intent, model=model)
     spec = _postprocess_spec(intent, np.asarray(pred, dtype=np.float64))
-    spec["strategy"] = "learned_linear"
+    spec["strategy"] = {
+        "linear_edit_spec_calibrator": "learned_linear",
+        "family_affine_edit_spec_calibrator": "learned_family_affine",
+        "family_duration_affine_edit_spec_calibrator": "learned_family_duration_affine",
+    }.get(str(model.get("model_type", "")), "learned_linear")
     return spec

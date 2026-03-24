@@ -895,6 +895,8 @@ def main() -> None:
             "learned_rule_guarded",
             "learned_rule_shrunk",
             "teacher_distilled_shrunk",
+            "teacher_distilled_family_affine",
+            "teacher_distilled_family_duration_affine",
             "learned_confidence_gated",
             "learned_reliability_gated",
         ],

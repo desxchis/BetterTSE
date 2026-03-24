@@ -14,7 +14,8 @@ Current runnable entrypoints:
 - `run_pipeline.py --mode full_bettertse|direct_edit|wo_localization|wo_canonical_layer`
 - `run_forecast_revision.py --mode base_only|heuristic_revision|direct_delta_regression|wo_parameter_calibration|localized_full_revision`
 - `run_forecast_revision.py --calibration-strategy teacher_search_oracle|teacher_distilled_linear|teacher_distilled_shrunk`
-- `test_scripts/train_forecast_revision_calibrator.py --label-source gt|teacher_search`
+- `run_forecast_revision.py --calibration-strategy teacher_search_oracle|teacher_distilled_linear|teacher_distilled_shrunk|teacher_distilled_family_affine|teacher_distilled_family_duration_affine`
+- `test_scripts/train_forecast_revision_calibrator.py --label-source gt|teacher_search --model-kind linear|family_affine|family_duration_affine`
 - `test_scripts/run_multibackbone_forecast_revision.py --dataset-kind timemmd`
 - `test_scripts/aggregate_revision_how_much_protocol.py --root-dir <run_root> --output-dir <aggregate_dir>`
 
