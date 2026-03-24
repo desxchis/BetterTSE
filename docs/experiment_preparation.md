@@ -23,6 +23,7 @@ Current runnable entrypoints:
 - `test_scripts/build_pure_editing_volatility_closure_benchmark.py --csv-path <csv> --output-dir <closure_dir>`
 - `test_scripts/run_pure_editing_volatility_audit.py --testset <volatility_json> --output <audit_json>`
 - `test_scripts/run_pure_editing_volatility_split_validation.py --testset <volatility_json> --output <split_json>`
+- `test_scripts/analyze_pure_editing_volatility_routing.py --testset <event_json> --result <pipeline_json> --output <routing_json>`
 
 It does not start:
 
@@ -72,6 +73,7 @@ Current scope notes:
 - Pure-editing now also has an audit-only validator for minimal volatility canonical split hypotheses; it was used to decide the current registry split.
 - Pure-editing now also has a volatility closure benchmark builder for split stability retests.
 - The validated volatility split tools are now connected back to the pure-editing routing and execution path, while `non_monotonic_envelope` remains outside the main route.
+- A post-integration routing analyzer is now available to diagnose whether volatility samples are being sent to the correct split sub-tool.
 - Controlled synthetic forecast-revision builders are ready after backbone artifacts exist.
 - Time-MMD projected revision is now exposed as a runnable benchmark path.
 - A single generic projected-target builder across the full standard LTSF dataset pool is still not exposed as one CLI entrypoint.

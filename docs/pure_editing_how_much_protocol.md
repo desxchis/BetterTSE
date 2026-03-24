@@ -289,6 +289,55 @@ Current next step:
 2. connect the validated split tools back to the BetterTSE canonical/hybrid registry
 3. run a small full-pipeline sanity check to ensure the new routing does not damage other tool families
 
+## Post-Integration Formal Rerun
+
+Reference artifacts:
+
+- `tmp/pipeline_full_mainline20_volsplit.json`
+- `tmp/pipeline_direct_mainline20_volsplit.json`
+- `tmp/pipeline_woloc_mainline20_volsplit.json`
+- `tmp/pipeline_wocanonical_mainline20_volsplit.json`
+- `tmp/pipeline_full_mainline20_volsplit_routing.json`
+
+Current reading on the 20-sample pure-editing mainline benchmark:
+
+- `full_bettertse`
+  - target MAE `0.9853`
+  - target MSE `16.3463`
+  - t-IoU `0.3284`
+  - preservation MAE `0.4568`
+- `direct_edit`
+  - `1.6157 / 35.3121 / 0.1593 / 0.8957`
+- `wo_localization`
+  - `6.6399 / 115.8596 / 0.0852 / 6.4923`
+- `wo_canonical_layer`
+  - `1.2079 / 22.8725 / 0.2841 / 0.6637`
+
+Current interpretation:
+
+- after volatility split integration, the full mainline remains clearly stronger than `direct_edit`
+- localization is still the dominant contributor
+- the canonical layer remains positive after integration
+- there is no sign that routing the volatility family through split tools damaged the non-volatility tool families in this small formal rerun
+
+Volatility routing diagnosis:
+
+- `total_volatility_cases`: `6`
+- `preview_case_count`: `3`
+- `fallback_or_unsupported_count`: `0`
+- `overall_route_correct_rate`: `0.33`
+- routed tools in the full rerun:
+  - all 6 volatility cases were executed by `volatility_global_scale`
+- subpattern reading:
+  - `uniform_variance`: `1/1` routed correctly
+  - `local_burst`: `0/2` routed correctly
+  - `non_monotonic_envelope`: `3/3` kept on the preview-side generic path
+
+Current conclusion:
+
+- the volatility split itself is now integrated and does not break the pure-editing mainline
+- the new primary bottleneck is no longer operator adequacy; it is route correctness from prompt semantics into the split volatility sub-tools
+
 ## Go / No-Go
 
 Go:
