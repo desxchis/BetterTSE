@@ -422,6 +422,10 @@ Reference artifacts:
 - `tmp/pipeline_full_mainline50_volsubtype_v2.json`
 - `tmp/pipeline_direct_mainline50_volsubtype_v2.json`
 - `tmp/pipeline_full_mainline50_volsubtype_v2_routing.json`
+- `tmp/event_driven_ettm1_36_volsubtype_v2/event_driven_testset_ETTm1_36_volsubtype_v2.json`
+- `tmp/pipeline_full_ettm1_42_volsubtype_v2.json`
+- `tmp/pipeline_direct_ettm1_42_volsubtype_v2.json`
+- `tmp/pipeline_full_ettm1_42_volsubtype_v2_routing.json`
 
 What changed:
 
@@ -598,6 +602,68 @@ Current interpretation:
 - `full_bettertse` remains clearly stronger than `direct_edit`, and preservation does not become a new blocking issue at this scale
 - at the current protocol scope, the volatility split can be treated as resolved at the system level
 
+## Cross-Distribution Frozen Recheck
+
+Reference artifacts:
+
+- `tmp/event_driven_ettm1_36/event_driven_testset_ETTm1_36.json`
+- `tmp/event_driven_ettm1_36_volsubtype_v2/event_driven_testset_ETTm1_36_volsubtype_v2.json`
+- `tmp/pipeline_full_ettm1_42_volsubtype_v2.json`
+- `tmp/pipeline_direct_ettm1_42_volsubtype_v2.json`
+- `tmp/pipeline_full_ettm1_42_volsubtype_v2_routing.json`
+
+What changed:
+
+- the same frozen volatility split design was replayed on a second data distribution, `ETTm1`, without changing:
+  - operator definitions
+  - subtype schema
+  - route guard logic
+  - planner/runtime method set
+- the baseline 36-sample event-driven benchmark was refreshed into a 42-sample subtype-aware v2 benchmark with explicit coverage:
+  - `global_scale = 3`
+  - `local_burst = 4`
+  - `envelope_monotonic = 3`
+  - `preview_non_monotonic = 5`
+
+Formal rerun on the second-distribution subtype-aware benchmark:
+
+- `full_bettertse`
+  - target MAE `0.9843`
+  - target MSE `22.4546`
+  - t-IoU `0.2490`
+  - preservation MAE `0.3703`
+- `direct_edit`
+  - target MAE `1.1407`
+  - target MSE `26.0659`
+  - t-IoU `0.1059`
+  - preservation MAE `0.5159`
+
+Volatility routing diagnosis on the second-distribution rerun:
+
+- `total_volatility_cases`: `15`
+- `preview_case_count`: `5`
+- `fallback_or_unsupported_count`: `0`
+- `overall_route_correct_rate`: `1.00`
+- `overall_subtype_correct_rate`: `1.00`
+- `preview_not_misrouted_rate`: `1.00`
+
+Per-subpattern routed reading:
+
+- `uniform_variance`
+  - `3/3` routed to `volatility_global_scale`
+- `local_burst`
+  - `4/4` routed to `volatility_local_burst`
+- `monotonic_envelope`
+  - `3/3` routed to `volatility_envelope_monotonic`
+- `non_monotonic_envelope`
+  - `5/5` kept on preview-side routing with `final_subtype = preview_non_monotonic`
+
+Current interpretation:
+
+- the volatility split no longer looks specific to the original ETTh1 sign-off distribution
+- under a frozen method stack, the subtype-aware benchmark and split routing stay stable on a second data condition
+- `full_bettertse` continues to beat `direct_edit` while preservation remains better, so the volatility split no longer needs active development before opening pure-editing student work
+
 ## Go / No-Go
 
 Go:
@@ -622,3 +688,4 @@ It is:
 1. treat the subtype-aware mainline benchmark v2, with subtype-coverage supplementation when needed, as the current volatility-aware pure-editing mainline
 2. keep legacy generic volatility prompts as historical artifacts, not as the authoritative routing benchmark
 3. do not reopen volatility operator or routing work unless a larger future benchmark reveals a new failure mode
+4. when pure-editing student work starts, treat the current volatility split as a frozen tool-conditioned taxonomy rather than a still-moving target
