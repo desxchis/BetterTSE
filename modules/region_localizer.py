@@ -17,6 +17,27 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
 
+POSITION_BUCKET_ALIASES = {
+    "early": "early",
+    "mid": "mid",
+    "middle": "mid",
+    "late": "late",
+    "full": "full",
+    "none": "none",
+    "early_horizon": "early",
+    "mid_horizon": "mid",
+    "middle_horizon": "mid",
+    "late_horizon": "late",
+    "full_horizon": "full",
+    "mid_early": "mid",
+    "mid_late": "mid",
+}
+
+
+def normalize_position_bucket(bucket: str, fallback: str = "mid") -> str:
+    return POSITION_BUCKET_ALIASES.get(str(bucket or "").strip().lower(), fallback)
+
+
 EARLY_HINTS = ("清晨", "早班", "大清早", "早上")
 MID_EARLY_HINTS = ("上午", "前半段", "较早时段")
 MIDDLE_HINTS = ("中午", "运行中段", "刚才", "午后")
@@ -31,6 +52,12 @@ NOISE_HINTS = ("杂乱跳变", "失真", "无规律波动", "信号异常", "跳
 HUMP_HINTS = ("短时冲高后回落", "先升后降", "先偏离后恢复", "阶段性抬升后逐步回落")
 SHUTDOWN_HINTS = ("停摆", "停机", "极低水平", "接近停滞", "几乎中断")
 ONSET_HINTS = ("开始", "交接后", "之后", "自", "从", "预计在")
+VOLATILITY_CANONICAL_TOOLS = {
+    "volatility_increase",
+    "volatility_global_scale",
+    "volatility_local_burst",
+    "volatility_envelope_monotonic",
+}
 
 
 @dataclass
@@ -41,30 +68,29 @@ class CandidateWindow:
     reason: str
 
 
-def infer_position_bucket(text: str, fallback: str = "middle") -> str:
+def infer_position_bucket(text: str, fallback: str = "mid") -> str:
     if any(token in text for token in EARLY_HINTS):
         return "early"
     if any(token in text for token in MID_EARLY_HINTS):
-        return "mid_early"
+        return "mid"
     if any(token in text for token in LATE_HINTS):
         return "late"
     if any(token in text for token in MID_LATE_HINTS):
-        return "mid_late"
+        return "mid"
     if any(token in text for token in MIDDLE_HINTS):
-        return "middle"
-    return fallback
+        return "mid"
+    return normalize_position_bucket(fallback)
 
 
 def anchor_center(text: str, ts_length: int, bucket: str) -> int:
     normalized = text or ""
+    bucket = normalize_position_bucket(bucket)
     if bucket == "early":
         ratio = 0.22
-    elif bucket == "mid_early":
-        ratio = 0.35
-    elif bucket == "mid_late":
-        ratio = 0.6
     elif bucket == "late":
         ratio = 0.78
+    elif bucket == "full":
+        ratio = 0.5
     else:
         ratio = 0.5
 
@@ -118,7 +144,7 @@ def infer_duration_steps(
         return max(12, min(26, ts_length // 8))
     if effect_family in {"impulse"} or any(token in text for token in SHORT_HINTS):
         return max(8, min(20, ts_length // 10))
-    if canonical_tool in {"volatility_increase"} or any(token in text for token in NOISE_HINTS):
+    if canonical_tool in VOLATILITY_CANONICAL_TOOLS or any(token in text for token in NOISE_HINTS):
         return max(14, min(28, ts_length // 7))
     if any(token in text for token in SWITCH_HINTS):
         return max(10, min(24, ts_length // 8))
@@ -208,13 +234,13 @@ def score_candidate_window(
         score -= 0.15
     if effect_family in {"trend", "seasonality", "shutdown"} and cand_len < max(12, ts_length // 10):
         score -= 0.15
-    if canonical_tool == "volatility_increase" and cand_len > max(28, ts_length // 6):
+    if canonical_tool in VOLATILITY_CANONICAL_TOOLS and cand_len > max(28, ts_length // 6):
         score -= 0.08
     if any(token in prompt_text for token in RECOVERY_HINTS) and effect_family in {"impulse", "trend"}:
         score += 0.04
     if any(token in prompt_text for token in SWITCH_HINTS) and cand_len > max(24, ts_length // 7):
         score -= 0.08
-    if any(token in prompt_text for token in NOISE_HINTS) and canonical_tool == "volatility_increase":
+    if any(token in prompt_text for token in NOISE_HINTS) and canonical_tool in VOLATILITY_CANONICAL_TOOLS:
         score += 0.06
     if any(token in prompt_text for token in HUMP_HINTS) and shape == "hump":
         score += 0.05
@@ -273,7 +299,7 @@ def localize_region(
     if active_shape == "step":
         if infer_onset_phrase(anchor_phrase):
             duration_steps = min(duration_steps, max(18, ts_length // 10))
-        if bucket in {"middle", "mid_late"}:
+        if normalize_position_bucket(bucket) == "mid":
             center = max(0, center - max(6, ts_length // 16))
         elif bucket == "late":
             center = max(0, center - max(8, ts_length // 14))

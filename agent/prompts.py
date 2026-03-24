@@ -32,12 +32,12 @@ First identify the time anchor phrase and map it to a coarse bucket before decid
 
 Bucket guide:
 - early: indices `[0, {early_end})`
-- middle: indices `[{early_end}, {mid_end})`
+- mid: indices `[{early_end}, {mid_end})`
 - late: indices `[{mid_end}, {ts_length})`
 
 Typical phrase mapping:
 - `自今日清晨起`, `在早班交接后`, `大清早的时候` -> usually `early`
-- `从今天中午开始`, `在今日运行中段`, `刚才` -> usually `middle`
+- `从今天中午开始`, `在今日运行中段`, `刚才` -> usually `mid`
 - `预计在今晚深夜`, `在夜间低谷期前`, `就快到半夜的时候` -> usually `late`
 
 Localization rules:
@@ -87,8 +87,11 @@ Canonical mapping guide:
 - `seasonality + neutral + periodic` -> `seasonality_enhance` -> `season_enhance`
 - `seasonality + neutral + flatten` -> `seasonality_reduce` -> `season_reduce`
 - `volatility + neutral + flatten` -> `smooth_denoise` -> `ensemble_smooth`
-- `volatility + neutral + residual_amplify` -> `volatility_increase` -> `volatility_increase`
-- `volatility + neutral + irregular_noise` -> `volatility_increase` -> `volatility_increase`
+- `volatility + neutral + residual_amplify` -> choose the closest split volatility tool, not the old generic one
+- `volatility + neutral + irregular_noise` -> prefer:
+  - whole-window noisy corruption -> `volatility_global_scale` -> `volatility_global_scale`
+  - local bursty corruption -> `volatility_local_burst` -> `volatility_local_burst`
+  - gradually stronger/weaker corruption -> `volatility_envelope_monotonic` -> `volatility_envelope_monotonic`
 - `impulse + up/down + transient` -> `impulse_spike` -> `spike_inject`
 - `impulse + up/down + hump` -> closest current local hump tool; prefer `spike_inject` for short/medium local bump, or `trend_quadratic_up/down` only if the window is clearly wider and smoother
 - `level + up + plateau` -> closest current elevated-level tool; prefer `hybrid_up`
@@ -116,7 +119,7 @@ CRITICAL CONSTRAINTS:
 - region[1] MUST be > region[0] and <= {ts_length}
 - The region length MUST be >= 1
 - `math_shift` and `shift_factor` are mutually exclusive
-- For `volatility_increase` and `spike_inject`, do not provide `math_shift` or `shift_factor`
+- For volatility split tools and `spike_inject`, do not provide `math_shift` or `shift_factor`
 
 ━━━━━━━━━━━━━━━━━  OUTPUT FORMAT  ━━━━━━━━━━━━━━━━━
 
@@ -132,7 +135,7 @@ Return STRICT JSON with this schema:
   }},
   "localization": {{
     "time_anchor_phrase": "<phrase copied or summarized from the prompt>",
-    "position_bucket": "<early|middle|late>",
+    "position_bucket": "<early|mid|late|full|none>",
     "duration_steps": int,
     "evidence": "short explanation of why this bucket and duration fit",
     "region": [int, int],
@@ -152,8 +155,12 @@ Return STRICT JSON with this schema:
 Parameter rules:
 - `hybrid_up`, `hybrid_down`, `trend_quadratic_up`, `trend_quadratic_down`:
   may include either `math_shift` or `shift_factor`
-- `volatility_increase`:
-  may include `amplify_factor`
+- `volatility_global_scale`:
+  may include `base_noise_scale`, `local_std_target_ratio`, `baseline_offset_ratio`, `trend_preserve`
+- `volatility_local_burst`:
+  may include `background_scale`, `burst_center`, `burst_width`, `burst_amplitude`, `burst_envelope_sharpness`, `baseline_offset_ratio`
+- `volatility_envelope_monotonic`:
+  may include `base_noise_scale`, `start_scale`, `end_scale`, `baseline_offset_ratio`, `trend_preserve`
 - `spike_inject`:
   may include `amplitude`, `width`, `center`
 - `step_shift`:

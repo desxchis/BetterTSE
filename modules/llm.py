@@ -2,11 +2,39 @@ import os
 import time
 from typing import Literal, Optional, List, Optional, Dict, Any
 
-from langchain_openai import ChatOpenAI
 from openai import OpenAI, APIStatusError
 
-from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
-from langchain_core.language_models.chat_models import BaseChatModel
+try:
+    from langchain_openai import ChatOpenAI
+except ImportError:  # pragma: no cover - optional dependency
+    ChatOpenAI = None
+
+try:
+    from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
+    from langchain_core.language_models.chat_models import BaseChatModel
+except ImportError:  # pragma: no cover - optional dependency
+    class BaseMessage:  # type: ignore[override]
+        def __init__(self, content: str = "", **kwargs: Any):
+            self.content = content
+            for key, value in kwargs.items():
+                setattr(self, key, value)
+
+    class SystemMessage(BaseMessage):
+        pass
+
+    class HumanMessage(BaseMessage):
+        pass
+
+    class ToolMessage(BaseMessage):
+        pass
+
+    class AIMessage(BaseMessage):
+        def __init__(self, content: str = "", additional_kwargs: Dict[str, Any] | None = None, **kwargs: Any):
+            super().__init__(content=content, additional_kwargs=additional_kwargs or {}, **kwargs)
+
+    class BaseChatModel:  # type: ignore[override]
+        pass
+from modules.pure_editing_volatility import infer_volatility_subtool_from_text
 from modules.region_localizer import infer_shape_hint, localize_region
 from tool.ts_editors import normalize_llm_plan
 
@@ -57,8 +85,10 @@ def _apply_explicit_prompt_hints(plan: Dict[str, Any], instruction_text: str) ->
         elif shape_hint == "irregular_noise":
             intent["effect_family"] = "volatility"
             intent["direction"] = "neutral"
-            execution["canonical_tool"] = "volatility_increase"
-            execution["tool_name"] = "volatility_increase"
+            routed = infer_volatility_subtool_from_text(instruction_text)
+            execution["canonical_tool"] = routed["canonical_tool"]
+            execution["tool_name"] = routed["tool_name"]
+            execution.setdefault("parameters", {}).update(routed.get("parameters", {}))
         elif shape_hint == "hump":
             intent["effect_family"] = "impulse"
             execution["canonical_tool"] = "impulse_spike"
@@ -238,6 +268,8 @@ def get_llm(
         )
         return llm
     elif source == "OpenAI":
+        if ChatOpenAI is None:
+            raise ImportError("langchain_openai is required for source='OpenAI'. Install langchain-openai or use source='vLLM'.")
         llm = ChatOpenAI(
             model=model_name,
             temperature=temperature,
@@ -327,8 +359,8 @@ def get_event_driven_plan(
         f"You MUST ensure region[0] >= 0 and region[1] <= {ts_length}.\n"
         f"[Allowed Effect Families] trend, seasonality, volatility, impulse, level, shutdown\n"
         f"[Localization Hint] Long trends usually span 20-60 steps; transient shocks usually span 5-20 steps.\n"
-        f"[Temporal Buckets] early=[0,{early_end}), middle=[{early_end},{mid_end}), late=[{mid_end},{ts_length})\n"
-        f"[Anchor Mapping] 清晨/早班/大清早->early; 中午/运行中段/刚才->middle; 深夜/夜间低谷前/半夜->late"
+        f"[Temporal Buckets] early=[0,{early_end}), mid=[{early_end},{mid_end}), late=[{mid_end},{ts_length})\n"
+        f"[Anchor Mapping] 清晨/早班/大清早->early; 中午/运行中段/刚才->mid; 深夜/夜间低谷前/半夜->late"
     )
     
     if client is not None:

@@ -204,6 +204,8 @@ Reference artifacts:
 
 - `tmp/how_much/pure_editing/volatility24_split_validation.json`
 - `tmp/how_much/pure_editing/volatility24_split_validation_v2.json`
+- `tmp/how_much/pure_editing/volclosure24_seed29/pure_editing_volatility_closure_ETTh1_24.json`
+- `tmp/how_much/pure_editing/volclosure24_seed29_split_validation_v3.json`
 
 Validation setup:
 
@@ -256,18 +258,36 @@ Current reading:
 - preservation:
   - current split operators keep preservation unchanged on this audit because edits remain confined to the GT region
 
+Closure retest:
+
+- random-seed-balanced closure benchmark:
+  - `uniform_variance`, `local_burst`, `monotonic_envelope` each collected with quota `8`
+- closure retest (`volclosure24_seed29_split_validation_v3.json`):
+  - `volatility_global_scale`: better rate `0.75`
+  - `volatility_local_burst`: better rate `0.875`
+  - `volatility_envelope_monotonic`: better rate `0.875`
+  - routed split policy: `0.75`
+- routed subpattern reading:
+  - `uniform_variance`: `0.875`
+  - `local_burst`: `0.75`
+  - `monotonic_envelope`: `0.625`
+- note:
+  - the closure gate is now satisfied at operator level
+  - routed monotonic still looks weaker than the other two, but no longer fails the closure standard at the operator level
+
 Current interpretation:
 
 - the volatility family should not be treated as one monolithic canonical tool
-- the split hypothesis is now empirically validated on the current audit set
+- the split hypothesis is now empirically validated on both the audit set and the closure retest
 - `uniform_variance`, `local_burst`, and `monotonic_envelope` now each have a viable dedicated operator path
 - `non_monotonic_envelope` remains a preview case and should not block the main conclusion
+- the split is ready to be connected back to the pure-editing registry, with `non_monotonic_envelope` kept outside the main route
 
 Current next step:
 
 1. keep `non_monotonic_envelope` in preview
-2. run a small stability re-check before registry integration
-3. only then connect the validated split tools back to the BetterTSE canonical/hybrid registry
+2. connect the validated split tools back to the BetterTSE canonical/hybrid registry
+3. run a small full-pipeline sanity check to ensure the new routing does not damage other tool families
 
 ## Go / No-Go
 

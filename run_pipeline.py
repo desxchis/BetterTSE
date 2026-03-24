@@ -48,13 +48,15 @@ if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
 from config import get_api_config
+from modules.experiment_logging import build_pure_editing_record, compute_target_similarity
 from modules.experiment_visualization import (
     build_visualization_dir,
     build_visualization_path,
     save_pipeline_visualization,
 )
-from modules.llm import CustomLLMClient, get_event_driven_plan
-from tool.ts_editors import execute_llm_tool
+from modules.pure_editing_volatility import infer_volatility_subtool_from_text
+from modules.region_localizer import infer_duration_steps, infer_position_bucket, infer_shape_hint
+from tool.ts_editors import EDIT_TOOL_SPECS, execute_llm_tool, normalize_llm_plan
 from tool.tedit_wrapper import TEditWrapper, get_tedit_instance
 from test_scripts.bettertse_cik_official import TSEditEvaluator
 
@@ -105,6 +107,7 @@ def run_pipeline(
     tedit_config_path: Optional[str] = None,
     tedit_device: str = "cpu",
     output_path: str = "results/pipeline/pipeline_results.json",
+    mode: str = "full_bettertse",
     vis_dir: Optional[str] = None,
     save_visualizations: bool = True,
     max_samples: Optional[int] = None,
@@ -118,6 +121,7 @@ def run_pipeline(
         tedit_config_path:  TEdit 配置 .yaml
         tedit_device:       运行设备（"cpu" 或 "cuda:0"）
         output_path:        结果 JSON 输出路径
+        mode:               pipeline mode / ablation setting
         vis_dir:            可视化输出目录；默认 output 同级 visualizations/
         save_visualizations:是否保存逐样本图像
         max_samples:        最多处理样本数（None = 全部）
@@ -149,19 +153,27 @@ def run_pipeline(
         logger.info(f"  可视化输出目录: {vis_dir_obj}")
 
     # ── Stage 1: 初始化 LLM 客户端 ───────────────────────────────────────
-    logger.info("[Stage 1] 初始化 LLM 客户端")
-    api_cfg = get_api_config()
-    if not api_cfg.get("api_key"):
-        raise ValueError(
-            "未设置 API 密钥。请在 .env 文件或环境变量中设置 DEEPSEEK_API_KEY / OPENAI_API_KEY。"
+    llm_client = None
+    get_event_driven_plan_fn = None
+    if mode != "direct_edit":
+        logger.info("[Stage 1] 初始化 LLM 客户端")
+        from modules.llm import CustomLLMClient, get_event_driven_plan
+
+        api_cfg = get_api_config()
+        if not api_cfg.get("api_key"):
+            raise ValueError(
+                "未设置 API 密钥。请在 .env 文件或环境变量中设置 DEEPSEEK_API_KEY / OPENAI_API_KEY。"
+            )
+        llm_client = CustomLLMClient(
+            model_name=api_cfg["model_name"],
+            base_url=api_cfg["base_url"],
+            api_key=api_cfg["api_key"],
+            temperature=0.3,
         )
-    llm_client = CustomLLMClient(
-        model_name=api_cfg["model_name"],
-        base_url=api_cfg["base_url"],
-        api_key=api_cfg["api_key"],
-        temperature=0.3,
-    )
-    logger.info(f"  模型: {api_cfg['model_name']}  |  Base URL: {api_cfg['base_url']}")
+        get_event_driven_plan_fn = get_event_driven_plan
+        logger.info(f"  模型: {api_cfg['model_name']}  |  Base URL: {api_cfg['base_url']}")
+    else:
+        logger.info("[Stage 1] direct_edit 模式跳过 LLM 初始化")
 
     # ── Stage 2: 初始化 TEdit 模型（可选）────────────────────────────────
     tedit: Optional[TEditWrapper] = None
@@ -205,6 +217,10 @@ def run_pipeline(
                 # 优先使用 L2（新闻主播，间接叙事但仍有完整背景）；不存在则取最高 level
                 sorted_ep = sorted(event_prompts, key=lambda x: abs(x.get("level", 0) - 2))
                 vague_prompt = sorted_ep[0].get("prompt", "")
+        if not vague_prompt:
+            vague_prompt = str(sample.get("causal_scenario", "") or "")
+        if not vague_prompt:
+            vague_prompt = str(sample.get("technical_ground_truth", "") or "")
         gt_config = _normalize_gt_config(sample)
 
         if not vague_prompt:
@@ -214,15 +230,24 @@ def run_pipeline(
 
         # ---- Stage 3a: LLM 解析编辑意图 ----------------------------------
         try:
-            plan = get_event_driven_plan(
-                news_text="",
-                instruction_text=vague_prompt,
+            if mode == "direct_edit":
+                full_plan = {}
+            else:
+                full_plan = get_event_driven_plan_fn(
+                    news_text="",
+                    instruction_text=vague_prompt,
+                    ts_length=len(base_ts),
+                    llm=llm_client,
+                )
+            plan = _apply_pipeline_mode(
+                full_plan=full_plan,
+                prompt_text=vague_prompt,
                 ts_length=len(base_ts),
-                llm=llm_client,
+                mode=mode,
             )
             region = plan.get("parameters", {}).get("region", [0, len(base_ts)])
             logger.info(
-                f"  LLM plan: tool={plan.get('tool_name')}  "
+                f"  Pipeline mode={mode}  tool={plan.get('tool_name')}  "
                 f"region={region}  "
                 f"math_shift={plan.get('parameters', {}).get('math_shift', 'N/A')}"
             )
@@ -285,6 +310,7 @@ def run_pipeline(
         gt_intent = gt_config.get("edit_intent_gt", {}) if isinstance(gt_config.get("edit_intent_gt"), dict) else {}
         predicted_intent = plan.get("intent", {}) if isinstance(plan.get("intent"), dict) else {}
         intent_alignment = _compute_intent_alignment(gt_intent, predicted_intent)
+        target_similarity = compute_target_similarity(generated_ts, target_ts)
         visualization_path = None
         if vis_dir_obj is not None:
             visualization_path = build_visualization_path(
@@ -315,24 +341,39 @@ def run_pipeline(
             )
             logger.info(f"  可视化已保存: {visualization_path}")
 
+        metrics_payload = {
+            "t_iou": metrics.t_iou,
+            "feature_accuracy": metrics.feature_accuracy,
+            "mse_edit_region": metrics.mse_edit_region,
+            "mae_edit_region": metrics.mae_edit_region,
+            "mse_preserve_region": metrics.mse_preserve_region,
+            "mae_preserve_region": metrics.mae_preserve_region,
+            "editability_score": metrics.editability_score,
+            "preservability_score": metrics.preservability_score,
+            **target_similarity,
+            "preservation_mae": metrics.mae_preserve_region,
+        }
+        experiment_record = build_pure_editing_record(
+            sample=sample,
+            gt_config=gt_config,
+            prompt_text=vague_prompt,
+            mode=mode,
+            plan=plan,
+            metrics=metrics_payload,
+            intent_alignment=intent_alignment,
+            visualization_path=str(visualization_path) if visualization_path is not None else None,
+        )
         results.append({
             **_strip_arrays(sample),
+            "mode": mode,
             "generated_ts": np.asarray(generated_ts, dtype=float).tolist(),
             "llm_plan": plan,
             "edit_log": edit_log,
             "intent_alignment": intent_alignment,
             "background_fidelity": bg_fidelity,
             "visualization_path": str(visualization_path) if visualization_path is not None else None,
-            "metrics": {
-                "t_iou": metrics.t_iou,
-                "feature_accuracy": metrics.feature_accuracy,
-                "mse_edit_region": metrics.mse_edit_region,
-                "mae_edit_region": metrics.mae_edit_region,
-                "mse_preserve_region": metrics.mse_preserve_region,
-                "mae_preserve_region": metrics.mae_preserve_region,
-                "editability_score": metrics.editability_score,
-                "preservability_score": metrics.preservability_score,
-            },
+            "metrics": metrics_payload,
+            "experiment_record": experiment_record,
         })
 
     # ── Stage 4: 汇总并保存 ──────────────────────────────────────────────
@@ -346,6 +387,7 @@ def run_pipeline(
         json.dump(
             {
                 "summary": summary,
+                "mode": mode,
                 "run_timestamp_utc": run_timestamp,
                 "visualization_dir": str(vis_dir_obj) if vis_dir_obj is not None else None,
                 "results": results,
@@ -353,6 +395,7 @@ def run_pipeline(
             f,
             ensure_ascii=False,
             indent=2,
+            default=_json_default,
         )
     logger.info(f"\n[Stage 4] 结果已保存: {output_obj}")
 
@@ -362,6 +405,108 @@ def run_pipeline(
 # ---------------------------------------------------------------------------
 # 辅助函数
 # ---------------------------------------------------------------------------
+
+def _direct_tool_choice(prompt_text: str) -> tuple[str, str]:
+    text = str(prompt_text or "")
+    lowered = text.lower()
+    shape = infer_shape_hint(text)
+    down_hints = ("走低", "回落", "下降", "下滑", "停摆", "停机", "降到", "更低位")
+    up_hints = ("走高", "冲高", "抬升", "上扬", "上升", "偏高", "高位")
+
+    if shape == "step":
+        return "step_shift", EDIT_TOOL_SPECS["step_shift"]["canonical_tool"]
+    if shape == "irregular_noise":
+        routed = infer_volatility_subtool_from_text(text)
+        return routed["tool_name"], routed["canonical_tool"]
+    if shape == "hump":
+        return "spike_inject", EDIT_TOOL_SPECS["spike_inject"]["canonical_tool"]
+    if shape == "flatline":
+        return "hybrid_down", EDIT_TOOL_SPECS["hybrid_down"]["canonical_tool"]
+    if any(token in text for token in down_hints):
+        return "hybrid_down", EDIT_TOOL_SPECS["hybrid_down"]["canonical_tool"]
+    if any(token in text for token in up_hints) or "plateau" in lowered:
+        return "hybrid_up", EDIT_TOOL_SPECS["hybrid_up"]["canonical_tool"]
+    return "hybrid_up", EDIT_TOOL_SPECS["hybrid_up"]["canonical_tool"]
+
+
+def _build_direct_edit_plan(prompt_text: str, ts_length: int) -> Dict[str, Any]:
+    tool_name, canonical_tool = _direct_tool_choice(prompt_text)
+    spec = EDIT_TOOL_SPECS.get(tool_name, {})
+    bucket = infer_position_bucket(prompt_text, fallback="mid")
+    shape_hint = infer_shape_hint(prompt_text)
+    duration = infer_duration_steps(
+        prompt_text,
+        ts_length,
+        effect_family=str(spec.get("effect_family", "")),
+        canonical_tool=canonical_tool,
+        shape=shape_hint,
+    )
+    if bucket == "full":
+        region = [0, int(ts_length)]
+    elif bucket == "late":
+        start = max(0, ts_length - duration)
+        region = [start, min(ts_length, start + duration)]
+    elif bucket == "early":
+        region = [0, min(ts_length, duration)]
+    else:
+        start = max(0, (ts_length - duration) // 2)
+        region = [start, min(ts_length, start + duration)]
+
+    return normalize_llm_plan(
+        {
+            "thought": "direct text-to-executor ablation",
+            "intent": {
+                "effect_family": spec.get("effect_family", "trend"),
+                "direction": spec.get("direction", "neutral"),
+                "shape": shape_hint or spec.get("shape", "linear"),
+                "duration": spec.get("duration", "medium"),
+                "strength": spec.get("strength", "medium"),
+            },
+            "localization": {
+                "position_bucket": bucket,
+                "region": region,
+            },
+            "execution": {
+                "tool_name": tool_name,
+                "canonical_tool": canonical_tool,
+                "parameters": {"region": region},
+            },
+        },
+        ts_length=ts_length,
+    )
+
+
+def _apply_pipeline_mode(
+    *,
+    full_plan: Dict[str, Any],
+    prompt_text: str,
+    ts_length: int,
+    mode: str,
+) -> Dict[str, Any]:
+    normalized = normalize_llm_plan(full_plan, ts_length=ts_length)
+    if mode == "full_bettertse":
+        return normalized
+    if mode == "direct_edit":
+        return _build_direct_edit_plan(prompt_text, ts_length)
+    if mode == "wo_localization":
+        ablated = normalize_llm_plan(normalized, ts_length=ts_length)
+        full_region = [0, int(ts_length)]
+        ablated.setdefault("localization", {})["position_bucket"] = "full"
+        ablated["localization"]["region"] = full_region
+        ablated.setdefault("parameters", {})["region"] = full_region
+        ablated.setdefault("execution", {}).setdefault("parameters", {})
+        ablated["execution"]["parameters"]["region"] = full_region
+        return normalize_llm_plan(ablated, ts_length=ts_length)
+    if mode == "wo_canonical_layer":
+        tool_name, _ = _direct_tool_choice(prompt_text)
+        ablated = normalize_llm_plan(normalized, ts_length=ts_length)
+        ablated.pop("canonical_tool", None)
+        ablated["tool_name"] = tool_name
+        ablated.setdefault("execution", {})
+        ablated["execution"]["tool_name"] = tool_name
+        ablated["execution"].pop("canonical_tool", None)
+        return normalize_llm_plan(ablated, ts_length=ts_length)
+    raise ValueError(f"unsupported pipeline mode: {mode}")
 
 def _math_only_edit(
     plan: Dict[str, Any],
@@ -430,6 +575,9 @@ def _compute_summary(valid: List[Dict], total: int) -> Dict[str, Any]:
         "avg_mae_edit_region": _avg("mae_edit_region"),
         "avg_mse_preserve_region": _avg("mse_preserve_region"),
         "avg_mae_preserve_region": _avg("mae_preserve_region"),
+        "avg_mae_vs_target": _avg("mae_vs_target"),
+        "avg_mse_vs_target": _avg("mse_vs_target"),
+        "avg_preservation_mae": _avg("preservation_mae"),
         "avg_editability_score": _avg("editability_score"),
         "avg_preservability_score": _avg("preservability_score"),
         "avg_intent_match_score": _avg_intent("match_score"),
@@ -449,8 +597,11 @@ def _print_summary(summary: Dict[str, Any]) -> None:
     if summary["successful"] > 0:
         logger.info(f"  avg t-IoU:           {summary['avg_t_iou']:.4f}")
         logger.info(f"  avg Feature Acc:     {summary['avg_feature_accuracy']:.4f}")
+        logger.info(f"  avg Target MAE:      {summary['avg_mae_vs_target']:.4f}")
+        logger.info(f"  avg Target MSE:      {summary['avg_mse_vs_target']:.4f}")
         logger.info(f"  avg Edit MSE:        {summary['avg_mse_edit_region']:.4f}")
         logger.info(f"  avg Preserve MSE:    {summary['avg_mse_preserve_region']:.4f}")
+        logger.info(f"  avg Preserve MAE:    {summary['avg_preservation_mae']:.4f}")
         logger.info(f"  avg Editability:     {summary['avg_editability_score']:.4f}")
         logger.info(f"  avg Preservability:  {summary['avg_preservability_score']:.4f}")
         logger.info(f"  avg Intent Match:    {summary.get('avg_intent_match_score', 0.0):.4f}")
@@ -479,6 +630,16 @@ def _compute_intent_alignment(gt_intent: Dict[str, Any], predicted_intent: Dict[
         "direction_match": matches["direction"],
         "match_score": float(np.mean(list(matches.values()))),
     }
+
+
+def _json_default(value: Any) -> Any:
+    if isinstance(value, (np.floating,)):
+        return float(value)
+    if isinstance(value, (np.integer,)):
+        return int(value)
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    raise TypeError(f"Object of type {value.__class__.__name__} is not JSON serializable")
 
 
 # ---------------------------------------------------------------------------
@@ -517,6 +678,12 @@ def main() -> None:
         help="结果 JSON 保存路径（默认: results/pipeline/pipeline_results.json）",
     )
     parser.add_argument(
+        "--mode",
+        default="full_bettertse",
+        choices=["full_bettertse", "direct_edit", "wo_localization", "wo_canonical_layer"],
+        help="pipeline mode / ablation setting",
+    )
+    parser.add_argument(
         "--vis-dir",
         default=None,
         help="逐样本可视化保存目录（默认: output 同级 visualizations/）",
@@ -540,6 +707,7 @@ def main() -> None:
         tedit_config_path=args.tedit_config,
         tedit_device=args.device,
         output_path=args.output,
+        mode=args.mode,
         vis_dir=args.vis_dir,
         save_visualizations=not args.no_save_vis,
         max_samples=args.max_samples,

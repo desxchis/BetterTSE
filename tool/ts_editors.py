@@ -41,6 +41,11 @@ from typing import Any, Dict, Optional, Tuple
 import numpy as np
 import torch
 
+from modules.pure_editing_volatility import (
+    volatility_envelope_monotonic,
+    volatility_global_scale,
+    volatility_burst_local,
+)
 from tool.tedit_wrapper import TEditWrapper, get_tedit_instance
 
 
@@ -132,6 +137,39 @@ EDIT_TOOL_SPECS: Dict[str, Dict[str, Any]] = {
         "duration": "short_or_medium",
         "strength": "medium",
         "description": "Increase local fluctuations without shifting the mean level.",
+    },
+    "volatility_global_scale": {
+        "canonical_tool": "volatility_global_scale",
+        "control_source": "math_only",
+        "tool_layer": "derived",
+        "effect_family": "volatility",
+        "direction": "neutral",
+        "shape": "irregular_noise",
+        "duration": "short_or_medium",
+        "strength": "medium",
+        "description": "Replace a local region with low-baseline higher-variance noise.",
+    },
+    "volatility_local_burst": {
+        "canonical_tool": "volatility_local_burst",
+        "control_source": "math_only",
+        "tool_layer": "derived",
+        "effect_family": "volatility",
+        "direction": "neutral",
+        "shape": "irregular_noise",
+        "duration": "short_or_medium",
+        "strength": "strong",
+        "description": "Inject a localized burst-shaped noisy segment.",
+    },
+    "volatility_envelope_monotonic": {
+        "canonical_tool": "volatility_envelope_monotonic",
+        "control_source": "math_only",
+        "tool_layer": "derived",
+        "effect_family": "volatility",
+        "direction": "neutral",
+        "shape": "irregular_noise",
+        "duration": "medium",
+        "strength": "strong",
+        "description": "Inject monotonic envelope-shaped local volatility changes.",
     },
     "spike_inject": {
         "canonical_tool": "impulse_spike",
@@ -270,6 +308,7 @@ def _resolve_math_shift(
     start_idx: int,
     end_idx: int,
     default_shift_factor: float,
+    intent: Optional[Dict[str, Any]] = None,
     sign: float = 1.0,
 ) -> float:
     """Resolve math_shift from explicit value or adaptive shift_factor * std(region).
@@ -279,9 +318,37 @@ def _resolve_math_shift(
     if "math_shift" in params:
         raw_shift = float(params["math_shift"])
         return sign * abs(raw_shift)
+
     region_std = float(np.std(ts[start_idx:end_idx]))
-    factor = abs(float(params.get("shift_factor", default_shift_factor)))
-    return sign * factor * max(region_std, 1e-3)
+    scale = max(region_std, 1e-3)
+
+    amplitude = params.get("amplitude")
+    if amplitude is not None:
+        raw_amp = float(amplitude)
+        if abs(raw_amp) <= 4.0:
+            return raw_amp * scale
+        return raw_amp
+
+    level_shift = params.get("level_shift")
+    if level_shift is not None:
+        raw_level = float(level_shift)
+        if abs(raw_level) <= 4.0:
+            return raw_level * scale
+        return raw_level
+
+    strength_scale = {
+        "weak": 0.75,
+        "light": 0.8,
+        "mild": 0.85,
+        "medium": 1.0,
+        "moderate": 1.0,
+        "strong": 1.2,
+        "large": 1.25,
+        "sharp": 1.3,
+    }
+    strength = str((intent or {}).get("strength", "")).lower()
+    factor = abs(float(params.get("shift_factor", default_shift_factor))) * strength_scale.get(strength, 1.0)
+    return sign * factor * scale
 
 
 def _resolve_spike_parameters(
@@ -304,11 +371,21 @@ def _resolve_spike_parameters(
     direction = (intent or {}).get("direction", "")
     shape = (intent or {}).get("shape", "")
 
-    amplitude = default_amp
-    if direction == "down":
-        amplitude = -abs(amplitude)
-    elif direction == "up":
-        amplitude = abs(amplitude)
+    explicit_amp = params.get("amplitude")
+    if explicit_amp is not None:
+        raw_amp = float(explicit_amp)
+        if abs(raw_amp) <= 4.0:
+            amplitude = raw_amp * max(region_std, 1e-3)
+        else:
+            amplitude = raw_amp
+    else:
+        amplitude = default_amp
+
+    if explicit_amp is None:
+        if direction == "down":
+            amplitude = -abs(amplitude)
+        elif direction == "up":
+            amplitude = abs(amplitude)
 
     if shape == "hump":
         center = start_idx + max(1, region_len // 3)
@@ -316,6 +393,22 @@ def _resolve_spike_parameters(
     else:
         center = (start_idx + end_idx) // 2
         width = max(2.0, region_len / 6.0)
+
+    explicit_center = params.get("center")
+    if explicit_center is not None:
+        raw_center = float(explicit_center)
+        if 0.0 <= raw_center <= 1.0:
+            center = start_idx + int(round(raw_center * max(region_len - 1, 1)))
+        else:
+            center = int(round(raw_center))
+
+    explicit_width = params.get("width")
+    if explicit_width is not None:
+        raw_width = float(explicit_width)
+        if 0.0 < raw_width <= 1.0:
+            width = raw_width * max(region_len, 1)
+        else:
+            width = raw_width
 
     center = max(start_idx, min(center, end_idx - 1))
     width = max(2.0, min(width, max(3.0, region_len / 2.0)))
@@ -350,8 +443,22 @@ def _resolve_step_shift(
     if "math_shift" in params:
         return float(params["math_shift"])
 
+    if "level_shift" in params:
+        raw_level = float(params["level_shift"])
+        region_std = float(np.std(ts[start_idx:end_idx]))
+        if abs(raw_level) <= 4.0:
+            return raw_level * max(region_std, 1e-3)
+        return raw_level
+
+    if "amplitude" in params:
+        raw_amp = float(params["amplitude"])
+        region_std = float(np.std(ts[start_idx:end_idx]))
+        if abs(raw_amp) <= 4.0:
+            return raw_amp * max(region_std, 1e-3)
+        return raw_amp
+
     region_std = float(np.std(ts[start_idx:end_idx]))
-    factor = abs(float(params.get("shift_factor", 4.0)))
+    factor = abs(float(params.get("shift_factor", 2.5)))
     direction = (intent or {}).get("direction", "")
     sign = -1.0 if direction == "down" else 1.0
     return sign * factor * max(region_std, 1e-3)
@@ -404,6 +511,58 @@ def execute_llm_tool(
         log = f"[volatility_increase] region=[{start_idx},{end_idx}], amplify_factor={amplify}"
         return edited_ts, log
 
+    if tool_name == "volatility_global_scale":
+        edited_ts = volatility_global_scale(
+            base_ts=ts,
+            region=[start_idx, end_idx],
+            base_noise_scale=float(params.get("base_noise_scale") or 1.0),
+            local_std_target_ratio=float(params.get("local_std_target_ratio") or 2.0),
+            baseline_offset_ratio=float(params.get("baseline_offset_ratio") or 0.05),
+            trend_preserve=float(params.get("trend_preserve") or 0.0),
+        )
+        log = (
+            f"[volatility_global_scale] region=[{start_idx},{end_idx}], "
+            f"base_noise_scale={float(params.get('base_noise_scale') or 1.0):.2f}, "
+            f"std_ratio={float(params.get('local_std_target_ratio') or 2.0):.2f}"
+        )
+        return edited_ts, log
+
+    if tool_name == "volatility_local_burst":
+        edited_ts = volatility_burst_local(
+            base_ts=ts,
+            region=[start_idx, end_idx],
+            background_scale=float(params.get("background_scale") or 0.5),
+            burst_center=float(params.get("burst_center") or 0.5),
+            burst_width=float(params.get("burst_width") or 0.25),
+            burst_amplitude=float(params.get("burst_amplitude") or 2.4),
+            burst_envelope_sharpness=float(params.get("burst_envelope_sharpness") or 0.8),
+            baseline_offset_ratio=float(params.get("baseline_offset_ratio") or 0.05),
+        )
+        log = (
+            f"[volatility_local_burst] region=[{start_idx},{end_idx}], "
+            f"center={float(params.get('burst_center') or 0.5):.2f}, "
+            f"width={float(params.get('burst_width') or 0.25):.2f}, "
+            f"amplitude={float(params.get('burst_amplitude') or 2.4):.2f}"
+        )
+        return edited_ts, log
+
+    if tool_name == "volatility_envelope_monotonic":
+        edited_ts = volatility_envelope_monotonic(
+            base_ts=ts,
+            region=[start_idx, end_idx],
+            base_noise_scale=float(params.get("base_noise_scale") or 1.0),
+            start_scale=float(params.get("start_scale") or 0.3),
+            end_scale=float(params.get("end_scale") or 2.0),
+            baseline_offset_ratio=float(params.get("baseline_offset_ratio") or 0.05),
+            trend_preserve=float(params.get("trend_preserve") or 0.0),
+        )
+        log = (
+            f"[volatility_envelope_monotonic] region=[{start_idx},{end_idx}], "
+            f"start_scale={float(params.get('start_scale') or 0.3):.2f}, "
+            f"end_scale={float(params.get('end_scale') or 2.0):.2f}"
+        )
+        return edited_ts, log
+
     if tool_name == "spike_inject":
         amplitude, width, center = _resolve_spike_parameters(
             params=params,
@@ -436,29 +595,69 @@ def execute_llm_tool(
     # ── TEdit-backed tools ─────────────────────────────────────────────────────
     if use_soft_boundary:
         if tool_name == "hybrid_up":
-            math_shift = _resolve_math_shift(params, ts, start_idx, end_idx, default_shift_factor=2.0, sign=1.0)
+            math_shift = _resolve_math_shift(
+                params,
+                ts,
+                start_idx,
+                end_idx,
+                default_shift_factor=2.0,
+                intent=intent,
+                sign=1.0,
+            )
             edited_ts = hybrid_up_soft(ts=ts, start_idx=start_idx, end_idx=end_idx, math_shift=math_shift, tedit=tedit)
             log = f"[hybrid_up_soft] region=[{start_idx},{end_idx}], math_shift={math_shift:.3f}"
 
         elif tool_name == "hybrid_down":
             if intent.get("effect_family") == "shutdown" or intent.get("shape") == "flatline":
                 math_shift = (
-                    _resolve_math_shift(params, ts, start_idx, end_idx, default_shift_factor=3.5, sign=-1.0)
+                    _resolve_math_shift(
+                        params,
+                        ts,
+                        start_idx,
+                        end_idx,
+                        default_shift_factor=3.5,
+                        intent=intent,
+                        sign=-1.0,
+                    )
                     if ("math_shift" in params or "shift_factor" in params)
                     else _resolve_shutdown_shift(ts, start_idx, end_idx)
                 )
             else:
-                math_shift = _resolve_math_shift(params, ts, start_idx, end_idx, default_shift_factor=2.0, sign=-1.0)
+                math_shift = _resolve_math_shift(
+                    params,
+                    ts,
+                    start_idx,
+                    end_idx,
+                    default_shift_factor=2.0,
+                    intent=intent,
+                    sign=-1.0,
+                )
             edited_ts = hybrid_down_soft(ts=ts, start_idx=start_idx, end_idx=end_idx, math_shift=math_shift, tedit=tedit)
             log = f"[hybrid_down_soft] region=[{start_idx},{end_idx}], math_shift={math_shift:.3f}"
 
         elif tool_name == "trend_quadratic_up":
-            math_shift = _resolve_math_shift(params, ts, start_idx, end_idx, default_shift_factor=2.5, sign=1.0)
+            math_shift = _resolve_math_shift(
+                params,
+                ts,
+                start_idx,
+                end_idx,
+                default_shift_factor=2.5,
+                intent=intent,
+                sign=1.0,
+            )
             edited_ts = trend_quadratic_up_soft(ts=ts, start_idx=start_idx, end_idx=end_idx, math_shift=math_shift, tedit=tedit)
             log = f"[trend_quadratic_up_soft] region=[{start_idx},{end_idx}], math_shift={math_shift:.3f}"
 
         elif tool_name == "trend_quadratic_down":
-            math_shift = _resolve_math_shift(params, ts, start_idx, end_idx, default_shift_factor=2.5, sign=-1.0)
+            math_shift = _resolve_math_shift(
+                params,
+                ts,
+                start_idx,
+                end_idx,
+                default_shift_factor=2.5,
+                intent=intent,
+                sign=-1.0,
+            )
             edited_ts = trend_quadratic_down_soft(ts=ts, start_idx=start_idx, end_idx=end_idx, math_shift=math_shift, tedit=tedit)
             log = f"[trend_quadratic_down_soft] region=[{start_idx},{end_idx}], math_shift={math_shift:.3f}"
 
@@ -489,29 +688,69 @@ def execute_llm_tool(
 
     else:  # hard boundary (legacy)
         if tool_name == "hybrid_up":
-            math_shift = _resolve_math_shift(params, ts, start_idx, end_idx, default_shift_factor=2.0, sign=1.0)
+            math_shift = _resolve_math_shift(
+                params,
+                ts,
+                start_idx,
+                end_idx,
+                default_shift_factor=2.0,
+                intent=intent,
+                sign=1.0,
+            )
             edited_ts = hybrid_up(ts=ts, start_idx=start_idx, end_idx=end_idx, math_shift=math_shift, tedit=tedit)
             log = f"[hybrid_up] region=[{start_idx},{end_idx}], math_shift={math_shift:.3f}"
 
         elif tool_name == "hybrid_down":
             if intent.get("effect_family") == "shutdown" or intent.get("shape") == "flatline":
                 math_shift = (
-                    _resolve_math_shift(params, ts, start_idx, end_idx, default_shift_factor=3.5, sign=-1.0)
+                    _resolve_math_shift(
+                        params,
+                        ts,
+                        start_idx,
+                        end_idx,
+                        default_shift_factor=3.5,
+                        intent=intent,
+                        sign=-1.0,
+                    )
                     if ("math_shift" in params or "shift_factor" in params)
                     else _resolve_shutdown_shift(ts, start_idx, end_idx)
                 )
             else:
-                math_shift = _resolve_math_shift(params, ts, start_idx, end_idx, default_shift_factor=2.0, sign=-1.0)
+                math_shift = _resolve_math_shift(
+                    params,
+                    ts,
+                    start_idx,
+                    end_idx,
+                    default_shift_factor=2.0,
+                    intent=intent,
+                    sign=-1.0,
+                )
             edited_ts = hybrid_down(ts=ts, start_idx=start_idx, end_idx=end_idx, math_shift=math_shift, tedit=tedit)
             log = f"[hybrid_down] region=[{start_idx},{end_idx}], math_shift={math_shift:.3f}"
 
         elif tool_name == "trend_quadratic_up":
-            math_shift = _resolve_math_shift(params, ts, start_idx, end_idx, default_shift_factor=2.5, sign=1.0)
+            math_shift = _resolve_math_shift(
+                params,
+                ts,
+                start_idx,
+                end_idx,
+                default_shift_factor=2.5,
+                intent=intent,
+                sign=1.0,
+            )
             edited_ts = trend_quadratic_up(ts=ts, start_idx=start_idx, end_idx=end_idx, math_shift=math_shift, tedit=tedit)
             log = f"[trend_quadratic_up] region=[{start_idx},{end_idx}], math_shift={math_shift:.3f}"
 
         elif tool_name == "trend_quadratic_down":
-            math_shift = _resolve_math_shift(params, ts, start_idx, end_idx, default_shift_factor=2.5, sign=-1.0)
+            math_shift = _resolve_math_shift(
+                params,
+                ts,
+                start_idx,
+                end_idx,
+                default_shift_factor=2.5,
+                intent=intent,
+                sign=-1.0,
+            )
             edited_ts = trend_quadratic_down(ts=ts, start_idx=start_idx, end_idx=end_idx, math_shift=math_shift, tedit=tedit)
             log = f"[trend_quadratic_down] region=[{start_idx},{end_idx}], math_shift={math_shift:.3f}"
 

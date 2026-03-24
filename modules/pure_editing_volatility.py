@@ -6,6 +6,17 @@ from typing import Any, Dict, List, Tuple
 import numpy as np
 
 
+LOCAL_BURST_HINTS = (
+    "局部", "一段", "短时", "短窗口", "突发", "骤然", "瞬时", "片段", "某段",
+)
+MONOTONIC_UP_HINTS = (
+    "逐渐加剧", "越来越乱", "逐步失真", "持续恶化", "波动逐步放大", "后面更乱",
+)
+MONOTONIC_DOWN_HINTS = (
+    "逐渐恢复", "逐步恢复", "逐步平稳", "慢慢恢复", "波动逐步减弱", "前面更乱",
+)
+
+
 @dataclass
 class VolatilityAuditResult:
     operator_name: str
@@ -24,6 +35,57 @@ class VolatilityAuditResult:
             "edited_ts": list(self.edited_ts),
             "search_space_size": int(self.search_space_size),
         }
+
+
+def infer_volatility_subtool_from_text(text: str) -> Dict[str, Any]:
+    normalized = str(text or "")
+    if any(token in normalized for token in LOCAL_BURST_HINTS):
+        return {
+            "tool_name": "volatility_local_burst",
+            "canonical_tool": "volatility_local_burst",
+            "parameters": {
+                "background_scale": 0.5,
+                "burst_center": 0.5,
+                "burst_width": 0.25,
+                "burst_amplitude": 2.4,
+                "burst_envelope_sharpness": 0.8,
+                "baseline_offset_ratio": 0.05,
+            },
+        }
+    if any(token in normalized for token in MONOTONIC_UP_HINTS):
+        return {
+            "tool_name": "volatility_envelope_monotonic",
+            "canonical_tool": "volatility_envelope_monotonic",
+            "parameters": {
+                "base_noise_scale": 1.0,
+                "start_scale": 0.3,
+                "end_scale": 2.0,
+                "baseline_offset_ratio": 0.05,
+                "trend_preserve": 0.0,
+            },
+        }
+    if any(token in normalized for token in MONOTONIC_DOWN_HINTS):
+        return {
+            "tool_name": "volatility_envelope_monotonic",
+            "canonical_tool": "volatility_envelope_monotonic",
+            "parameters": {
+                "base_noise_scale": 1.0,
+                "start_scale": 2.0,
+                "end_scale": 0.3,
+                "baseline_offset_ratio": 0.05,
+                "trend_preserve": 0.0,
+            },
+        }
+    return {
+        "tool_name": "volatility_global_scale",
+        "canonical_tool": "volatility_global_scale",
+        "parameters": {
+            "base_noise_scale": 1.0,
+            "local_std_target_ratio": 2.0,
+            "baseline_offset_ratio": 0.05,
+            "trend_preserve": 0.0,
+        },
+    }
 
 
 def _safe_region(region: List[int], length: int) -> Tuple[int, int]:
@@ -340,23 +402,25 @@ def volatility_piecewise_envelope_noise(
 def volatility_envelope_monotonic(
     base_ts: np.ndarray,
     region: List[int],
-    noise_scale: float,
+    base_noise_scale: float,
     start_scale: float,
     end_scale: float,
-    bias_ratio: float,
+    baseline_offset_ratio: float,
+    trend_preserve: float,
     seed: int = 31,
 ) -> np.ndarray:
     base = np.asarray(base_ts, dtype=np.float64).copy()
     start, end = _safe_region(region, len(base))
-    trend, residual = _base_trend_and_residual(base, start, end)
+    trend, _ = _base_trend_and_residual(base, start, end)
     region_len = end - start
     envelope = np.linspace(start_scale, end_scale, region_len, dtype=np.float64)
     envelope = np.clip(envelope, 0.0, 4.0)
-    rng = np.random.RandomState(seed + start + end + int(round(noise_scale * 10)))
-    residual_std = max(float(np.std(residual)), 1e-3)
-    noise = rng.normal(loc=0.0, scale=residual_std * noise_scale, size=region_len)
-    bias = np.linspace(0.0, bias_ratio * residual_std, region_len, dtype=np.float64)
-    new_region = trend + residual + noise * envelope + bias
+    data_min, data_range, data_std = _global_series_stats(base)
+    baseline = data_min + data_range * baseline_offset_ratio
+    rng = np.random.RandomState(seed + start + end + int(round(base_noise_scale * 10)))
+    raw_noise = rng.normal(loc=0.0, scale=data_std * base_noise_scale, size=region_len)
+    trend_component = trend_preserve * (trend - float(np.mean(trend)))
+    new_region = baseline + trend_component + raw_noise * envelope
     base[start:end] = new_region
     return base.astype(np.float32)
 
@@ -462,16 +526,20 @@ def _candidate_grid(operator_name: str) -> List[Dict[str, Any]]:
         return grid
     if operator_name == "volatility_envelope_monotonic":
         grid = []
-        for noise_scale in (0.8, 1.2, 1.6, 2.0, 2.6):
-            for start_scale in (0.2, 0.6, 1.2, 2.0):
-                for end_scale in (0.2, 0.6, 1.2, 2.0, 3.0):
-                    for bias in (-0.2, 0.0, 0.2):
+        for base_noise_scale in (0.8, 1.0, 1.2):
+            for start_scale in (0.2, 0.5, 0.8, 1.2):
+                for end_scale in (0.8, 1.2, 2.0, 3.0):
+                    for baseline_offset in (0.02, 0.05, 0.08, 0.12):
+                        for trend_preserve in (0.0, 0.08, 0.16):
+                            if abs(end_scale - start_scale) < 0.2:
+                                continue
                         grid.append(
                             {
-                                "noise_scale": float(noise_scale),
+                                "base_noise_scale": float(base_noise_scale),
                                 "start_scale": float(start_scale),
                                 "end_scale": float(end_scale),
-                                "bias_ratio": float(bias),
+                                "baseline_offset_ratio": float(baseline_offset),
+                                "trend_preserve": float(trend_preserve),
                             }
                         )
         return grid
