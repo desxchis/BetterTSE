@@ -414,6 +414,10 @@ Reference artifacts:
 - `tmp/pipeline_full_mainline20_volsubtype_v2.json`
 - `tmp/pipeline_direct_mainline20_volsubtype_v2.json`
 - `tmp/pipeline_full_mainline20_volsubtype_v2_routing.json`
+- `tmp/event_driven_mainline24_volsubtype_v2_monotonic/event_driven_testset_ETTh1_20_volsubtype_v2.json`
+- `tmp/pipeline_full_mainline24_volsubtype_v2_monotonic.json`
+- `tmp/pipeline_direct_mainline24_volsubtype_v2_monotonic.json`
+- `tmp/pipeline_full_mainline24_volsubtype_v2_monotonic_routing.json`
 
 What changed:
 
@@ -470,6 +474,67 @@ Current interpretation:
 - the previous mainline routing failures were benchmark-prompt granularity failures, not routing-system failures
 - once benchmark volatility prompts are made subtype-aware, the route bottleneck disappears on the current 20-sample rerun
 
+## Mainline Volatility-Subtype-Aware Benchmark v2 With Monotonic Coverage
+
+Reference artifacts:
+
+- `tmp/event_driven_mainline24_volsubtype_v2_monotonic/event_driven_testset_ETTh1_20_volsubtype_v2.json`
+- `tmp/pipeline_full_mainline24_volsubtype_v2_monotonic.json`
+- `tmp/pipeline_direct_mainline24_volsubtype_v2_monotonic.json`
+- `tmp/pipeline_full_mainline24_volsubtype_v2_monotonic_routing.json`
+
+What changed:
+
+- the v2 refresh path can now supplement the mainline with additional `noise_injection` samples until a requested monotonic coverage target is met
+- the generated monotonic samples reuse the same subtype-aware prompt template as the mainline v2 refresh
+- this closes the only known mainline-v2 coverage hole from the earlier 20-sample rerun
+
+Current volatility distribution on the 22-sample monotonic-augmented mainline v2 benchmark:
+
+- `global_scale`: `1`
+- `local_burst`: `2`
+- `envelope_monotonic`: `2`
+- `preview_non_monotonic`: `3`
+
+Formal rerun on the monotonic-augmented mainline v2 benchmark:
+
+- `full_bettertse`
+  - target MAE `1.1591`
+  - target MSE `20.0611`
+  - t-IoU `0.2959`
+  - preservation MAE `0.6212`
+- `direct_edit`
+  - target MAE `1.2752`
+  - target MSE `22.1279`
+  - t-IoU `0.1798`
+  - preservation MAE `0.5518`
+
+Volatility routing diagnosis on the monotonic-augmented rerun:
+
+- `total_volatility_cases`: `8`
+- `preview_case_count`: `3`
+- `fallback_or_unsupported_count`: `0`
+- `overall_route_correct_rate`: `1.00`
+- `overall_subtype_correct_rate`: `1.00`
+- `preview_not_misrouted_rate`: `1.00`
+
+Per-subpattern routed reading:
+
+- `uniform_variance`
+  - `1/1` routed to `volatility_global_scale`
+- `local_burst`
+  - `2/2` routed to `volatility_local_burst`
+- `monotonic_envelope`
+  - `2/2` routed to `volatility_envelope_monotonic`
+- `non_monotonic_envelope`
+  - `3/3` kept on preview-side routing with `final_subtype = preview_non_monotonic`
+
+Current interpretation:
+
+- the subtype-aware mainline no longer has a volatility coverage hole; all three supported volatility subtypes are now exercised in the formal rerun
+- once the benchmark text explicitly carries subtype semantics, the routed split policy remains stable in the live main pipeline, including `envelope_monotonic`
+- the remaining pure-editing volatility question is no longer about routing correctness on the current mainline v2 path
+
 ## Go / No-Go
 
 Go:
@@ -491,6 +556,6 @@ The next step is still not operator redesign or student work.
 
 It is:
 
-1. treat the subtype-aware mainline benchmark v2 as the current volatility-aware pure-editing mainline
+1. treat the subtype-aware mainline benchmark v2, with monotonic supplementation when needed, as the current volatility-aware pure-editing mainline
 2. if more statistical confidence is needed, scale the same v2 refresh procedure beyond 20 samples before reopening student discussions
 3. keep legacy generic volatility prompts as historical artifacts, not as the authoritative routing benchmark
