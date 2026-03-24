@@ -15,13 +15,14 @@ if str(_ROOT) not in sys.path:
 
 from modules.pure_editing_volatility import (
     classify_volatility_pattern,
+    classify_volatility_subpattern,
     compute_volatility_audit_metrics,
     heuristic_volatility_operator,
     search_best_volatility_operator,
 )
 
 
-OPERATORS = ("global_subwindow", "burst_local", "envelope_noise")
+OPERATORS = ("global_subwindow", "burst_local", "envelope_noise", "piecewise_envelope_noise")
 
 
 def _mean(rows: List[Dict[str, Any]], key: str) -> float:
@@ -93,6 +94,7 @@ def main() -> None:
         target_region = target_ts[region[0] : region[1]]
         base_region = base_ts[region[0] : region[1]]
         volatility_pattern = classify_volatility_pattern(target_region, base_region)
+        volatility_subpattern = classify_volatility_subpattern(target_region, base_region)
         heuristic_ts = heuristic_volatility_operator(base_ts, region)
         heuristic_metrics = compute_volatility_audit_metrics(
             base_ts=base_ts,
@@ -115,6 +117,7 @@ def main() -> None:
                     "strength_bucket": (sample.get("stress_metadata") or {}).get("strength_bucket", "unknown"),
                     "target_energy_type": (sample.get("stress_metadata") or {}).get("target_energy_type", "unknown"),
                     "volatility_pattern": volatility_pattern,
+                    "volatility_subpattern": volatility_subpattern,
                     "teacher_params": teacher.params,
                     "teacher_search_space_size": teacher.search_space_size,
                     "teacher_mae_vs_target": teacher.metrics["mae_vs_target"],
@@ -142,6 +145,7 @@ def main() -> None:
             "duration_bucket": _bucket_summary(rows, "duration_bucket"),
             "target_energy_type": _bucket_summary(rows, "target_energy_type"),
             "volatility_pattern": _bucket_summary(rows, "volatility_pattern"),
+            "volatility_subpattern": _bucket_summary(rows, "volatility_subpattern"),
         },
         "results": rows,
     }

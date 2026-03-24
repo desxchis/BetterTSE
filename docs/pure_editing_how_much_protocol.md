@@ -172,6 +172,11 @@ Current reading:
   - best current operator
   - clearly improves `local_std_error`, `roughness_error`, and `windowed_energy_profile_error`
   - still fails the current go threshold
+- `piecewise_envelope_noise`
+  - teacher better rate `0.42`
+  - strongest current operator on structural volatility metrics
+  - `local_std_error`, `roughness_error`, and `windowed_energy_profile_error` all improve sharply over heuristic
+  - but target MAE still lags, so the operator is structurally better but not yet a stable replacement
 
 Pattern reading for `envelope_noise`:
 
@@ -179,10 +184,18 @@ Pattern reading for `envelope_noise`:
 - `uniform_variance`: better rate `0.67`
 - `time_varying_envelope`: better rate `0.50`
 
+Pattern reading for `piecewise_envelope_noise`:
+
+- `monotonic_envelope`: better rate `1.00`
+- `non_monotonic_envelope`: better rate `0.50`
+- `local_burst`: better rate `0.00`
+- `uniform_variance`: better rate `0.33`
+
 Current interpretation:
 
 - the weakness is not only search-space width; the original global operator is too coarse
 - moving from global variance amplification to envelope-shaped synthetic noise is directionally correct
+- `piecewise_envelope_noise` confirms the missing part is now objective/operator alignment, not pure expressivity
 - even the best current redesign is not strong enough to unlock student distillation
 
 ## Go / No-Go
@@ -219,6 +232,7 @@ Current volatility gate:
   - `local_std_error` clearly below heuristic
   - `preservation_mae` not materially worse than heuristic
 - current status:
-  - best operator is `envelope_noise`
-  - teacher better rate is only `0.58`
+  - best MAE operator is still `envelope_noise`
+  - strongest structure-matching operator is `piecewise_envelope_noise`
+  - neither crosses the gate
   - therefore volatility remains in tool-audit mode

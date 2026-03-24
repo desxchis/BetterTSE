@@ -78,6 +78,28 @@ def classify_volatility_pattern(target_region: np.ndarray, base_region: np.ndarr
     return "time_varying_envelope"
 
 
+def classify_volatility_subpattern(target_region: np.ndarray, base_region: np.ndarray, num_windows: int = 4) -> str:
+    pattern = classify_volatility_pattern(target_region, base_region, num_windows=num_windows)
+    if pattern != "time_varying_envelope":
+        return pattern
+    windows = _window_splits(0, len(target_region), num_windows=num_windows)
+    energies = []
+    for start, end in windows:
+        target_energy = float(np.mean(np.square(np.diff(target_region[start:end])))) if end - start > 1 else 0.0
+        base_energy = float(np.mean(np.square(np.diff(base_region[start:end])))) if end - start > 1 else 0.0
+        energies.append(max(target_energy - base_energy, 0.0))
+    arr = np.asarray(energies, dtype=np.float64)
+    if arr.size < 3:
+        return "monotonic_envelope"
+    diffs = np.diff(arr)
+    signs = np.sign(diffs[np.abs(diffs) > 1e-8])
+    if signs.size <= 1:
+        return "monotonic_envelope"
+    if np.all(signs >= 0) or np.all(signs <= 0):
+        return "monotonic_envelope"
+    return "non_monotonic_envelope"
+
+
 def compute_volatility_audit_metrics(
     *,
     base_ts: np.ndarray,
@@ -210,6 +232,37 @@ def volatility_envelope_noise(
     return base.astype(np.float32)
 
 
+def volatility_piecewise_envelope_noise(
+    base_ts: np.ndarray,
+    region: List[int],
+    noise_scale: float,
+    base_scale: float,
+    knot_1_pos: float,
+    knot_2_pos: float,
+    knot_1_scale: float,
+    knot_2_scale: float,
+    tail_scale: float,
+    seed: int = 23,
+) -> np.ndarray:
+    base = np.asarray(base_ts, dtype=np.float64).copy()
+    start, end = _safe_region(region, len(base))
+    trend, residual = _base_trend_and_residual(base, start, end)
+    region_len = end - start
+    xs = np.linspace(0.0, 1.0, region_len)
+    k1 = float(np.clip(knot_1_pos, 0.05, 0.80))
+    k2 = float(np.clip(knot_2_pos, k1 + 0.05, 0.95))
+    control_x = np.asarray([0.0, k1, k2, 1.0], dtype=np.float64)
+    control_y = np.asarray([base_scale, knot_1_scale, knot_2_scale, tail_scale], dtype=np.float64)
+    envelope = np.interp(xs, control_x, control_y)
+    envelope = np.clip(envelope, 0.0, 4.0)
+    rng = np.random.RandomState(seed + start + end + int(round(noise_scale * 10)))
+    residual_std = max(float(np.std(residual)), 1e-3)
+    raw_noise = rng.normal(loc=0.0, scale=residual_std * noise_scale, size=region_len)
+    new_region = trend + residual + raw_noise * envelope
+    base[start:end] = new_region
+    return base.astype(np.float32)
+
+
 def heuristic_volatility_operator(base_ts: np.ndarray, region: List[int]) -> np.ndarray:
     return volatility_global_subwindow(
         base_ts=np.asarray(base_ts, dtype=np.float32),
@@ -267,6 +320,29 @@ def _candidate_grid(operator_name: str) -> List[Dict[str, Any]]:
                             }
                         )
         return grid
+    if operator_name == "piecewise_envelope_noise":
+        grid = []
+        for noise_scale in (0.8, 1.2, 1.6, 2.0, 2.6):
+            for base_scale in (0.2, 0.5, 0.8):
+                for k1 in (0.2, 0.35, 0.5):
+                    for k2 in (0.55, 0.7, 0.85):
+                        if k2 <= k1:
+                            continue
+                        for s1 in (0.6, 1.2, 2.0, 3.0):
+                            for s2 in (0.6, 1.2, 2.0, 3.0):
+                                for tail in (0.2, 0.8, 1.6):
+                                    grid.append(
+                                        {
+                                            "noise_scale": float(noise_scale),
+                                            "base_scale": float(base_scale),
+                                            "knot_1_pos": float(k1),
+                                            "knot_2_pos": float(k2),
+                                            "knot_1_scale": float(s1),
+                                            "knot_2_scale": float(s2),
+                                            "tail_scale": float(tail),
+                                        }
+                                    )
+        return grid
     raise ValueError(f"unknown volatility operator: {operator_name}")
 
 
@@ -277,6 +353,8 @@ def _apply_operator(operator_name: str, base_ts: np.ndarray, region: List[int], 
         return volatility_burst_local(base_ts, region, **params)
     if operator_name == "envelope_noise":
         return volatility_envelope_noise(base_ts, region, **params)
+    if operator_name == "piecewise_envelope_noise":
+        return volatility_piecewise_envelope_noise(base_ts, region, **params)
     raise ValueError(f"unknown volatility operator: {operator_name}")
 
 
