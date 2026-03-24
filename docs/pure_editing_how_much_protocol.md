@@ -21,6 +21,57 @@ The pure-editing teacher protocol currently compares only:
 
 Do not introduce student variants into the main pure-editing table until the teacher benchmark is large enough to diagnose weak tool families.
 
+## Student Kickoff Status
+
+An experimental pure-editing student path now exists, but it is not yet promoted into the locked main protocol.
+
+Current student design:
+
+- `tool-conditioned heads`, not unified spec
+- supported heads:
+  - `spike_inject`
+  - `step_shift`
+  - `hybrid_up`
+  - `hybrid_down`
+  - `volatility_global_scale`
+  - `volatility_local_burst`
+  - `volatility_envelope_monotonic`
+- `preview_non_monotonic` remains outside the student path on purpose
+
+Current repo entrypoints:
+
+- teacher dump + train:
+  - `test_scripts/train_pure_editing_student.py --testset <event_json> --output-dir <student_dir>`
+- runtime injection:
+  - `run_pipeline.py --how-much-student-model <student_json>`
+
+Current reading:
+
+- ETTh1 24-sample kickoff:
+  - heldout target MAE:
+    - student `0.4292`
+    - teacher `0.4219`
+    - heuristic `0.5248`
+  - student better rate vs heuristic: `1.00`
+- ETTh1 56-sample kickoff:
+  - heldout target MAE:
+    - student `0.4962`
+    - teacher `0.4218`
+    - heuristic `0.5025`
+  - student better rate vs heuristic: `0.64`
+- ETTh1 + ETTm1 combined kickoff:
+  - heldout target MAE:
+    - student `0.5408`
+    - teacher `0.4257`
+    - heuristic `0.5265`
+  - student better rate vs heuristic: `0.44`
+
+Current interpretation:
+
+- the teacher-label dump, tool-conditioned head training, and runtime override path are all functional
+- the current lightweight linear student is not yet stable enough to replace teacher search or enter the main pure-editing result table
+- the next student work should focus on model adequacy and per-tool calibration quality, not on reopening volatility taxonomy or routing
+
 ## Current teacher design
 
 The teacher is tool-conditioned and searches directly in each tool's native parameter space.

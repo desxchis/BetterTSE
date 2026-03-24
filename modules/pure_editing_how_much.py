@@ -5,6 +5,7 @@ from typing import Any, Dict, List, Tuple
 
 import numpy as np
 
+from modules.pure_editing_volatility import search_best_volatility_operator
 from tool.tedit_wrapper import TEditWrapper
 from tool.ts_editors import (
     hybrid_down_soft,
@@ -221,6 +222,79 @@ def teacher_search_pure_editing_params(
     base = np.asarray(base_ts, dtype=np.float32).flatten()
     target = np.asarray(target_ts, dtype=np.float32).flatten()
     safe_region = list(_safe_region(region, len(base)))
+
+    if tool_name == "volatility_global_scale":
+        audit = search_best_volatility_operator(
+            operator_name="volatility_global_scale",
+            base_ts=base,
+            target_ts=target,
+            region=safe_region,
+            objective_variant="global_scale",
+        )
+        return PureEditingTeacherResult(
+            tool_name=tool_name,
+            region=safe_region,
+            params=dict(audit.params),
+            objective=float(audit.objective),
+            metrics={
+                "mae_vs_target": float(audit.metrics["mae_vs_target"]),
+                "mse_vs_target": float(audit.metrics["mse_vs_target"]),
+                "preservation_mae": float(audit.metrics["preservation_mae"]),
+                "peak_delta_error": 0.0,
+                "signed_area_error": 0.0,
+                "duration_error": 0.0,
+            },
+            teacher_sequence=list(audit.edited_ts),
+            search_space_size=int(audit.search_space_size),
+        )
+    if tool_name == "volatility_local_burst":
+        audit = search_best_volatility_operator(
+            operator_name="burst_local",
+            base_ts=base,
+            target_ts=target,
+            region=safe_region,
+            objective_variant="local_burst",
+        )
+        return PureEditingTeacherResult(
+            tool_name=tool_name,
+            region=safe_region,
+            params=dict(audit.params),
+            objective=float(audit.objective),
+            metrics={
+                "mae_vs_target": float(audit.metrics["mae_vs_target"]),
+                "mse_vs_target": float(audit.metrics["mse_vs_target"]),
+                "preservation_mae": float(audit.metrics["preservation_mae"]),
+                "peak_delta_error": 0.0,
+                "signed_area_error": 0.0,
+                "duration_error": 0.0,
+            },
+            teacher_sequence=list(audit.edited_ts),
+            search_space_size=int(audit.search_space_size),
+        )
+    if tool_name == "volatility_envelope_monotonic":
+        audit = search_best_volatility_operator(
+            operator_name="volatility_envelope_monotonic",
+            base_ts=base,
+            target_ts=target,
+            region=safe_region,
+            objective_variant="envelope_monotonic",
+        )
+        return PureEditingTeacherResult(
+            tool_name=tool_name,
+            region=safe_region,
+            params=dict(audit.params),
+            objective=float(audit.objective),
+            metrics={
+                "mae_vs_target": float(audit.metrics["mae_vs_target"]),
+                "mse_vs_target": float(audit.metrics["mse_vs_target"]),
+                "preservation_mae": float(audit.metrics["preservation_mae"]),
+                "peak_delta_error": 0.0,
+                "signed_area_error": 0.0,
+                "duration_error": 0.0,
+            },
+            teacher_sequence=list(audit.edited_ts),
+            search_space_size=int(audit.search_space_size),
+        )
 
     if tool_name == "spike_inject":
         candidates = _spike_candidates(base, safe_region, direction)

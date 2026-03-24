@@ -54,6 +54,7 @@ from modules.experiment_visualization import (
     build_visualization_path,
     save_pipeline_visualization,
 )
+from modules.pure_editing_student import build_student_runtime_override, load_student_model
 from modules.pure_editing_volatility import resolve_volatility_subtype_route
 from modules.region_localizer import infer_duration_steps, infer_position_bucket, infer_shape_hint
 from tool.ts_editors import EDIT_TOOL_SPECS, execute_llm_tool, normalize_llm_plan
@@ -111,6 +112,7 @@ def run_pipeline(
     vis_dir: Optional[str] = None,
     save_visualizations: bool = True,
     max_samples: Optional[int] = None,
+    how_much_student_model: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     运行完整评估 pipeline。
@@ -151,6 +153,10 @@ def run_pipeline(
     vis_dir_obj = build_visualization_dir(output_path, vis_dir) if save_visualizations else None
     if vis_dir_obj is not None:
         logger.info(f"  可视化输出目录: {vis_dir_obj}")
+    pure_editing_student = None
+    if how_much_student_model:
+        pure_editing_student = load_student_model(how_much_student_model)
+        logger.info(f"  how-much student 已加载: {how_much_student_model}")
 
     # ── Stage 1: 初始化 LLM 客户端 ───────────────────────────────────────
     llm_client = None
@@ -245,6 +251,18 @@ def run_pipeline(
                 ts_length=len(base_ts),
                 mode=mode,
             )
+            if pure_editing_student is not None:
+                student_override = build_student_runtime_override(
+                    model=pure_editing_student,
+                    plan=plan,
+                    base_ts=base_ts,
+                    prompt_text=vague_prompt,
+                )
+                if student_override is not None:
+                    plan.setdefault("parameters", {}).update(student_override)
+                    plan.setdefault("execution", {}).setdefault("parameters", {}).update(student_override)
+                    plan["how_much_source"] = "tool_conditioned_student"
+                    plan["how_much_student_override"] = dict(student_override)
             region = plan.get("parameters", {}).get("region", [0, len(base_ts)])
             logger.info(
                 f"  Pipeline mode={mode}  tool={plan.get('tool_name')}  "
@@ -735,6 +753,11 @@ def main() -> None:
         default=None,
         help="最多处理的样本数，用于快速验证（默认: 全部）",
     )
+    parser.add_argument(
+        "--how-much-student-model",
+        default=None,
+        help="可选的 pure-editing tool-conditioned how-much student 模型 JSON；提供后将覆写执行参数层。",
+    )
 
     args = parser.parse_args()
     run_pipeline(
@@ -747,6 +770,7 @@ def main() -> None:
         vis_dir=args.vis_dir,
         save_visualizations=not args.no_save_vis,
         max_samples=args.max_samples,
+        how_much_student_model=args.how_much_student_model,
     )
 
 

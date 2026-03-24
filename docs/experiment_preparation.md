@@ -23,6 +23,7 @@ Current runnable entrypoints:
 - `test_scripts/build_pure_editing_volatility_closure_benchmark.py --csv-path <csv> --output-dir <closure_dir>`
 - `test_scripts/build_pure_editing_volatility_route_closure_benchmark.py --csv-path <csv> --output-dir <route_closure_dir>`
 - `test_scripts/build_event_driven_volatility_subtype_v2.py --benchmark <event_json> --output-dir <v2_dir> [--csv-path <csv> --target-monotonic-count <n>]`
+- `test_scripts/train_pure_editing_student.py --testset <event_json> --output-dir <student_dir> [--testset <event_json_2> ...]`
 - `test_scripts/run_pure_editing_volatility_audit.py --testset <volatility_json> --output <audit_json>`
 - `test_scripts/run_pure_editing_volatility_split_validation.py --testset <volatility_json> --output <split_json>`
 - `test_scripts/run_pure_editing_volatility_route_closure.py --testset <volatility_json> --output <route_json> --routing-source planner_llm|text_guard_only`
@@ -81,6 +82,8 @@ Current scope notes:
 - A post-integration routing analyzer is now available to diagnose whether volatility samples are being sent to the correct split sub-tool.
 - Pure-editing now also has a mainline benchmark refresh script that rewrites only volatility samples into subtype-aware prompts and labels, and can optionally supplement monotonic cases so the mainline pipeline can exercise `global_scale / local_burst / envelope_monotonic / preview_non_monotonic` semantics directly.
 - The subtype-aware mainline refresh has now been validated on both the 56-sample ETTh1 sign-off rerun and a frozen second-distribution ETTm1 rerun; current volatility work is considered system-level stable rather than still exploratory.
+- Pure-editing now also has an experimental tool-conditioned student path: teacher pseudo labels can be dumped and trained with `test_scripts/train_pure_editing_student.py`, and `run_pipeline.py` can optionally inject the learned parameter layer through `--how-much-student-model`.
+- Current student status is still experimental: the ETTh1/ETTm1 kickoff confirms the training and runtime override path works, but the lightweight linear heads do not yet beat the teacher route reliably enough to promote them into the main pure-editing table.
 - Controlled synthetic forecast-revision builders are ready after backbone artifacts exist.
 - Time-MMD projected revision is now exposed as a runnable benchmark path.
 - A single generic projected-target builder across the full standard LTSF dataset pool is still not exposed as one CLI entrypoint.
