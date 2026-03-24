@@ -137,6 +137,48 @@ def _audit_objective(metrics: Dict[str, float]) -> float:
     )
 
 
+def _global_scale_objective(metrics: Dict[str, float]) -> float:
+    return (
+        0.60 * metrics["mae_vs_target"]
+        + 0.01 * metrics["mse_vs_target"]
+        + 0.20 * metrics["local_std_error"]
+        + 0.05 * metrics["roughness_error"]
+        + 0.05 * metrics["windowed_energy_profile_error"]
+    )
+
+
+def _local_burst_objective(metrics: Dict[str, float]) -> float:
+    return (
+        0.55 * metrics["mae_vs_target"]
+        + 0.01 * metrics["mse_vs_target"]
+        + 0.10 * metrics["local_std_error"]
+        + 0.15 * metrics["roughness_error"]
+        + 0.25 * metrics["windowed_energy_profile_error"]
+    )
+
+
+def _envelope_monotonic_objective(metrics: Dict[str, float]) -> float:
+    return (
+        0.55 * metrics["mae_vs_target"]
+        + 0.01 * metrics["mse_vs_target"]
+        + 0.15 * metrics["local_std_error"]
+        + 0.20 * metrics["roughness_error"]
+        + 0.20 * metrics["windowed_energy_profile_error"]
+    )
+
+
+def _objective_for_variant(objective_variant: str, metrics: Dict[str, float]) -> float:
+    if objective_variant == "default":
+        return _audit_objective(metrics)
+    if objective_variant == "global_scale":
+        return _global_scale_objective(metrics)
+    if objective_variant == "local_burst":
+        return _local_burst_objective(metrics)
+    if objective_variant == "envelope_monotonic":
+        return _envelope_monotonic_objective(metrics)
+    raise ValueError(f"unknown objective_variant: {objective_variant}")
+
+
 def _base_trend_and_residual(base_ts: np.ndarray, start: int, end: int) -> Tuple[np.ndarray, np.ndarray]:
     region = np.asarray(base_ts[start:end], dtype=np.float64)
     x = np.arange(len(region), dtype=np.float64)
@@ -173,6 +215,19 @@ def volatility_global_subwindow(
         envelope[rel_start:rel_end] = shape
     envelope = np.clip(envelope, 0.0, 1.0)
     new_region = trend + residual * (1.0 + (amplify_factor - 1.0) * envelope)
+    base[start:end] = new_region
+    return base.astype(np.float32)
+
+
+def volatility_global_scale(
+    base_ts: np.ndarray,
+    region: List[int],
+    amplify_factor: float,
+) -> np.ndarray:
+    base = np.asarray(base_ts, dtype=np.float64).copy()
+    start, end = _safe_region(region, len(base))
+    trend, residual = _base_trend_and_residual(base, start, end)
+    new_region = trend + residual * amplify_factor
     base[start:end] = new_region
     return base.astype(np.float32)
 
@@ -263,6 +318,30 @@ def volatility_piecewise_envelope_noise(
     return base.astype(np.float32)
 
 
+def volatility_envelope_monotonic(
+    base_ts: np.ndarray,
+    region: List[int],
+    noise_scale: float,
+    start_scale: float,
+    end_scale: float,
+    bias_ratio: float,
+    seed: int = 31,
+) -> np.ndarray:
+    base = np.asarray(base_ts, dtype=np.float64).copy()
+    start, end = _safe_region(region, len(base))
+    trend, residual = _base_trend_and_residual(base, start, end)
+    region_len = end - start
+    envelope = np.linspace(start_scale, end_scale, region_len, dtype=np.float64)
+    envelope = np.clip(envelope, 0.0, 4.0)
+    rng = np.random.RandomState(seed + start + end + int(round(noise_scale * 10)))
+    residual_std = max(float(np.std(residual)), 1e-3)
+    noise = rng.normal(loc=0.0, scale=residual_std * noise_scale, size=region_len)
+    bias = np.linspace(0.0, bias_ratio * residual_std, region_len, dtype=np.float64)
+    new_region = trend + residual + noise * envelope + bias
+    base[start:end] = new_region
+    return base.astype(np.float32)
+
+
 def heuristic_volatility_operator(base_ts: np.ndarray, region: List[int]) -> np.ndarray:
     return volatility_global_subwindow(
         base_ts=np.asarray(base_ts, dtype=np.float32),
@@ -275,6 +354,8 @@ def heuristic_volatility_operator(base_ts: np.ndarray, region: List[int]) -> np.
 
 
 def _candidate_grid(operator_name: str) -> List[Dict[str, Any]]:
+    if operator_name == "volatility_global_scale":
+        return [{"amplify_factor": float(v)} for v in (0.8, 1.0, 1.2, 1.5, 2.0, 2.6, 3.2)]
     if operator_name == "global_subwindow":
         grid = []
         for amplify in (1.0, 1.2, 1.5, 2.0, 2.5, 3.0):
@@ -343,10 +424,27 @@ def _candidate_grid(operator_name: str) -> List[Dict[str, Any]]:
                                         }
                                     )
         return grid
+    if operator_name == "volatility_envelope_monotonic":
+        grid = []
+        for noise_scale in (0.8, 1.2, 1.6, 2.0, 2.6):
+            for start_scale in (0.2, 0.6, 1.2, 2.0):
+                for end_scale in (0.2, 0.6, 1.2, 2.0, 3.0):
+                    for bias in (-0.2, 0.0, 0.2):
+                        grid.append(
+                            {
+                                "noise_scale": float(noise_scale),
+                                "start_scale": float(start_scale),
+                                "end_scale": float(end_scale),
+                                "bias_ratio": float(bias),
+                            }
+                        )
+        return grid
     raise ValueError(f"unknown volatility operator: {operator_name}")
 
 
 def _apply_operator(operator_name: str, base_ts: np.ndarray, region: List[int], params: Dict[str, Any]) -> np.ndarray:
+    if operator_name == "volatility_global_scale":
+        return volatility_global_scale(base_ts, region, **params)
     if operator_name == "global_subwindow":
         return volatility_global_subwindow(base_ts, region, **params)
     if operator_name == "burst_local":
@@ -355,6 +453,8 @@ def _apply_operator(operator_name: str, base_ts: np.ndarray, region: List[int], 
         return volatility_envelope_noise(base_ts, region, **params)
     if operator_name == "piecewise_envelope_noise":
         return volatility_piecewise_envelope_noise(base_ts, region, **params)
+    if operator_name == "volatility_envelope_monotonic":
+        return volatility_envelope_monotonic(base_ts, region, **params)
     raise ValueError(f"unknown volatility operator: {operator_name}")
 
 
@@ -364,6 +464,7 @@ def search_best_volatility_operator(
     base_ts: np.ndarray,
     target_ts: np.ndarray,
     region: List[int],
+    objective_variant: str = "default",
 ) -> VolatilityAuditResult:
     base = np.asarray(base_ts, dtype=np.float32)
     target = np.asarray(target_ts, dtype=np.float32)
@@ -380,7 +481,7 @@ def search_best_volatility_operator(
             edited_ts=edited,
             region=region,
         )
-        score = _audit_objective(metrics)
+        score = _objective_for_variant(objective_variant, metrics)
         if score < best_score:
             best_score = score
             best_params = dict(params)

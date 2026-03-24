@@ -21,6 +21,7 @@ Current runnable entrypoints:
 - `test_scripts/run_pure_editing_teacher_search.py --testset <event_driven_json> --output <teacher_json>`
 - `test_scripts/build_pure_editing_how_much_stress_benchmark.py --csv-path <csv> --output-dir <stress_dir>`
 - `test_scripts/run_pure_editing_volatility_audit.py --testset <volatility_json> --output <audit_json>`
+- `test_scripts/run_pure_editing_volatility_split_validation.py --testset <volatility_json> --output <split_json>`
 
 It does not start:
 
@@ -67,6 +68,7 @@ Current scope notes:
 - Pure-editing teacher protocol and bucket definitions are documented in `docs/pure_editing_how_much_protocol.md`.
 - Pure-editing now also has a tool-balanced stress benchmark builder for how-much diagnosis, independent of slow event-prompt generation.
 - Pure-editing now has a volatility-only operator audit path with volatility-structure metrics and operator ablations.
+- Pure-editing now also has an audit-only validator for minimal volatility canonical split hypotheses; it stays outside the main registry until the split proves stable.
 - Controlled synthetic forecast-revision builders are ready after backbone artifacts exist.
 - Time-MMD projected revision is now exposed as a runnable benchmark path.
 - A single generic projected-target builder across the full standard LTSF dataset pool is still not exposed as one CLI entrypoint.

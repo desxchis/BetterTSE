@@ -198,6 +198,69 @@ Current interpretation:
 - `piecewise_envelope_noise` confirms the missing part is now objective/operator alignment, not pure expressivity
 - even the best current redesign is not strong enough to unlock student distillation
 
+## Volatility Canonical Split Validation
+
+Reference artifact:
+
+- `tmp/how_much/pure_editing/volatility24_split_validation.json`
+
+Validation setup:
+
+- benchmark: same volatility-only stress subset used by the audit checkpoint
+- goal: test whether `volatility_increase` should remain one canonical family or be split into smaller sub-tools
+- candidate set:
+  - legacy generic operator: `legacy_generic_envelope`
+  - split candidates:
+    - `volatility_global_scale`
+    - `volatility_local_burst`
+    - `volatility_envelope_monotonic`
+- routing policy:
+  - `uniform_variance -> volatility_global_scale`
+  - `local_burst -> volatility_local_burst`
+  - `monotonic_envelope -> volatility_envelope_monotonic`
+  - `non_monotonic_envelope` is kept outside the routed policy on purpose
+
+Teacher objective specialization:
+
+- `volatility_global_scale`
+  - prioritize `local_std_error`, then MAE
+- `volatility_local_burst`
+  - prioritize `windowed_energy_profile_error`, then `roughness_error`, then MAE
+- `volatility_envelope_monotonic`
+  - prioritize `roughness_error + windowed_energy_profile_error`, then MAE
+
+Current reading:
+
+- overall candidate-level results:
+  - `legacy_generic_envelope`: better rate `0.58`
+  - `volatility_global_scale`: `0.12`
+  - `volatility_local_burst`: `0.46`
+  - `volatility_envelope_monotonic`: `0.38`
+  - `routed_split_policy`: `0.50`
+- structure alignment:
+  - `volatility_envelope_monotonic` sharply improves `local_std_error`, `roughness_error`, and `windowed_energy_profile_error`
+  - but it still loses too much on pointwise target MAE outside the monotonic subset
+- subpattern-level routed reading:
+  - `uniform_variance`: better rate `0.33`
+  - `local_burst`: better rate `0.50`
+  - `monotonic_envelope`: better rate `1.00`
+  - `non_monotonic_envelope`: not routed, kept as preview
+
+Current interpretation:
+
+- the volatility family should not be treated as one monolithic canonical tool
+- the split hypothesis is directionally correct
+- `monotonic_envelope` already behaves like a valid distinct sub-tool
+- `uniform_variance` and `local_burst` are not yet strong enough to promote into the main registry
+- `non_monotonic_envelope` remains a preview case and should not block the main conclusion
+
+Current next step:
+
+1. keep volatility in audit mode
+2. continue split-first validation instead of tuning one generic volatility operator
+3. strengthen `volatility_global_scale` and `volatility_local_burst` separately
+4. only after the split tools each cross the gate should they be connected back to the BetterTSE canonical/hybrid registry
+
 ## Go / No-Go
 
 Go:
