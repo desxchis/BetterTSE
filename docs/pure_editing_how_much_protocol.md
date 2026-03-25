@@ -145,19 +145,21 @@ Current ETTh1 56-sample heldout reading for `mixed_capacity`:
   - teacher gap closed `0.3028`
   - fallback rate `0.82`
 - `clip_softguard`
-  - student MAE `0.4594`
-  - teacher gap closed `0.1513`
-  - fallback rate `0.27`
-  - softguard rate `0.45`
-  - avg guard weight `0.3836`
+  - student MAE `0.4778`
+  - teacher gap closed `0.3868`
+  - fallback rate `0.45`
+  - softguard rate `0.55`
+  - avg guard weight `0.6188`
+  - note: current `clip_softguard` now includes per-tool quality prior and semantic risk calibration
 
 Current ETTh1+ETTm1 combined heldout reading for `mixed_capacity clip_softguard`:
 
-- student MAE `0.5324`
-- heuristic MAE `0.4877`
-- teacher gap closed `-3.8722`
-- fallback rate `0.00`
-- softguard rate `0.125`
+- student MAE `0.4858`
+- heuristic MAE `0.4875`
+- teacher gap closed `0.2091`
+- fallback rate `0.6875`
+- softguard rate `0.0625`
+- avg guard weight `0.7368`
 
 Current ETTh1 20-sample runtime smoke:
 
@@ -175,15 +177,17 @@ Current ETTh1 20-sample runtime smoke:
   - preservation MAE `0.4189`
   - note: this was only validated on the earlier 3-sample smoke because the global guard was too conservative
 - `mixed_capacity clip_softguard`
-  - target MAE `1.1805`
-  - preservation MAE `0.6181`
+  - target MAE `1.1948`
+  - preservation MAE `0.6430`
 
 Current interpretation:
 
 - the best current student is still `mixed_capacity`
 - naive clipping helps heldout MAE but hurts runtime
-- per-tool softguard materially improves deployment safety relative to raw `v1` and plain `clip`
-- however, the student path still does not beat the frozen teacher-backed full chain, and the cross-distribution heldout result remains below heuristic
+- per-tool softguard is now the best balanced deployment candidate:
+  - it restores the combined ETTh1+ETTm1 heldout result to slightly better than heuristic
+  - it remains clearly safer than raw `v1` and plain `clip` on runtime
+- however, the student path still does not beat the frozen teacher-backed full chain on the 20-sample runtime smoke
 - the current bottleneck is therefore deployment calibration for the hardest heads, not taxonomy, routing, or volatility split design
 
 ## Current teacher design

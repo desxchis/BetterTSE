@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import random
 from typing import Any, Dict, List
 
 import numpy as np
@@ -158,12 +159,44 @@ def _tool_name_from_sample(sample: dict[str, Any]) -> str | None:
 
 def _tool_guard_config(tool_name: str) -> dict[str, float]:
     if tool_name in {"step_shift", "hybrid_down"}:
-        return {"support_mult": 1.8, "clip_delta_tol": 1.2, "softguard_gain": 0.15}
+        return {
+            "support_mult": 1.8,
+            "clip_delta_tol": 1.2,
+            "softguard_gain": 0.15,
+            "quality_floor": 0.55,
+            "quality_gain": 0.35,
+            "semantic_gain": 0.35,
+            "heuristic_ratio_tol": 2.5,
+        }
     if tool_name in {"spike_inject", "hybrid_up", "volatility_local_burst"}:
-        return {"support_mult": 1.35, "clip_delta_tol": 0.7, "softguard_gain": 0.45}
+        return {
+            "support_mult": 1.35,
+            "clip_delta_tol": 0.7,
+            "softguard_gain": 0.45,
+            "quality_floor": 0.45,
+            "quality_gain": 0.50,
+            "semantic_gain": 0.55,
+            "heuristic_ratio_tol": 2.0,
+        }
     if tool_name in {"volatility_global_scale", "volatility_envelope_monotonic"}:
-        return {"support_mult": 1.10, "clip_delta_tol": 0.35, "softguard_gain": 0.85}
-    return {"support_mult": 1.25, "clip_delta_tol": 0.5, "softguard_gain": 0.5}
+        return {
+            "support_mult": 1.10,
+            "clip_delta_tol": 0.35,
+            "softguard_gain": 0.85,
+            "quality_floor": 0.35,
+            "quality_gain": 0.70,
+            "semantic_gain": 0.45,
+            "heuristic_ratio_tol": 1.5,
+        }
+    return {
+        "support_mult": 1.25,
+        "clip_delta_tol": 0.5,
+        "softguard_gain": 0.5,
+        "quality_floor": 0.45,
+        "quality_gain": 0.5,
+        "semantic_gain": 0.45,
+        "heuristic_ratio_tol": 2.0,
+    }
 
 
 def build_heuristic_params_for_tool(
@@ -472,6 +505,13 @@ def fit_tool_conditioned_student(
             }
         else:
             head_payload = _fit_mlp_head(X_norm, Y_arr, alpha=alpha, seed=seed + len(rows) + len(tool_name))
+        cv_quality = _estimate_head_cv_quality(
+            tool_name=tool_name,
+            rows=rows,
+            alpha=alpha,
+            model_kind=model_kind,
+            seed=seed,
+        )
         model["tool_heads"][tool_name] = {
             "head_kind": head_kind,
             "feature_mean": feat_mean.tolist(),
@@ -481,6 +521,10 @@ def fit_tool_conditioned_student(
             "target_p05": np.quantile(Y_arr, 0.05, axis=0).tolist(),
             "target_p95": np.quantile(Y_arr, 0.95, axis=0).tolist(),
             "feature_abs_z_p95": float(np.quantile(np.max(np.abs(X_norm), axis=1), 0.95)),
+            "cv_student_mae": float(cv_quality["student_mae"]),
+            "cv_heuristic_mae": float(cv_quality["heuristic_mae"]),
+            "cv_teacher_gap_closed": float(cv_quality["teacher_gap_closed"]),
+            "cv_student_better_rate_vs_heuristic": float(cv_quality["student_better_rate_vs_heuristic"]),
             **head_payload,
         }
     return model
@@ -527,7 +571,7 @@ def predict_tool_conditioned_params(
         raise ValueError(f"unsupported head_kind: {head_kind}")
     clipped_prediction = np.asarray(raw_prediction, dtype=np.float64).copy()
     clipped = False
-    if prediction_variant in {"clip", "clip_guard"}:
+    if prediction_variant in {"clip", "clip_guard", "clip_softguard"}:
         p05 = np.asarray(head.get("target_p05", []), dtype=np.float64)
         p95 = np.asarray(head.get("target_p95", []), dtype=np.float64)
         if p05.size == clipped_prediction.size == p95.size:
@@ -536,8 +580,8 @@ def predict_tool_conditioned_params(
     guard_triggered = False
     guard_reason = None
     guard_weight = 0.0
+    config = _tool_guard_config(tool_name)
     if prediction_variant == "clip_guard":
-        config = _tool_guard_config(tool_name)
         support_limit = float(head.get("feature_abs_z_p95", 4.0)) * config["support_mult"]
         if support_score > support_limit:
             guard_triggered = True
@@ -548,7 +592,6 @@ def predict_tool_conditioned_params(
                 guard_triggered = True
                 guard_reason = "aggressive_clip"
     elif prediction_variant == "clip_softguard":
-        config = _tool_guard_config(tool_name)
         support_limit = float(head.get("feature_abs_z_p95", 4.0)) * config["support_mult"]
         support_risk = max(0.0, (support_score - support_limit) / max(support_limit, 1e-6))
         clip_risk = 0.0
@@ -558,7 +601,36 @@ def predict_tool_conditioned_params(
         if np.any(np.isnan(raw_prediction)) or np.any(np.isinf(raw_prediction)):
             support_risk = max(support_risk, 1.0)
             clip_risk = max(clip_risk, 1.0)
-        guard_weight = float(np.clip(config["softguard_gain"] * max(support_risk, clip_risk), 0.0, 1.0))
+        cv_gap_closed = float(head.get("cv_teacher_gap_closed", 1.0))
+        quality_risk = max(0.0, (config["quality_floor"] - cv_gap_closed) / max(config["quality_floor"], 1e-6))
+        quality_weight = float(np.clip(config["quality_gain"] * quality_risk, 0.0, 1.0))
+        heuristic_params = build_heuristic_params_for_tool(
+            tool_name=tool_name,
+            base_ts=np.asarray(base_ts, dtype=np.float64),
+            region=region,
+            prompt_text=prompt_text,
+        )
+        heuristic_target = params_to_target_vector(
+            tool_name=tool_name,
+            params=heuristic_params,
+            base_ts=np.asarray(base_ts, dtype=np.float64),
+            region=region,
+        )
+        candidate_params = target_vector_to_params(
+            tool_name=tool_name,
+            target=clipped_prediction,
+            base_ts=np.asarray(base_ts, dtype=np.float64),
+            region=region,
+        )
+        semantic_risk = _semantic_risk(
+            tool_name=tool_name,
+            candidate_params=candidate_params,
+            heuristic_params=heuristic_params,
+            intent=intent,
+            ratio_tol=config["heuristic_ratio_tol"],
+        )
+        semantic_weight = float(np.clip(config["semantic_gain"] * semantic_risk, 0.0, 1.0))
+        guard_weight = float(np.clip(max(config["softguard_gain"] * max(support_risk, clip_risk), quality_weight, semantic_weight), 0.0, 1.0))
         if guard_weight >= 0.999:
             guard_triggered = True
             guard_reason = "softguard_full_fallback"
@@ -577,22 +649,11 @@ def predict_tool_conditioned_params(
                 "guard_reason": guard_reason,
                 "clipped": clipped,
                 "guard_weight": 1.0,
+                "cv_teacher_gap_closed": float(head.get("cv_teacher_gap_closed", 1.0)),
             }
         return fallback
     prediction = clipped_prediction if prediction_variant in {"clip", "clip_guard"} else raw_prediction
     if prediction_variant == "clip_softguard":
-        heuristic_params = build_heuristic_params_for_tool(
-            tool_name=tool_name,
-            base_ts=np.asarray(base_ts, dtype=np.float64),
-            region=region,
-            prompt_text=prompt_text,
-        )
-        heuristic_target = params_to_target_vector(
-            tool_name=tool_name,
-            params=heuristic_params,
-            base_ts=np.asarray(base_ts, dtype=np.float64),
-            region=region,
-        )
         prediction = (1.0 - guard_weight) * clipped_prediction + guard_weight * heuristic_target
     params = target_vector_to_params(
         tool_name=tool_name,
@@ -608,6 +669,7 @@ def predict_tool_conditioned_params(
             "guard_reason": guard_reason,
             "clipped": clipped,
             "guard_weight": guard_weight,
+            "cv_teacher_gap_closed": float(head.get("cv_teacher_gap_closed", 1.0)),
         }
     return target_vector_to_params(
         tool_name=tool_name,
@@ -740,3 +802,176 @@ def _predict_mlp_head(x_norm: np.ndarray, head: Dict[str, Any]) -> np.ndarray:
     b2 = np.asarray(head.get("b2", []), dtype=np.float64)
     hidden = np.tanh(x_norm @ w1 + b1)
     return hidden @ w2 + b2
+
+
+def _semantic_risk(
+    *,
+    tool_name: str,
+    candidate_params: dict[str, Any],
+    heuristic_params: dict[str, Any],
+    intent: dict[str, Any],
+    ratio_tol: float,
+) -> float:
+    direction = str(intent.get("direction", "") or "")
+    if tool_name == "spike_inject":
+        cand = abs(float(candidate_params.get("amplitude", 0.0)))
+        heur = max(abs(float(heuristic_params.get("amplitude", 0.0))), 1e-6)
+        mismatch = 1.0 if ((direction == "up" and float(candidate_params.get("amplitude", 0.0)) < 0.0) or (direction == "down" and float(candidate_params.get("amplitude", 0.0)) > 0.0)) else 0.0
+        ratio_risk = max(0.0, cand / (heur * ratio_tol) - 1.0)
+        return max(mismatch, min(1.0, ratio_risk))
+    if tool_name == "step_shift":
+        cand = abs(float(candidate_params.get("level_shift", 0.0)))
+        heur = max(abs(float(heuristic_params.get("level_shift", 0.0))), 1e-6)
+        mismatch = 1.0 if ((direction == "up" and float(candidate_params.get("level_shift", 0.0)) < 0.0) or (direction == "down" and float(candidate_params.get("level_shift", 0.0)) > 0.0)) else 0.0
+        ratio_risk = max(0.0, cand / (heur * ratio_tol) - 1.0)
+        return max(mismatch, min(1.0, ratio_risk))
+    if tool_name in {"hybrid_up", "hybrid_down"}:
+        cand = abs(float(candidate_params.get("math_shift", 0.0)))
+        heur = max(abs(float(heuristic_params.get("math_shift", 0.0))), 1e-6)
+        ratio_risk = max(0.0, cand / (heur * ratio_tol) - 1.0)
+        return min(1.0, ratio_risk)
+    if tool_name == "volatility_global_scale":
+        cand = float(candidate_params.get("local_std_target_ratio", 1.0))
+        heur = max(float(heuristic_params.get("local_std_target_ratio", 1.0)), 1e-6)
+        return min(1.0, max(0.0, cand / (heur * ratio_tol) - 1.0))
+    if tool_name == "volatility_local_burst":
+        cand = float(candidate_params.get("burst_amplitude", 1.0))
+        heur = max(float(heuristic_params.get("burst_amplitude", 1.0)), 1e-6)
+        return min(1.0, max(0.0, cand / (heur * ratio_tol) - 1.0))
+    if tool_name == "volatility_envelope_monotonic":
+        cand = max(float(candidate_params.get("start_scale", 0.0)), float(candidate_params.get("end_scale", 0.0)))
+        heur = max(float(heuristic_params.get("start_scale", 0.0)), float(heuristic_params.get("end_scale", 0.0)), 1e-6)
+        return min(1.0, max(0.0, cand / (heur * ratio_tol) - 1.0))
+    return 0.0
+
+
+def _fit_head_from_xy(x_norm: np.ndarray, y_arr: np.ndarray, *, head_kind: str, alpha: float, seed: int) -> Dict[str, Any]:
+    if head_kind in {"linear", "quadratic"}:
+        x_aug = _expand_design_matrix(x_norm, head_kind)
+        if len(y_arr) == 1:
+            weights = np.zeros((x_aug.shape[1], y_arr.shape[1]), dtype=np.float64)
+            weights[-1, :] = y_arr[0]
+        else:
+            reg = alpha * np.eye(x_aug.shape[1], dtype=np.float64)
+            reg[-1, -1] = 0.0
+            weights = np.linalg.solve(x_aug.T @ x_aug + reg, x_aug.T @ y_arr)
+        return {"head_kind": head_kind, "weights": weights.tolist()}
+    if head_kind == "mlp":
+        return _fit_mlp_head(x_norm, y_arr, alpha=alpha, seed=seed)
+    raise ValueError(f"unsupported head_kind: {head_kind}")
+
+
+def _predict_head_from_xy(x_norm: np.ndarray, head: Dict[str, Any]) -> np.ndarray:
+    head_kind = str(head.get("head_kind", "linear"))
+    if head_kind in {"linear", "quadratic"}:
+        x_aug = _expand_feature_vector(x_norm, head_kind)
+        weights = np.asarray(head.get("weights", []), dtype=np.float64)
+        return x_aug @ weights
+    if head_kind == "mlp":
+        return _predict_mlp_head(x_norm, head)
+    raise ValueError(f"unsupported head_kind: {head_kind}")
+
+
+def _estimate_head_cv_quality(
+    *,
+    tool_name: str,
+    rows: list[dict[str, Any]],
+    alpha: float,
+    model_kind: str,
+    seed: int,
+) -> dict[str, float]:
+    if len(rows) <= 1:
+        return {
+            "student_mae": 0.0,
+            "heuristic_mae": 0.0,
+            "teacher_gap_closed": 1.0,
+            "student_better_rate_vs_heuristic": 1.0,
+        }
+    idxs = list(range(len(rows)))
+    rng = random.Random(seed + len(rows) + len(tool_name))
+    rng.shuffle(idxs)
+    if len(rows) <= 8:
+        folds = [[i] for i in idxs]
+    else:
+        fold_count = min(3, len(rows))
+        folds = [idxs[i::fold_count] for i in range(fold_count)]
+    student_errs: list[float] = []
+    heuristic_errs: list[float] = []
+    better_flags: list[float] = []
+    head_kind = _resolve_head_kind(model_kind, tool_name)
+    for fold_id, heldout in enumerate(folds):
+        train = [rows[i] for i in idxs if i not in heldout]
+        if not train:
+            continue
+        x_train = []
+        y_train = []
+        for row in train:
+            base_ts = np.asarray(row["base_ts"], dtype=np.float64)
+            region = list(row["region"])
+            x_train.append(build_student_feature_vector(
+                tool_name=tool_name,
+                base_ts=base_ts,
+                region=region,
+                prompt_text=str(row.get("prompt_text", "")),
+                intent=dict(row.get("intent") or {}),
+            ))
+            y_train.append(params_to_target_vector(
+                tool_name=tool_name,
+                params=dict(row["teacher_params"]),
+                base_ts=base_ts,
+                region=region,
+            ))
+        x_train_arr = np.asarray(x_train, dtype=np.float64)
+        y_train_arr = np.asarray(y_train, dtype=np.float64)
+        feat_mean = x_train_arr.mean(axis=0)
+        feat_std = x_train_arr.std(axis=0)
+        feat_std = np.where(feat_std < 1e-6, 1.0, feat_std)
+        x_train_norm = (x_train_arr - feat_mean) / feat_std
+        head = _fit_head_from_xy(x_train_norm, y_train_arr, head_kind=head_kind, alpha=alpha, seed=seed + fold_id)
+        for i in heldout:
+            row = rows[i]
+            base_ts = np.asarray(row["base_ts"], dtype=np.float64)
+            region = list(row["region"])
+            teacher_target = params_to_target_vector(
+                tool_name=tool_name,
+                params=dict(row["teacher_params"]),
+                base_ts=base_ts,
+                region=region,
+            )
+            heuristic_target = params_to_target_vector(
+                tool_name=tool_name,
+                params=build_heuristic_params_for_tool(
+                    tool_name=tool_name,
+                    base_ts=base_ts,
+                    region=region,
+                    prompt_text=str(row.get("prompt_text", "")),
+                ),
+                base_ts=base_ts,
+                region=region,
+            )
+            x = build_student_feature_vector(
+                tool_name=tool_name,
+                base_ts=base_ts,
+                region=region,
+                prompt_text=str(row.get("prompt_text", "")),
+                intent=dict(row.get("intent") or {}),
+            )
+            x_norm = (x - feat_mean) / feat_std
+            pred = _predict_head_from_xy(x_norm, head)
+            student_err = float(np.mean(np.abs(pred - teacher_target)))
+            heuristic_err = float(np.mean(np.abs(heuristic_target - teacher_target)))
+            student_errs.append(student_err)
+            heuristic_errs.append(heuristic_err)
+            better_flags.append(1.0 if student_err < heuristic_err else 0.0)
+    student_mae = float(np.mean(student_errs)) if student_errs else 0.0
+    heuristic_mae = float(np.mean(heuristic_errs)) if heuristic_errs else 0.0
+    gap = heuristic_mae - 0.0
+    gap_closed = 0.0
+    if heuristic_mae > 1e-8:
+        gap_closed = float((heuristic_mae - student_mae) / heuristic_mae)
+    return {
+        "student_mae": student_mae,
+        "heuristic_mae": heuristic_mae,
+        "teacher_gap_closed": gap_closed,
+        "student_better_rate_vs_heuristic": float(np.mean(better_flags)) if better_flags else 0.0,
+    }

@@ -85,9 +85,10 @@ Current scope notes:
 - Pure-editing now also has an experimental tool-conditioned student path: teacher pseudo labels can be dumped and trained with `test_scripts/train_pure_editing_student.py`, and `run_pipeline.py` can optionally inject the learned parameter layer through `--how-much-student-model`.
 - Current student status is still experimental: the current best student is `mixed_capacity`, and runtime-safe variants (`clip`, `clip_guard`, `clip_softguard`) are now available through `run_pipeline.py --how-much-student-variant ...`.
 - The newest guarded student result is more specific:
-  - plain `clip` is best for ETTh1 heldout MAE
-  - `clip_softguard` is best for runtime safety on the 20-sample ETTh1 mainline smoke
-  - neither variant yet replaces the frozen teacher-backed pure-editing chain, and cross-distribution heldout still trails heuristic
+  - plain `clip` is still the best pure heldout MAE variant on ETTh1-only
+  - the latest `clip_softguard` adds per-tool quality prior and semantic risk calibration
+  - that version is now the best balanced deployment candidate: it restores the ETTh1+ETTm1 combined heldout result to slightly better than heuristic while remaining clearly safer than raw `v1` and plain `clip`
+  - it still does not replace the frozen teacher-backed pure-editing chain on runtime
 - Current pure-editing student work should therefore be treated as per-tool deployment calibration, not as a system-design or taxonomy problem.
 - Controlled synthetic forecast-revision builders are ready after backbone artifacts exist.
 - Time-MMD projected revision is now exposed as a runnable benchmark path.
