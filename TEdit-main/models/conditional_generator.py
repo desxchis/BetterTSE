@@ -20,6 +20,9 @@ class ConditionalGenerator(nn.Module):
         self.background_loss_weight = float(strength_cfg.get("background_loss_weight", 0.0))
         self.monotonic_loss_weight = float(strength_cfg.get("monotonic_loss_weight", 0.0))
         self.monotonic_margin = float(strength_cfg.get("monotonic_margin", 1.0e-3))
+        self._last_finetune_stats = {}
+        self._last_loss_tensors = {}
+        self._last_strength_trace = None
 
         self._init_condition_encoders(configs["attrs"], configs["side"])
         self._init_diff(configs["diffusion"])
@@ -70,6 +73,7 @@ class ConditionalGenerator(nn.Module):
         strength_label=None,
         task_id=None,
         text_context=None,
+        collect_strength_diagnostics=False,
         soft_mask=None,
         keys_null=None,
         values_null=None,
@@ -100,6 +104,8 @@ class ConditionalGenerator(nn.Module):
             model_kwargs["task_id"] = task_id
         if text_context is not None:
             model_kwargs["text_context"] = text_context
+        if collect_strength_diagnostics:
+            model_kwargs["collect_strength_diagnostics"] = True
 
         pred_noise = self.diff_model(noisy_x, side_emb, src_attr_emb, t, **model_kwargs)  # (B,K,L)
         return pred_noise
@@ -125,6 +131,9 @@ class ConditionalGenerator(nn.Module):
         """
         Training.
         """
+        self._last_finetune_stats = {}
+        self._last_loss_tensors = {}
+        self._last_strength_trace = None
         if mode == "pretrain":
             return self.pretrain(batch, is_train)
         elif mode == "finetune":
@@ -206,9 +215,9 @@ class ConditionalGenerator(nn.Module):
                     ),
                 )
             else:
-                loss_tgt = 0.0
+                loss_tgt = src_x.new_tensor(0.0)
         else:
-            loss_tgt = 0
+            loss_tgt = src_x.new_tensor(0.0)
             B = tgt_x_pred.shape[0]
             for t in range(self.num_steps):
                 t = (torch.ones(B, device=self.device) * t).long()
@@ -224,6 +233,15 @@ class ConditionalGenerator(nn.Module):
                     )
             loss_tgt = loss_tgt/self.num_steps
         total_loss = loss_tgt
+        strength_diag = {
+            "denoising_loss": loss_tgt.detach(),
+            "edit_region_l1": src_x.new_tensor(0.0),
+            "background_l1": src_x.new_tensor(0.0),
+            "monotonic_loss": src_x.new_tensor(0.0),
+            "monotonic_active_family_rate": src_x.new_tensor(0.0),
+            "monotonic_active_family_count": src_x.new_tensor(0.0),
+            "monotonic_family_count": src_x.new_tensor(0.0),
+        }
         mask_gt = batch.get("mask_gt")
         family_sizes = batch.get("family_sizes")
         if mask_gt is not None:
@@ -232,13 +250,31 @@ class ConditionalGenerator(nn.Module):
                 mask_gt = mask_gt.permute(0, 2, 1)
             elif mask_gt.dim() == 2:
                 mask_gt = mask_gt.unsqueeze(1)
-            total_loss = total_loss + self._strength_supervision_loss(
+            strength_loss, strength_diag = self._strength_supervision_loss(
                 src_x=src_x,
                 tgt_x=tgt_x,
                 tgt_x_pred=tgt_x_pred,
                 mask_gt=mask_gt,
                 family_sizes=family_sizes,
             )
+            total_loss = total_loss + strength_loss
+        self._last_loss_tensors = {
+            "total_loss": total_loss,
+            "denoising_loss": loss_tgt,
+            "edit_region_l1": strength_diag["edit_region_l1"],
+            "background_l1": strength_diag["background_l1"],
+            "monotonic_loss": strength_diag["monotonic_loss"],
+        }
+        self._last_finetune_stats = {
+            "denoising_loss": float(loss_tgt.detach().item()),
+            "edit_region_l1": float(strength_diag["edit_region_l1"].detach().item()),
+            "background_l1": float(strength_diag["background_l1"].detach().item()),
+            "monotonic_loss": float(strength_diag["monotonic_loss"].detach().item()),
+            "monotonic_active_family_rate": float(strength_diag["monotonic_active_family_rate"].detach().item()),
+            "monotonic_active_family_count": float(strength_diag["monotonic_active_family_count"].detach().item()),
+            "monotonic_family_count": float(strength_diag["monotonic_family_count"].detach().item()),
+            "total_loss": float(total_loss.detach().item()),
+        }
         return total_loss
 
     def _masked_mean(self, values, mask, eps=1.0e-8):
@@ -254,15 +290,27 @@ class ConditionalGenerator(nn.Module):
         bg_mask = 1.0 - edit_mask
 
         losses = []
+        diag = {
+            "edit_region_l1": src_x.new_tensor(0.0),
+            "background_l1": src_x.new_tensor(0.0),
+            "monotonic_loss": src_x.new_tensor(0.0),
+            "monotonic_active_family_rate": src_x.new_tensor(0.0),
+            "monotonic_active_family_count": src_x.new_tensor(0.0),
+            "monotonic_family_count": src_x.new_tensor(0.0),
+        }
         if self.edit_region_loss_weight > 0.0:
             edit_region_l1 = self._masked_mean(abs_pred_target, edit_mask).mean()
+            diag["edit_region_l1"] = edit_region_l1
             losses.append(self.edit_region_loss_weight * edit_region_l1)
         if self.background_loss_weight > 0.0:
             background_l1 = self._masked_mean(abs_pred_source, bg_mask).mean()
+            diag["background_l1"] = background_l1
             losses.append(self.background_loss_weight * background_l1)
         if self.monotonic_loss_weight > 0.0 and family_sizes is not None:
             gains = self._masked_mean(abs_pred_source, edit_mask)
             monotonic_losses = []
+            active_family_count = src_x.new_tensor(0.0)
+            family_count = 0
             start_idx = 0
             for family_size in family_sizes.detach().cpu().tolist():
                 family_size = int(family_size)
@@ -270,19 +318,26 @@ class ConditionalGenerator(nn.Module):
                 start_idx += family_size
                 if family_gains.numel() < 3:
                     continue
+                family_count += 1
                 weak_gain = family_gains[0]
                 medium_gain = family_gains[1]
                 strong_gain = family_gains[2]
-                monotonic_losses.append(
+                family_hinge = (
                     torch.relu(self.monotonic_margin + weak_gain - medium_gain)
                     + torch.relu(self.monotonic_margin + medium_gain - strong_gain)
                 )
+                monotonic_losses.append(family_hinge)
+                active_family_count = active_family_count + (family_hinge.detach() > 0).float()
             if monotonic_losses:
                 monotonic_loss = torch.stack(monotonic_losses).mean()
+                diag["monotonic_loss"] = monotonic_loss
+                diag["monotonic_active_family_count"] = active_family_count
+                diag["monotonic_family_count"] = src_x.new_tensor(float(family_count))
+                diag["monotonic_active_family_rate"] = active_family_count / max(1, family_count)
                 losses.append(self.monotonic_loss_weight * monotonic_loss)
         if not losses:
-            return src_x.new_tensor(0.0)
-        return torch.stack(losses).sum()
+            return src_x.new_tensor(0.0), diag
+        return torch.stack(losses).sum(), diag
 
     def _bootstrap(self, tgt_x_pred, src_x, side_emb, src_attr_emb, tgt_attr_emb):
         """
@@ -392,8 +447,20 @@ class ConditionalGenerator(nn.Module):
             samples.append(tgt_x_pred)
         return torch.stack(samples)
     
-    def _edit(self, src_x, side_emb, src_attr_emb, tgt_attr_emb, sampler, strength_label=None, task_id=None, text_context=None):
+    def _edit(
+        self,
+        src_x,
+        side_emb,
+        src_attr_emb,
+        tgt_attr_emb,
+        sampler,
+        strength_label=None,
+        task_id=None,
+        text_context=None,
+        collect_strength_diagnostics=False,
+    ):
         B = src_x.shape[0]
+        strength_trace = [] if collect_strength_diagnostics else None
 
         # forward
         xt = src_x
@@ -422,12 +489,27 @@ class ConditionalGenerator(nn.Module):
                 strength_label=strength_label,
                 task_id=task_id,
                 text_context=text_context,
+                collect_strength_diagnostics=collect_strength_diagnostics,
             )
+            if collect_strength_diagnostics and hasattr(self.diff_model, "get_last_strength_diagnostics"):
+                step_diag = self.diff_model.get_last_strength_diagnostics()
+                if step_diag is not None:
+                    strength_trace.append({"step": int(t[0].item()), "layers": step_diag})
             if sampler[-4:] == "ddpm":
                 xt = self.ddpm.reverse(xt, pred_noise, t, noise)
             else:
                 xt = self.ddim.reverse(xt, pred_noise, t, noise, is_determin=True)
+        self._last_strength_trace = strength_trace
         return xt
+
+    def get_last_finetune_stats(self):
+        return dict(self._last_finetune_stats)
+
+    def get_last_loss_tensors(self):
+        return dict(self._last_loss_tensors)
+
+    def get_last_strength_trace(self):
+        return self._last_strength_trace
 
     @staticmethod
     def create_soft_mask(hard_mask, smooth_width=5, smooth_type="gaussian"):

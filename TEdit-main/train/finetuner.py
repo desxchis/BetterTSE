@@ -1,6 +1,7 @@
 import os
 import time
 import json
+from collections import defaultdict
 
 import torch
 from torch.optim import Adam
@@ -39,6 +40,12 @@ class Finetuner:
         self.strength_diagnostics_enabled = bool(self.configs.get("strength_diagnostics_enabled", False))
         self.strength_diagnostics_interval = int(self.configs.get("strength_diagnostics_interval", 50))
         self.freeze_backbone_for_strength = bool(self.configs.get("freeze_backbone_for_strength", False))
+        self.trainable_scope = str(
+            self.configs.get(
+                "trainable_scope",
+                "strength_only" if self.freeze_backbone_for_strength else "all",
+            )
+        )
         self.instruction_text_dropout_prob = float(self.configs.get("instruction_text_dropout_prob", 0.0))
         self.run_generation_eval = bool(self.configs.get("run_generation_eval", True))
 
@@ -55,8 +62,7 @@ class Finetuner:
         if self.model_path != "":
             print("Laoding pretrained model from {}".format(self.model_path))
             self.model.load_state_dict(torch.load(self.model_path), strict=False)
-        if self.freeze_backbone_for_strength:
-            self._freeze_backbone_for_strength()
+        self._apply_trainable_scope()
 
     def _init_guider(self, guider):
         self.guider = guider.to(self.model.device)
@@ -88,6 +94,26 @@ class Finetuner:
             for name, param in self._strength_param_meta
         }
 
+    def _component_grad_norm(self, loss_tensor):
+        if loss_tensor is None or not isinstance(loss_tensor, torch.Tensor) or not loss_tensor.requires_grad:
+            return None
+        grads = torch.autograd.grad(
+            loss_tensor,
+            [param for _, param in self._strength_param_meta],
+            retain_graph=True,
+            allow_unused=True,
+        )
+        sq_sum = 0.0
+        has_grad = False
+        for grad in grads:
+            if grad is None:
+                continue
+            has_grad = True
+            sq_sum += float(torch.sum(grad.detach() ** 2).item())
+        if not has_grad:
+            return None
+        return sq_sum ** 0.5
+
     def _init_data(self, dataset):
         self.dataset = dataset
         self.train_loader = dataset.get_loader(split="train", batch_size=self.batch_size, shuffle=True, 
@@ -115,9 +141,24 @@ class Finetuner:
             or "attr_projection" in name
         )
 
-    def _freeze_backbone_for_strength(self):
+    def _is_output_amplitude_parameter(self, name):
+        return (
+            "output_projection1" in name
+            or "output_projection" in name
+            or "mid_projection" in name
+            or "side_projection" in name
+            or "patch_decoder" in name
+            or "multipatch_mixer" in name
+        )
+
+    def _apply_trainable_scope(self):
+        if self.trainable_scope == "all":
+            return
         for name, param in self.model.named_parameters():
-            param.requires_grad = self._is_strength_parameter(name) or self._is_modulation_neighbor_parameter(name)
+            allow = self._is_strength_parameter(name) or self._is_modulation_neighbor_parameter(name)
+            if self.trainable_scope == "wider_unfreeze":
+                allow = allow or self._is_output_amplitude_parameter(name)
+            param.requires_grad = allow
 
     def _tensor_histogram(self, values):
         if values is None:
@@ -167,7 +208,7 @@ class Finetuner:
         stats["task_gap_stats"] = task_gap_stats
         return stats
 
-    def _collect_strength_diagnostics(self, batch, loss):
+    def _collect_strength_diagnostics(self, batch, loss, finetune_stats=None, loss_tensors=None):
         modules = []
         for name, param in self._strength_param_meta:
             grad_norm = None if param.grad is None else float(param.grad.detach().norm().item())
@@ -181,12 +222,18 @@ class Finetuner:
                     "delta_from_init_norm": delta_norm,
                 }
             )
+        component_grad_norms = {}
+        if loss_tensors:
+            for key in ["denoising_loss", "edit_region_l1", "background_l1", "monotonic_loss", "total_loss"]:
+                component_grad_norms[key] = self._component_grad_norm(loss_tensors.get(key))
         payload = {
             "step": int(self._global_batch_no),
             "loss": float(loss.item()),
             "strength_lr_scale": float(self.strength_lr_scale),
             "strength_modules": modules,
             "batch_stats": self._batch_strength_stats(batch),
+            "finetune_stats": finetune_stats or {},
+            "component_grad_norms": component_grad_norms,
         }
         with open(self.strength_diag_path, "a", encoding="utf-8") as f:
             f.write(json.dumps(payload, ensure_ascii=False) + "\n")
@@ -260,16 +307,20 @@ class Finetuner:
 
                 self.opt.zero_grad()
                 loss = self.model(train_batch, is_train=True, mode="finetune")
+                finetune_stats = self.model.get_last_finetune_stats() if hasattr(self.model, "get_last_finetune_stats") else {}
+                loss_tensors = self.model.get_last_loss_tensors() if hasattr(self.model, "get_last_loss_tensors") else {}
                 loss.backward()
                 if (
                     self.strength_diagnostics_enabled
                     and self._strength_param_meta
                     and self._global_batch_no % max(1, self.strength_diagnostics_interval) == 0
                 ):
-                    self._collect_strength_diagnostics(train_batch, loss)
+                    self._collect_strength_diagnostics(train_batch, loss, finetune_stats=finetune_stats, loss_tensors=loss_tensors)
                 self.opt.step()
                 avg_loss += loss.item()
                 self.tf_writer.add_scalar("Finetune/Train/batch_loss", loss.item(), self._global_batch_no)
+                for key, value in finetune_stats.items():
+                    self.tf_writer.add_scalar(f"Finetune/Train/{key}", value, self._global_batch_no)
 
                 if batch_no >= self.itr_per_epoch:
                     break

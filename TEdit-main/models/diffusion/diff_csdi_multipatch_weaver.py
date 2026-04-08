@@ -213,24 +213,55 @@ class ResidualBlock(nn.Module):
         y = y.reshape(B, L, channel, K).permute(0, 2, 3, 1).reshape(B, channel, K * L)
         return y
 
-    def _compute_modulation(self, attr_emb, diffusion_cond, strength_cond):
+    def _compute_modulation(self, attr_emb, diffusion_cond, strength_cond, collect_strength_diagnostics=False):
         pooled_attr = torch.mean(self.attr_projection(attr_emb), dim=1)
         base_input = torch.cat([diffusion_cond, pooled_attr], dim=-1)
         gamma_orig, beta_orig = torch.chunk(self.base_modulation(base_input), 2, dim=-1)
 
         if self.strength_modulation is None or strength_cond is None or self.strength_mode != "modulation_residual":
-            return gamma_orig, beta_orig
+            debug = None
+            if collect_strength_diagnostics:
+                zeros = torch.zeros_like(gamma_orig)
+                debug = {
+                    "gamma_orig_norm": float(gamma_orig.detach().norm(dim=-1).mean().item()),
+                    "beta_orig_norm": float(beta_orig.detach().norm(dim=-1).mean().item()),
+                    "delta_gamma_norm": float(zeros.detach().norm(dim=-1).mean().item()),
+                    "delta_beta_norm": float(zeros.detach().norm(dim=-1).mean().item()),
+                    "delta_gamma_ratio": 0.0,
+                    "delta_beta_ratio": 0.0,
+                }
+            return gamma_orig, beta_orig, debug
 
         delta_gamma, delta_beta = torch.chunk(self.strength_modulation(strength_cond), 2, dim=-1)
-        return gamma_orig + delta_gamma, beta_orig + delta_beta
+        debug = None
+        if collect_strength_diagnostics:
+            gamma_orig_norm = torch.clamp(gamma_orig.detach().norm(dim=-1).mean(), min=1.0e-8)
+            beta_orig_norm = torch.clamp(beta_orig.detach().norm(dim=-1).mean(), min=1.0e-8)
+            delta_gamma_norm = delta_gamma.detach().norm(dim=-1).mean()
+            delta_beta_norm = delta_beta.detach().norm(dim=-1).mean()
+            debug = {
+                "gamma_orig_norm": float(gamma_orig_norm.item()),
+                "beta_orig_norm": float(beta_orig_norm.item()),
+                "delta_gamma_norm": float(delta_gamma_norm.item()),
+                "delta_beta_norm": float(delta_beta_norm.item()),
+                "delta_gamma_ratio": float((delta_gamma_norm / gamma_orig_norm).item()),
+                "delta_beta_ratio": float((delta_beta_norm / beta_orig_norm).item()),
+            }
+        return gamma_orig + delta_gamma, beta_orig + delta_beta, debug
 
     def forward(self, x, side_emb, attr_emb, diffusion_emb, attention_mask=None,
-                soft_mask=None, keys_null=None, values_null=None, strength_cond=None):
+                soft_mask=None, keys_null=None, values_null=None, strength_cond=None,
+                collect_strength_diagnostics=False):
         B, channel, K, L = x.shape
         base_shape = x.shape
 
         diffusion_cond = self.diffusion_projection(diffusion_emb)
-        gamma, beta = self._compute_modulation(attr_emb, diffusion_cond, strength_cond)
+        gamma, beta, mod_debug = self._compute_modulation(
+            attr_emb,
+            diffusion_cond,
+            strength_cond,
+            collect_strength_diagnostics=collect_strength_diagnostics,
+        )
         diffusion_emb = diffusion_cond.unsqueeze(-1).unsqueeze(-1)
         gamma = gamma.unsqueeze(-1).unsqueeze(-1)
         beta = beta.unsqueeze(-1).unsqueeze(-1)
@@ -255,8 +286,13 @@ class ResidualBlock(nn.Module):
         x = x.reshape(base_shape)
         residual = residual.reshape(base_shape)
         skip = skip.reshape(base_shape)
-
-        return (x + residual) / math.sqrt(2.0), skip
+        debug = None
+        if collect_strength_diagnostics:
+            debug = dict(mod_debug or {})
+            debug["residual_norm"] = float(residual.detach().norm().item())
+            debug["skip_norm"] = float(skip.detach().norm().item())
+            debug["output_norm"] = float(((x + residual) / math.sqrt(2.0)).detach().norm().item())
+        return (x + residual) / math.sqrt(2.0), skip, debug
 
 class TsPatchEmbedding(nn.Module):
     def __init__(self, L_patch_len, channels, d_model, dropout):
@@ -355,7 +391,7 @@ class Diff_CSDI_Patch(nn.Module):
         diffusion_emb = self.diffusion_embedding(diffusion_step)
         skip = []
         for layer in self.residual_layers:
-            x, skip_connection = layer(x, side_emb, attr_emb, diffusion_emb)
+            x, skip_connection, _ = layer(x, side_emb, attr_emb, diffusion_emb)
             skip.append(skip_connection)
 
         x = torch.sum(torch.stack(skip), dim=0) / math.sqrt(len(self.residual_layers))
@@ -413,7 +449,7 @@ class Diff_CSDI_MultiPatch(nn.Module):
             B, _, Nk, Nl = x.shape
             skip = []
             for layer in self.residual_layers:
-                x, skip_connection = layer(x, side_emb, attr_emb, diffusion_emb)
+                x, skip_connection, _ = layer(x, side_emb, attr_emb, diffusion_emb)
                 skip.append(skip_connection)
 
             x = torch.sum(torch.stack(skip), dim=0) / math.sqrt(len(self.residual_layers))
@@ -492,6 +528,7 @@ class Diff_CSDI_MultiPatch_Weaver_Parallel(nn.Module):
                 dim_hid=config["channels"], 
                 dim_out=config["channels"],
         )
+        self._last_strength_diagnostics = None
     
     def _build_strength_condition(self, strength_label=None, task_id=None, text_context=None):
         if not self.strength_enabled:
@@ -500,9 +537,13 @@ class Diff_CSDI_MultiPatch_Weaver_Parallel(nn.Module):
             return None
         return self.strength_projector(strength_label, task_id, text_context=text_context)
 
+    def get_last_strength_diagnostics(self):
+        return self._last_strength_diagnostics
+
     def forward(self, x_raw, side_emb_raw, attr_emb_raw, diffusion_step,
                 soft_mask=None, keys_null=None, values_null=None,
-                strength_label=None, task_id=None, text_context=None):
+                strength_label=None, task_id=None, text_context=None,
+                collect_strength_diagnostics=False):
         """
         Forward pass with Soft-Boundary Attention Injection support.
         
@@ -552,14 +593,20 @@ class Diff_CSDI_MultiPatch_Weaver_Parallel(nn.Module):
             x_in = x_in + strength_map
 
         skip = []
-        for layer in self.residual_layers:
-            x_in, skip_connection = layer(
+        layer_debug = []
+        for layer_idx, layer in enumerate(self.residual_layers):
+            x_in, skip_connection, block_debug = layer(
                 x_in+_x_in+attr_emb, side_in, attr_emb_raw, diffusion_emb, 
                 attention_mask=attention_mask,
                 soft_mask=soft_mask, keys_null=keys_null, values_null=values_null,
                 strength_cond=strength_cond,
+                collect_strength_diagnostics=collect_strength_diagnostics,
             )
             skip.append(skip_connection)        
+            if collect_strength_diagnostics:
+                block_payload = {"layer_idx": int(layer_idx)}
+                block_payload.update(block_debug or {})
+                layer_debug.append(block_payload)
         
         x = torch.sum(torch.stack(skip), dim=0) / math.sqrt(len(self.residual_layers))
         x = x.reshape(B, self.channels, Nk * Nl)
@@ -579,6 +626,7 @@ class Diff_CSDI_MultiPatch_Weaver_Parallel(nn.Module):
         all_out = torch.cat(all_out, dim=1) # (B, M, K, L)
         all_out = self.multipatch_mixer(all_out.permute(0, 2, 3, 1).contiguous()) # (B, K, L, 1)
         all_out = all_out.reshape(B, K, L)
+        self._last_strength_diagnostics = layer_debug if collect_strength_diagnostics else None
         return all_out
     
     def get_mask(self, attr_len, len_list, device=None):

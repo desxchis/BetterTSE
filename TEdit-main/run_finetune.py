@@ -188,12 +188,17 @@ parser.add_argument("--bootstrap_ratio", type=float, default=0.5)  # the bootstr
 # trainer
 parser.add_argument("--lr", type=float, default=1e-5)  # learning rate, should be smaller than pretrain lr
 parser.add_argument("--epochs", type=int, default=50)  # training epochs
-parser.add_argument("--include_self", type=int, default=1)  # true or false
+parser.add_argument("--include_self", type=int, default=-1)  # true or false
 parser.add_argument("--freeze-backbone-for-strength", type=int, default=-1)
 parser.add_argument("--instruction-text-dropout-prob", type=float, default=-1.0)
 parser.add_argument("--strength-lr-scale", type=float, default=1.0)
 parser.add_argument("--strength-diagnostics", type=int, default=0)
 parser.add_argument("--strength-diagnostics-interval", type=int, default=50)
+parser.add_argument("--trainable-scope", type=str, default="")
+parser.add_argument("--edit-region-loss-weight", type=float, default=-1.0)
+parser.add_argument("--background-loss-weight", type=float, default=-1.0)
+parser.add_argument("--monotonic-loss-weight", type=float, default=-1.0)
+parser.add_argument("--monotonic-margin", type=float, default=-1.0)
 
 args = parser.parse_args()
 
@@ -208,9 +213,12 @@ eval_configs = yaml.safe_load(open(args.evaluate_config_path))
 
 finetune_configs["train"]["lr"] = args.lr
 finetune_configs["train"]["epochs"] = args.epochs
-finetune_configs["train"]["include_self"] = bool(args.include_self)
+if args.include_self >= 0:
+    finetune_configs["train"]["include_self"] = bool(args.include_self)
 if args.freeze_backbone_for_strength >= 0:
     finetune_configs["train"]["freeze_backbone_for_strength"] = bool(args.freeze_backbone_for_strength)
+if args.trainable_scope.strip():
+    finetune_configs["train"]["trainable_scope"] = args.trainable_scope.strip()
 if args.instruction_text_dropout_prob >= 0.0:
     finetune_configs["train"]["instruction_text_dropout_prob"] = args.instruction_text_dropout_prob
 finetune_configs["train"]["strength_lr_scale"] = args.strength_lr_scale
@@ -250,6 +258,15 @@ for n in range(args.n_runs):
 
     model_configs = yaml.safe_load(open(fr"{args.pretrained_dir}/{n}/{args.model_config_path}"))
     model_configs["diffusion"]["bootstrap_ratio"] = args.bootstrap_ratio
+    strength_cfg = model_configs["diffusion"].setdefault("strength_control", {})
+    if args.edit_region_loss_weight >= 0.0:
+        strength_cfg["edit_region_loss_weight"] = args.edit_region_loss_weight
+    if args.background_loss_weight >= 0.0:
+        strength_cfg["background_loss_weight"] = args.background_loss_weight
+    if args.monotonic_loss_weight >= 0.0:
+        strength_cfg["monotonic_loss_weight"] = args.monotonic_loss_weight
+    if args.monotonic_margin >= 0.0:
+        strength_cfg["monotonic_margin"] = args.monotonic_margin
     finetune_configs["train"]["model_path"] = fr"{args.pretrained_dir}/{n}/{args.pretrained_model_path}"
 
     output_folder = os.path.join(save_folder, str(n))

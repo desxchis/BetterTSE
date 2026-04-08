@@ -1,0 +1,145 @@
+from __future__ import annotations
+
+import argparse
+import json
+import subprocess
+import sys
+from pathlib import Path
+
+
+EXPERIMENTS = [
+    {
+        "name": "denoising_only",
+        "trainable_scope": "strength_only",
+        "edit_region_loss_weight": 0.0,
+        "background_loss_weight": 0.0,
+        "monotonic_loss_weight": 0.0,
+    },
+    {
+        "name": "denoising_plus_current_ranking",
+        "trainable_scope": "strength_only",
+        "edit_region_loss_weight": 1.0,
+        "background_loss_weight": 0.2,
+        "monotonic_loss_weight": 0.5,
+    },
+    {
+        "name": "denoising_plus_5x_ranking",
+        "trainable_scope": "strength_only",
+        "edit_region_loss_weight": 1.0,
+        "background_loss_weight": 0.2,
+        "monotonic_loss_weight": 2.5,
+    },
+    {
+        "name": "denoising_plus_current_ranking_wider_unfreeze",
+        "trainable_scope": "wider_unfreeze",
+        "edit_region_loss_weight": 1.0,
+        "background_loss_weight": 0.2,
+        "monotonic_loss_weight": 0.5,
+    },
+]
+
+
+def _run(cmd: list[str], cwd: Path) -> None:
+    print("$", " ".join(cmd))
+    subprocess.run(cmd, cwd=str(cwd), check=True)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Run the 4-way strength dynamics diagnostic matrix.")
+    parser.add_argument("--pretrained-dir", required=True)
+    parser.add_argument("--model-config-path", default="trend_types/model_configs.yaml")
+    parser.add_argument("--pretrained-model-path", default="trend_types/ckpts/model_best.pth")
+    parser.add_argument("--finetune-config-path", default="TEdit-main/configs/synthetic/finetune_strength_trend_family.yaml")
+    parser.add_argument("--evaluate-config-path", default="tmp/strength_phase1/evaluate.synthetic.phase1b.yaml")
+    parser.add_argument("--data-folder", required=True)
+    parser.add_argument("--benchmark", required=True)
+    parser.add_argument("--output-dir", required=True)
+    parser.add_argument("--epochs", type=int, default=2)
+    parser.add_argument("--device", default="cuda:0")
+    parser.add_argument("--max-families", type=int, default=12)
+    parser.add_argument("--edit-steps", type=int, default=10)
+    args = parser.parse_args()
+
+    repo_root = Path(__file__).resolve().parent.parent
+    tedit_root = repo_root / "TEdit-main"
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    summary = []
+
+    for experiment in EXPERIMENTS:
+        exp_dir = output_dir / experiment["name"]
+        exp_dir.mkdir(parents=True, exist_ok=True)
+        train_cmd = [
+            sys.executable,
+            "run_finetune.py",
+            "--pretrained_dir", str(Path(args.pretrained_dir)),
+            "--model_config_path", args.model_config_path,
+            "--pretrained_model_path", args.pretrained_model_path,
+            "--finetune_config_path", str(repo_root / args.finetune_config_path),
+            "--evaluate_config_path", str(repo_root / args.evaluate_config_path),
+            "--data_type", "discrete_strength_family",
+            "--data_folder", str(Path(args.data_folder)),
+            "--save_folder", str(exp_dir),
+            "--n_runs", "1",
+            "--epochs", str(args.epochs),
+            "--lr", "1e-5",
+            "--strength-lr-scale", "5.0",
+            "--strength-diagnostics", "1",
+            "--strength-diagnostics-interval", "1",
+            "--include_self", "0",
+            "--trainable-scope", experiment["trainable_scope"],
+            "--edit-region-loss-weight", str(experiment["edit_region_loss_weight"]),
+            "--background-loss-weight", str(experiment["background_loss_weight"]),
+            "--monotonic-loss-weight", str(experiment["monotonic_loss_weight"]),
+        ]
+        _run(train_cmd, cwd=tedit_root)
+
+        model_path = exp_dir / "0" / "trend_injection" / "ckpts" / "model_best.pth"
+        config_path = exp_dir / "0" / "trend_injection" / "model_configs.yaml"
+        eval_output = exp_dir / "heldout_monotonic_eval.json"
+        eval_cmd = [
+            sys.executable,
+            str(repo_root / "test_scripts" / "run_tedit_trend_monotonic_eval.py"),
+            "--benchmark", str(Path(args.benchmark)),
+            "--model-path", str(model_path),
+            "--config-path", str(config_path),
+            "--output", str(eval_output),
+            "--max-families", str(args.max_families),
+            "--edit-steps", str(args.edit_steps),
+            "--device", args.device,
+        ]
+        _run(eval_cmd, cwd=repo_root)
+
+        modulation_output = exp_dir / "modulation_diagnostics.json"
+        diag_cmd = [
+            sys.executable,
+            str(repo_root / "test_scripts" / "collect_tedit_strength_modulation_diagnostics.py"),
+            "--benchmark", str(Path(args.benchmark)),
+            "--model-path", str(model_path),
+            "--config-path", str(config_path),
+            "--output", str(modulation_output),
+            "--max-families", str(args.max_families),
+            "--edit-steps", str(args.edit_steps),
+            "--device", args.device,
+        ]
+        _run(diag_cmd, cwd=repo_root)
+
+        eval_payload = json.loads(eval_output.read_text(encoding="utf-8"))
+        summary.append(
+            {
+                "name": experiment["name"],
+                "trainable_scope": experiment["trainable_scope"],
+                "monotonic_loss_weight": experiment["monotonic_loss_weight"],
+                "strong_minus_weak_edit_gain_mean": eval_payload["summary"]["strong_minus_weak_edit_gain_mean"],
+                "monotonic_hit_rate": eval_payload["summary"]["monotonic_hit_rate"],
+                "preservation_pass_rate": eval_payload["summary"]["preservation_pass_rate"],
+            }
+        )
+
+    summary_path = output_dir / "diagnostic_matrix_summary.json"
+    summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(json.dumps(summary, ensure_ascii=False, indent=2))
+
+
+if __name__ == "__main__":
+    main()
