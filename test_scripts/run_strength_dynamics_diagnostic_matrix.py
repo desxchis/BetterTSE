@@ -10,32 +10,31 @@ from pathlib import Path
 
 EXPERIMENTS = [
     {
-        "name": "denoising_only",
-        "trainable_scope": "strength_only",
-        "edit_region_loss_weight": 0.0,
-        "background_loss_weight": 0.0,
-        "monotonic_loss_weight": 0.0,
-    },
-    {
-        "name": "denoising_plus_current_ranking",
+        "name": "current_ranking",
         "trainable_scope": "strength_only",
         "edit_region_loss_weight": 1.0,
         "background_loss_weight": 0.2,
         "monotonic_loss_weight": 0.5,
+        "late_output_coupling_enabled": 0,
+        "late_output_coupling_gain": 1.0,
     },
     {
-        "name": "denoising_plus_5x_ranking",
-        "trainable_scope": "strength_only",
-        "edit_region_loss_weight": 1.0,
-        "background_loss_weight": 0.2,
-        "monotonic_loss_weight": 2.5,
-    },
-    {
-        "name": "denoising_plus_current_ranking_wider_unfreeze",
+        "name": "current_ranking_wider_unfreeze",
         "trainable_scope": "wider_unfreeze",
         "edit_region_loss_weight": 1.0,
         "background_loss_weight": 0.2,
         "monotonic_loss_weight": 0.5,
+        "late_output_coupling_enabled": 0,
+        "late_output_coupling_gain": 1.0,
+    },
+    {
+        "name": "current_ranking_wider_unfreeze_late_output_coupling",
+        "trainable_scope": "wider_unfreeze",
+        "edit_region_loss_weight": 1.0,
+        "background_loss_weight": 0.2,
+        "monotonic_loss_weight": 0.5,
+        "late_output_coupling_enabled": 1,
+        "late_output_coupling_gain": 1.0,
     },
 ]
 
@@ -71,10 +70,12 @@ def main() -> None:
     parser.add_argument("--benchmark", required=True)
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--epochs", type=int, default=2)
+    parser.add_argument("--n-runs", type=int, default=2)
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--max-families", type=int, default=12)
     parser.add_argument("--edit-steps", type=int, default=10)
     parser.add_argument("--experiment", action="append", default=[])
+    parser.add_argument("--pretrained-run", type=int, default=0)
     args = parser.parse_args()
 
     repo_root = Path(__file__).resolve().parent.parent
@@ -101,7 +102,7 @@ def main() -> None:
             "--data_type", "discrete_strength_family",
             "--data_folder", str(Path(args.data_folder)),
             "--save_folder", str(exp_dir),
-            "--n_runs", "1",
+            "--n_runs", str(args.n_runs),
             "--epochs", str(args.epochs),
             "--lr", "1e-5",
             "--strength-lr-scale", "5.0",
@@ -112,48 +113,57 @@ def main() -> None:
             "--edit-region-loss-weight", str(experiment["edit_region_loss_weight"]),
             "--background-loss-weight", str(experiment["background_loss_weight"]),
             "--monotonic-loss-weight", str(experiment["monotonic_loss_weight"]),
+            "--late-output-coupling-enabled", str(experiment["late_output_coupling_enabled"]),
+            "--late-output-coupling-gain", str(experiment["late_output_coupling_gain"]),
+            "--seed-list", "1,7" if args.n_runs == 2 else "1",
+            "--pretrained-run", str(args.pretrained_run),
         ]
         _run(train_cmd, cwd=tedit_root)
 
-        model_path = exp_dir / "0" / "trend_injection" / "ckpts" / "model_best.pth"
-        config_path = exp_dir / "0" / "trend_injection" / "model_configs.yaml"
-        eval_output = exp_dir / "heldout_monotonic_eval.json"
-        eval_cmd = [
-            sys.executable,
-            str(repo_root / "test_scripts" / "run_tedit_trend_monotonic_eval.py"),
-            "--benchmark", str(Path(args.benchmark)),
-            "--model-path", str(model_path),
-            "--config-path", str(config_path),
-            "--output", str(eval_output),
-            "--max-families", str(args.max_families),
-            "--edit-steps", str(args.edit_steps),
-            "--device", args.device,
-        ]
-        _run(eval_cmd, cwd=repo_root)
+        run_summaries = []
+        for run_idx in range(args.n_runs):
+            model_path = exp_dir / str(run_idx) / "trend_injection" / "ckpts" / "model_best.pth"
+            config_path = exp_dir / str(run_idx) / "trend_injection" / "model_configs.yaml"
+            eval_output = exp_dir / f"heldout_monotonic_eval_run{run_idx}.json"
+            eval_cmd = [
+                sys.executable,
+                str(repo_root / "test_scripts" / "run_tedit_trend_monotonic_eval.py"),
+                "--benchmark", str(Path(args.benchmark)),
+                "--model-path", str(model_path),
+                "--config-path", str(config_path),
+                "--output", str(eval_output),
+                "--max-families", str(args.max_families),
+                "--edit-steps", str(args.edit_steps),
+                "--device", args.device,
+            ]
+            _run(eval_cmd, cwd=repo_root)
 
-        modulation_output = exp_dir / "modulation_diagnostics.json"
-        diag_cmd = [
-            sys.executable,
-            str(repo_root / "test_scripts" / "collect_tedit_strength_modulation_diagnostics.py"),
-            "--benchmark", str(Path(args.benchmark)),
-            "--model-path", str(model_path),
-            "--config-path", str(config_path),
-            "--output", str(modulation_output),
-            "--max-families", str(args.max_families),
-            "--edit-steps", str(args.edit_steps),
-            "--device", args.device,
-        ]
-        _run(diag_cmd, cwd=repo_root)
+            modulation_output = exp_dir / f"modulation_diagnostics_run{run_idx}.json"
+            diag_cmd = [
+                sys.executable,
+                str(repo_root / "test_scripts" / "collect_tedit_strength_modulation_diagnostics.py"),
+                "--benchmark", str(Path(args.benchmark)),
+                "--model-path", str(model_path),
+                "--config-path", str(config_path),
+                "--output", str(modulation_output),
+                "--max-families", str(args.max_families),
+                "--edit-steps", str(args.edit_steps),
+                "--device", args.device,
+            ]
+            _run(diag_cmd, cwd=repo_root)
 
-        eval_payload = json.loads(eval_output.read_text(encoding="utf-8"))
+            eval_payload = json.loads(eval_output.read_text(encoding="utf-8"))
+            run_summaries.append(eval_payload["summary"])
         summary.append(
             {
                 "name": experiment["name"],
                 "trainable_scope": experiment["trainable_scope"],
                 "monotonic_loss_weight": experiment["monotonic_loss_weight"],
-                "strong_minus_weak_edit_gain_mean": eval_payload["summary"]["strong_minus_weak_edit_gain_mean"],
-                "monotonic_hit_rate": eval_payload["summary"]["monotonic_hit_rate"],
-                "preservation_pass_rate": eval_payload["summary"]["preservation_pass_rate"],
+                "late_output_coupling_enabled": experiment["late_output_coupling_enabled"],
+                "late_output_coupling_gain": experiment["late_output_coupling_gain"],
+                "strong_minus_weak_edit_gain_mean": [row["strong_minus_weak_edit_gain_mean"] for row in run_summaries],
+                "monotonic_hit_rate": [row["monotonic_hit_rate"] for row in run_summaries],
+                "preservation_pass_rate": [row["preservation_pass_rate"] for row in run_summaries],
             }
         )
 

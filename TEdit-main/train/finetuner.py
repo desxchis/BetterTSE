@@ -136,6 +136,7 @@ class Finetuner:
             "strength_projector" in name
             or "strength_modulation" in name
             or "strength_input_projection" in name
+            or "strength_output_projection" in name
         )
 
     def _is_modulation_neighbor_parameter(self, name):

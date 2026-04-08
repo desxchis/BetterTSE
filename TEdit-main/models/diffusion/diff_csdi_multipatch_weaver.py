@@ -474,8 +474,12 @@ class Diff_CSDI_MultiPatch_Weaver_Parallel(nn.Module):
         self.strength_enabled = bool(strength_cfg.get("enabled", False))
         self.strength_mode = str(strength_cfg.get("mode", "modulation_residual"))
         self.strength_cond_dim = int(strength_cfg.get("out_dim", self.channels))
+        late_coupling_cfg = dict(strength_cfg.get("late_output_coupling") or {})
+        self.late_output_coupling_enabled = bool(late_coupling_cfg.get("enabled", False))
+        self.late_output_coupling_gain = float(late_coupling_cfg.get("gain", 1.0))
         self.strength_projector = None
         self.strength_input_projection = None
+        self.strength_output_projection = None
         if self.strength_enabled:
             self.strength_projector = StrengthProjector(
                 num_strength_bins=int(strength_cfg.get("num_strength_bins", 3)),
@@ -492,6 +496,10 @@ class Diff_CSDI_MultiPatch_Weaver_Parallel(nn.Module):
             self.strength_input_projection = nn.Linear(self.strength_cond_dim, self.channels)
             nn.init.zeros_(self.strength_input_projection.weight)
             nn.init.zeros_(self.strength_input_projection.bias)
+            if self.late_output_coupling_enabled:
+                self.strength_output_projection = nn.Linear(self.strength_cond_dim, self.channels)
+                nn.init.zeros_(self.strength_output_projection.weight)
+                nn.init.zeros_(self.strength_output_projection.bias)
         self.diffusion_embedding = DiffusionEmbedding(
             num_steps=config["num_steps"],
             embedding_dim=config["diffusion_embedding_dim"],
@@ -610,6 +618,9 @@ class Diff_CSDI_MultiPatch_Weaver_Parallel(nn.Module):
         
         x = torch.sum(torch.stack(skip), dim=0) / math.sqrt(len(self.residual_layers))
         x = x.reshape(B, self.channels, Nk * Nl)
+        if self.late_output_coupling_enabled and strength_cond is not None and self.strength_output_projection is not None:
+            late_strength = self.strength_output_projection(strength_cond).unsqueeze(-1)
+            x = x + self.late_output_coupling_gain * late_strength
         x = self.output_projection1(x)  # (B,channel,Nk*Nl)
         x = F.relu(x)
         x = x.reshape(B, self.channels, Nk, Nl)

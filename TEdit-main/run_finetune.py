@@ -215,6 +215,10 @@ parser.add_argument("--edit-region-loss-weight", type=float, default=-1.0)
 parser.add_argument("--background-loss-weight", type=float, default=-1.0)
 parser.add_argument("--monotonic-loss-weight", type=float, default=-1.0)
 parser.add_argument("--monotonic-margin", type=float, default=-1.0)
+parser.add_argument("--late-output-coupling-enabled", type=int, default=-1)
+parser.add_argument("--late-output-coupling-gain", type=float, default=-1.0)
+parser.add_argument("--seed-list", type=str, default="")
+parser.add_argument("--pretrained-run", type=int, default=-1)
 
 args = parser.parse_args()
 
@@ -266,6 +270,8 @@ c_mean = pretrain_stat.get_concept_mean(dataset, split="train", batch_size=256)
 ###
 print("Started training...")
 seed_list = [1, 7, 42]
+if args.seed_list.strip():
+    seed_list = [int(v.strip()) for v in args.seed_list.split(",") if v.strip()]
 df_list = []
 eval_record_folder = eval_configs["data"]["folder"]
 for n in range(args.n_runs):
@@ -276,7 +282,8 @@ for n in range(args.n_runs):
 
     print(f"\nRun: {n}")
 
-    model_configs = yaml.safe_load(open(fr"{args.pretrained_dir}/{n}/{args.model_config_path}"))
+    pretrained_run = args.pretrained_run if args.pretrained_run >= 0 else n
+    model_configs = yaml.safe_load(open(fr"{args.pretrained_dir}/{pretrained_run}/{args.model_config_path}"))
     model_configs["diffusion"]["bootstrap_ratio"] = args.bootstrap_ratio
     strength_cfg = model_configs["diffusion"].setdefault("strength_control", {})
     if args.edit_region_loss_weight >= 0.0:
@@ -287,7 +294,12 @@ for n in range(args.n_runs):
         strength_cfg["monotonic_loss_weight"] = args.monotonic_loss_weight
     if args.monotonic_margin >= 0.0:
         strength_cfg["monotonic_margin"] = args.monotonic_margin
-    finetune_configs["train"]["model_path"] = fr"{args.pretrained_dir}/{n}/{args.pretrained_model_path}"
+    late_coupling_cfg = strength_cfg.setdefault("late_output_coupling", {})
+    if args.late_output_coupling_enabled >= 0:
+        late_coupling_cfg["enabled"] = bool(args.late_output_coupling_enabled)
+    if args.late_output_coupling_gain >= 0.0:
+        late_coupling_cfg["gain"] = args.late_output_coupling_gain
+    finetune_configs["train"]["model_path"] = fr"{args.pretrained_dir}/{pretrained_run}/{args.pretrained_model_path}"
 
     output_folder = os.path.join(save_folder, str(n))
     os.makedirs(output_folder, exist_ok=True)
