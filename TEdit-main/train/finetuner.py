@@ -15,7 +15,11 @@ class Finetuner:
         self._init_model(model)
         self._init_opt()
         self._init_data(dataset)
-        self._init_eval(eval_configs, c_mean)
+        self.evaluator = None
+        self.eval_configs = eval_configs
+        self.c_mean = c_mean
+        if self.run_generation_eval:
+            self._init_eval(eval_configs, c_mean)
         self._best_valid_loss = 1e10 
 
         self.tf_writer = SummaryWriter(log_dir=self.output_folder)
@@ -309,12 +313,13 @@ class Finetuner:
                 loss = self.model(train_batch, is_train=True, mode="finetune")
                 finetune_stats = self.model.get_last_finetune_stats() if hasattr(self.model, "get_last_finetune_stats") else {}
                 loss_tensors = self.model.get_last_loss_tensors() if hasattr(self.model, "get_last_loss_tensors") else {}
-                loss.backward()
-                if (
+                need_diag = (
                     self.strength_diagnostics_enabled
                     and self._strength_param_meta
                     and self._global_batch_no % max(1, self.strength_diagnostics_interval) == 0
-                ):
+                )
+                loss.backward(retain_graph=need_diag)
+                if need_diag:
                     self._collect_strength_diagnostics(train_batch, loss, finetune_stats=finetune_stats, loss_tensors=loss_tensors)
                 self.opt.step()
                 avg_loss += loss.item()

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -41,7 +42,22 @@ EXPERIMENTS = [
 
 def _run(cmd: list[str], cwd: Path) -> None:
     print("$", " ".join(cmd))
-    subprocess.run(cmd, cwd=str(cwd), check=True)
+    env = os.environ.copy()
+    env["OMP_NUM_THREADS"] = "1"
+    subprocess.run(cmd, cwd=str(cwd), check=True, env=env)
+
+
+def _resolve_path(repo_root: Path, value: str) -> Path:
+    candidate = Path(value)
+    if candidate.is_absolute() and candidate.exists():
+        return candidate
+    repo_candidate = (repo_root / candidate).resolve()
+    if repo_candidate.exists():
+        return repo_candidate
+    main_candidate = (repo_root.parent / "BetterTSE-main" / candidate).resolve()
+    if main_candidate.exists():
+        return main_candidate
+    return repo_candidate
 
 
 def main() -> None:
@@ -58,15 +74,20 @@ def main() -> None:
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--max-families", type=int, default=12)
     parser.add_argument("--edit-steps", type=int, default=10)
+    parser.add_argument("--experiment", action="append", default=[])
     args = parser.parse_args()
 
     repo_root = Path(__file__).resolve().parent.parent
     tedit_root = repo_root / "TEdit-main"
+    finetune_config_path = _resolve_path(repo_root, args.finetune_config_path)
+    evaluate_config_path = _resolve_path(repo_root, args.evaluate_config_path)
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     summary = []
 
-    for experiment in EXPERIMENTS:
+    selected = set(args.experiment)
+    experiments = [exp for exp in EXPERIMENTS if not selected or exp["name"] in selected]
+    for experiment in experiments:
         exp_dir = output_dir / experiment["name"]
         exp_dir.mkdir(parents=True, exist_ok=True)
         train_cmd = [
@@ -75,8 +96,8 @@ def main() -> None:
             "--pretrained_dir", str(Path(args.pretrained_dir)),
             "--model_config_path", args.model_config_path,
             "--pretrained_model_path", args.pretrained_model_path,
-            "--finetune_config_path", str(repo_root / args.finetune_config_path),
-            "--evaluate_config_path", str(repo_root / args.evaluate_config_path),
+            "--finetune_config_path", str(finetune_config_path),
+            "--evaluate_config_path", str(evaluate_config_path),
             "--data_type", "discrete_strength_family",
             "--data_folder", str(Path(args.data_folder)),
             "--save_folder", str(exp_dir),
@@ -138,6 +159,14 @@ def main() -> None:
 
     summary_path = output_dir / "diagnostic_matrix_summary.json"
     summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
+    aggregate_cmd = [
+        sys.executable,
+        str(repo_root / "test_scripts" / "summarize_strength_dynamics_matrix.py"),
+        "--matrix-dir", str(output_dir),
+        "--output-json", str(summary_path),
+        "--output-md", str(output_dir / "diagnostic_matrix_summary.md"),
+    ]
+    _run(aggregate_cmd, cwd=repo_root)
     print(json.dumps(summary, ensure_ascii=False, indent=2))
 
 

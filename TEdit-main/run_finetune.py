@@ -3,6 +3,7 @@ import yaml
 import json
 import argparse
 import pandas as pd
+from pathlib import Path
 
 import random
 import numpy as np
@@ -20,6 +21,21 @@ def save_configs(configs, path):
     print(json.dumps(configs, indent=4))
     with open(path, "w") as f:
         yaml.dump(configs, f, yaml.SafeDumper)
+
+
+def resolve_existing_path(value, *, anchors=None):
+    path = Path(value)
+    candidates = []
+    if path.is_absolute():
+        candidates.append(path)
+    else:
+        candidates.append(Path.cwd() / path)
+        for anchor in anchors or []:
+            candidates.append(Path(anchor) / path)
+    for candidate in candidates:
+        if candidate.exists():
+            return str(candidate.resolve())
+    return str(candidates[0].resolve()) if candidates else str(path)
 
 def pretrain(pretrain_configs, model_configs, output_folder):
     pretrain_configs["train"]["output_folder"] = output_folder
@@ -209,6 +225,8 @@ print("All files will be saved to '{}'".format(save_folder))
 
 finetune_configs = yaml.safe_load(open(args.finetune_config_path))
 eval_configs = yaml.safe_load(open(args.evaluate_config_path))
+pretrained_repo_root = Path(args.pretrained_dir).resolve().parents[2]
+tedit_data_anchor = pretrained_repo_root / "TEdit-main"
 
 
 finetune_configs["train"]["lr"] = args.lr
@@ -232,6 +250,7 @@ eval_configs["data"]["name"] = args.data_type
 print("Constucting dataset...")
 pretrain_folder = eval_configs["data"]["folder"].split("/")[:-1] + ["pretrain"]
 pretrain_folder = "/".join(pretrain_folder)
+pretrain_folder = resolve_existing_path(pretrain_folder, anchors=[tedit_data_anchor])
 data_configs = {
     "name": "synthetic_pretrain",
     "folder": pretrain_folder
@@ -240,7 +259,8 @@ dataset = EditDataset(data_configs)
 
 ###
 print("Obtaining stats of the pretraining data...")
-pretrain_stat = PretrainStat(eval_configs["eval"]["ctap_folder"])
+ctap_folder = resolve_existing_path(eval_configs["eval"]["ctap_folder"], anchors=[tedit_data_anchor])
+pretrain_stat = PretrainStat(ctap_folder)
 c_mean = pretrain_stat.get_concept_mean(dataset, split="train", batch_size=256)
 
 ###
@@ -287,5 +307,8 @@ df.to_csv(path)
 print("\n**************************************")
 print("*****", "Simple Statistics")
 print("**************************************")
-df_stat = df.groupby(["ctrl_attrs", "mode", "sampler", "steps", "n_samples"], as_index=False).agg(["mean", "std"])
-df_stat.to_csv(os.path.join(save_folder, fr"results_finetune_stat.csv"))
+if not df.empty and "ctrl_attrs" in df.columns:
+    df_stat = df.groupby(["ctrl_attrs", "mode", "sampler", "steps", "n_samples"], as_index=False).agg(["mean", "std"])
+    df_stat.to_csv(os.path.join(save_folder, fr"results_finetune_stat.csv"))
+else:
+    print("No final evaluation records to summarize.")
