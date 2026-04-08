@@ -1,223 +1,88 @@
-# Pure Editing How-Much Teacher Protocol
+# Pure Editing How-Much Mainline
 
-This document records the current protocol for the pure-editing `how much` layer.
+This document records the locked pure-editing `how much` mainline.
 
-## Scope
+## Locked scope
 
-- task line: `pure editing`
-- benchmark family: `event-driven controlled physical injection`
-- current phase: `teacher benchmark`, not student distillation
-- current goal:
-  - determine whether tool-conditioned teacher search systematically beats heuristic parameters
-  - determine which tool families are already learnable
-  - determine which tool families need tool-side redesign before student training
+- base editor: `TEdit`
+- task line: `Pure Editing`
+- strength form: discrete `weak / medium / strong`
+- condition path:
+  - `strength_label`
+  - `pooled text_context`
+- internal mechanism:
+  - `Numeric Projector / Strength Adapter`
+  - `residual modulation injection`
+- training objective:
+  - `diffusion denoising MSE`
+  - `edit-region target supervision`
+  - `family-level monotonic ranking`
 
-## Locked comparison set
+## Mainline goal
 
-The pure-editing teacher protocol currently compares only:
+The current goal is no longer teacher search or student distillation.
+The only question this line should answer is:
 
-1. `heuristic parameter layer`
-2. `tool-conditioned teacher_search`
+1. whether `how much` is truly injected into TEdit diffusion internals
+2. whether the model can produce monotonic amplitude response under
+   `weak < medium < strong`
+3. whether non-edited regions remain stable while strength increases
 
-Do not introduce student variants into the main pure-editing table until the teacher benchmark is large enough to diagnose weak tool families.
+## Explicitly retired from the mainline
 
-## Student Kickoff Status
+The following pure-editing `how much` routes are not part of the active mainline anymore:
 
-An experimental pure-editing student path now exists, but it is not yet promoted into the locked main protocol.
+- tool-conditioned teacher search as the core method story
+- tool-conditioned student training / runtime override
+- student runtime variants such as `clip`, `clip_guard`, `clip_softguard`
+- any pure-editing argument that depends on teacher pseudo labels as the main contribution
 
-Current student design:
+These historical paths may remain in older reports, but they are not the active protocol and should not be used as the main experimental narrative.
 
-- `tool-conditioned heads`, not unified spec
-- supported heads:
-  - `spike_inject`
-  - `step_shift`
-  - `hybrid_up`
-  - `hybrid_down`
-  - `volatility_global_scale`
-  - `volatility_local_burst`
-  - `volatility_envelope_monotonic`
-- `preview_non_monotonic` remains outside the student path on purpose
+## Required evidence
 
-Current repo entrypoints:
+Mainline experiments should prioritize:
 
-- teacher dump + train:
-  - `test_scripts/train_pure_editing_student.py --testset <event_json> --output-dir <student_dir>`
-- runtime injection:
-  - `run_pipeline.py --how-much-student-model <student_json>`
+1. internal probe
+   - same input / same prompt / same seed
+   - only change `strength_label`
+   - verify that the internal diffusion output changes
+2. monotonicity
+   - same `source + instruction + region + task`
+   - verify `weak < medium < strong`
+3. preservation
+   - verify that background-region error does not drift uncontrollably
+4. ablation
+   - original TEdit
+   - prompt-only strength
+   - internal residual modulation
 
-Current reading:
+## Current Phase 1 boundary
 
-- ETTh1 24-sample kickoff:
-  - heldout target MAE:
-    - student `0.4292`
-    - teacher `0.4219`
-    - heuristic `0.5248`
-  - student better rate vs heuristic: `1.00`
-- ETTh1 56-sample kickoff:
-  - heldout target MAE:
-    - student `0.4962`
-    - teacher `0.4218`
-    - heuristic `0.5025`
-  - student better rate vs heuristic: `0.64`
-- ETTh1 + ETTm1 combined kickoff:
-  - heldout target MAE:
-    - student `0.5408`
-    - teacher `0.4257`
-    - heuristic `0.5265`
-  - student better rate vs heuristic: `0.44`
+- active input path:
+  - `strength_label`
+  - `instruction_text`
+- active training supervision:
+  - family-based `trend_injection` targets
+  - edit-region target reconstruction
+  - background preservation
+  - `weak < medium < strong` ranking on the same family
+- `task_id` is implementation-retained but not required for the current Phase 1 conclusion
+- benchmark form:
+  - same `source + tool family + region + shape template`
+  - only change `weak / medium / strong`
+- training data form:
+  - same `source + region + prompt template`
+  - only change `weak / medium / strong`
+  - do not use `trend_types` attribute-gap supervision as the Phase 1 main training source
+- free-text strength parsing:
+  - first normalize text to one of `weak / medium / strong`
+  - constraint words such as `别过冲` are recorded separately and do not create a new strength class
 
-Current interpretation:
+## Runtime rule
 
-- the teacher-label dump, tool-conditioned head training, and runtime override path are all functional
-- the current lightweight linear student is not yet stable enough to replace teacher search or enter the main pure-editing result table
-- the next student work should focus on model adequacy and per-tool calibration quality, not on reopening volatility taxonomy or routing
-
-## Student Capacity Ablation
-
-The current student question is no longer whether a student path can run, but what the minimum adequate capacity is.
-
-Current ablation set:
-
-1. `linear`
-2. `quadratic`
-3. `mixed_capacity`
-   - `volatility_global_scale`, `volatility_envelope_monotonic`: tiny MLP heads
-   - `spike_inject`, `hybrid_up`, `volatility_local_burst`: quadratic heads
-   - `step_shift`, `hybrid_down`: linear heads
-
-Current ETTh1 56-sample heldout reading:
-
-- `linear`
-  - student MAE `0.5053`
-  - heuristic MAE `0.5024`
-  - teacher gap closed `0.0712`
-- `quadratic`
-  - student MAE `0.7004`
-  - heuristic MAE `0.5027`
-  - teacher gap closed `-1.5313`
-- `mixed_capacity`
-  - student MAE `0.4843`
-  - heuristic MAE `0.5025`
-  - teacher gap closed `0.4563`
-
-Current interpretation:
-
-- `mixed_capacity` is the best current student variant and materially improves over the plain linear head
-- a naive global `quadratic` upgrade overfits and should not be treated as the default next step
-- the remaining bottleneck is per-tool adequacy, especially:
-  - `volatility_global_scale`
-  - `volatility_envelope_monotonic`
-  - cross-distribution robustness
-
-Current runtime note:
-
-- 3-sample ETTh1 smoke confirms `mixed_capacity` runtime override works and is less damaging than the initial linear kickoff
-- it is still worse than the frozen teacher-backed `full_bettertse` path, so student remains experimental rather than promoted
-
-## Runtime-Safe Student Variants
-
-To reduce runtime mismatch, the current student path now supports:
-
-1. `v1`
-2. `clip`
-   - clip each head to its teacher-label training quantile band
-3. `clip_guard`
-   - apply clipping
-   - if the sample is in low-support space or the prediction is clipped too aggressively, fallback to heuristic how-much
-4. `clip_softguard`
-   - apply clipping
-   - use per-tool risk calibration instead of a single global guard
-   - only raise fallback pressure when low support and large support-domain deviation appear together
-   - blend student and heuristic parameters with a risk-dependent soft fallback before any hard fallback is allowed
-
-Current ETTh1 56-sample heldout reading for `mixed_capacity`:
-
-- `v1`
-  - student MAE `0.4843`
-  - teacher gap closed `0.4563`
-  - fallback rate `0.00`
-- `clip`
-  - student MAE `0.4614`
-  - teacher gap closed `0.3083`
-  - fallback rate `0.00`
-- `clip_guard`
-  - student MAE `0.4906`
-  - teacher gap closed `0.3028`
-  - fallback rate `0.82`
-- `clip_softguard`
-  - student MAE `0.4778`
-  - teacher gap closed `0.3868`
-  - fallback rate `0.45`
-  - softguard rate `0.55`
-  - avg guard weight `0.6188`
-  - note: current `clip_softguard` now includes per-tool quality prior and semantic risk calibration
-
-Current ETTh1+ETTm1 combined heldout reading for `mixed_capacity clip_softguard`:
-
-- student MAE `0.4858`
-- heuristic MAE `0.4875`
-- teacher gap closed `0.2091`
-- fallback rate `0.6875`
-- softguard rate `0.0625`
-- avg guard weight `0.7368`
-
-Current ETTh1 20-sample runtime smoke:
-
-- frozen teacher-backed full chain
-  - target MAE `1.1404`
-  - preservation MAE `0.6114`
-- `mixed_capacity v1`
-  - target MAE `1.3280`
-  - preservation MAE `0.6657`
-- `mixed_capacity clip`
-  - target MAE `1.3673`
-  - preservation MAE `0.7071`
-- `mixed_capacity clip_guard`
-  - target MAE `0.6552`
-  - preservation MAE `0.4189`
-  - note: this was only validated on the earlier 3-sample smoke because the global guard was too conservative
-- `mixed_capacity clip_softguard`
-  - target MAE `1.1948`
-  - preservation MAE `0.6430`
-- `mixed_capacity hard_head_semantic_calibration`
-  - ETTh1 heldout MAE `0.4579`
-  - ETTh1+ETTm1 combined MAE `0.4791`
-  - runtime target MAE `1.2267`
-  - runtime preservation MAE `0.7029`
-- `mixed_capacity hard_head_residual_semantic_calibration`
-  - ETTh1 heldout MAE `0.4580`
-  - ETTh1+ETTm1 combined MAE `0.4801`
-  - runtime target MAE `1.2068`
-  - runtime preservation MAE `0.6536`
-- `mixed_capacity hard_head_residual_semantic_calibration_v2`
-  - ETTh1 heldout MAE `0.4580`
-  - ETTh1+ETTm1 combined MAE `0.4789`
-  - runtime target MAE `1.1908`
-  - runtime preservation MAE `0.6392`
-
-Current interpretation:
-
-- the best current student is still `mixed_capacity`
-- naive clipping helps heldout MAE but hurts runtime
-- per-tool softguard is now the best balanced deployment candidate:
-  - it restores the combined ETTh1+ETTm1 heldout result to slightly better than heuristic
-  - it remains clearly safer than raw `v1` and plain `clip` on runtime
-- the newest hard-head semantic calibration only targets `spike_inject` and `hybrid_up`
-  - both heads are now treated as semantic-risk heads rather than ordinary full-override heads
-  - the strongest candidate is `hard_head_residual_semantic_calibration`, which uses `heuristic base + bounded residual student`
-  - the newest `v2` variant goes further and treats the hardest heads as bounded correction heads with decomposed residual semantics
-  - that version is the first hard-head residual variant to beat `clip_softguard_v3` on the 20-sample runtime smoke
-- however, the student path still does not beat the frozen teacher-backed full chain on the 20-sample runtime smoke
-- the current bottleneck is therefore deployment calibration for the hardest heads, not taxonomy, routing, or volatility split design
-
-## Current teacher design
-
-The teacher is tool-conditioned and searches directly in each tool's native parameter space.
-
-Current search families:
-
-- `spike_inject`
-  - `center / width / amplitude`
+`run_pipeline.py` should follow the locked mainline only.
+Do not reintroduce the retired pure-editing student override path into the runtime entrypoint.
 - `step_shift`
   - `level_shift / left_ramp_steps / right_ramp_steps`
 - `hybrid_up`
@@ -295,14 +160,14 @@ Current interpretation:
 - most main tool families already show positive signal
 - `volatility_increase` is still a weak tool family and should be audited before student distillation
 
-## Current 50-sample stress checkpoint
+## Historical 50-sample stress checkpoint
 
 Reference artifacts:
 
 - `tmp/how_much/pure_editing/stress50/pure_editing_how_much_stress_ETTh1_50.json`
 - `tmp/how_much/pure_editing/teacher_protocol_stress50.json`
 
-This stress benchmark is tool-balanced and parameter-coverage oriented. It is the preferred diagnostic benchmark when the goal is to study `how much`, not prompt diversity.
+This stress benchmark is historical background only. It is no longer the preferred benchmark for the current discrete strength-control mainline.
 
 Current reading:
 

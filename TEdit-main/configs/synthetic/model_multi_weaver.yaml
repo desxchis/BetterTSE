@@ -41,6 +41,10 @@ diffusion:
     text_dim: 64
     text_num_buckets: 4096
     dropout: 0.0
+    edit_region_loss_weight: 1.0
+    background_loss_weight: 0.2
+    monotonic_loss_weight: 0.5
+    monotonic_margin: 0.001
   ##### attr projector: deprecated
   attr_heads: 8
   attr_layers: 2

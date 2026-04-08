@@ -40,6 +40,7 @@ class Finetuner:
         self.strength_diagnostics_interval = int(self.configs.get("strength_diagnostics_interval", 50))
         self.freeze_backbone_for_strength = bool(self.configs.get("freeze_backbone_for_strength", False))
         self.instruction_text_dropout_prob = float(self.configs.get("instruction_text_dropout_prob", 0.0))
+        self.run_generation_eval = bool(self.configs.get("run_generation_eval", True))
 
         self.include_self = self.configs["include_self"]
 
@@ -221,7 +222,8 @@ class Finetuner:
             self._train_epoch(epoch_no)
             if self.valid_loader is not None and (epoch_no + 1) % self.valid_epoch_interval == 0:
                 self.valid(epoch_no)
-                self.evaluate(epoch_no)
+                if self.run_generation_eval:
+                    self.evaluate(epoch_no)
     
     def evaluate(self, epoch_no):
         metric_list = ["cos", "rats", "auc"]

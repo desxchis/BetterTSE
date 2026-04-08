@@ -1,9 +1,11 @@
 from torch.utils.data import DataLoader
 
+from .discrete_strength_family import DiscreteStrengthFamilyDataset
 from .synthetic_finetune import SyntheticDataset
 from .synthetic_pretrain import SyntheticPretrainDataset
 
 datasets = {
+    "discrete_strength_family": DiscreteStrengthFamilyDataset,
     "synthetic": SyntheticDataset,
     "synthetic_pretrain": SyntheticPretrainDataset,
 }
@@ -15,6 +17,14 @@ class EditDataset:
         self.dataset = datasets[configs["name"]](**configs)
 
     def get_loader(self, split, batch_size, shuffle=True, num_workers=1, include_self=False):
+        if hasattr(self.dataset, "get_loader"):
+            return self.dataset.get_loader(
+                split=split,
+                batch_size=batch_size,
+                shuffle=shuffle,
+                num_workers=num_workers,
+                include_self=include_self,
+            )
         loader = DataLoader(
             dataset=self.dataset.get_split(split, include_self), 
             batch_size=batch_size, 

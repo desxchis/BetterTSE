@@ -128,6 +128,8 @@ def _evaluate_edit(evaluator, sampler="ddim", n_samples=1, c_mean=None):
 def run(finetune_configs, eval_configs, model_configs, output_folder_all, data_folder="", only_evaluate="false", c_mean=None):    
     ### finetune ###
     ctrl_attrs = finetune_configs["train"]["ctrl_attrs"]
+    data_name = str(finetune_configs["data"]["name"])
+    skip_final_evaluate = bool(finetune_configs["train"].get("skip_final_evaluate", False))
 
     df_list = []
     for attrs in ctrl_attrs:
@@ -139,20 +141,27 @@ def run(finetune_configs, eval_configs, model_configs, output_folder_all, data_f
         output_folder = os.path.join(output_folder_all, "_".join(attrs))
 
         os.makedirs(output_folder, exist_ok=True)
-        finetune_configs["data"]["folder"] = os.path.join(data_folder, "_".join(attrs))
-        eval_configs["data"]["folder"] = os.path.join(data_folder, "_".join(attrs))
+        if data_name == "discrete_strength_family":
+            finetune_configs["data"]["folder"] = data_folder
+            eval_configs["data"]["folder"] = data_folder
+        else:
+            finetune_configs["data"]["folder"] = os.path.join(data_folder, "_".join(attrs))
+            eval_configs["data"]["folder"] = os.path.join(data_folder, "_".join(attrs))
         if only_evaluate == "false" and not os.path.exists(os.path.join(output_folder, "ckpts/model_best.pth")):
             eval_configs["eval"]["model_path"] = ""
             finetune(finetune_configs, model_configs, eval_configs, output_folder, c_mean)
 
-        eval_configs["eval"]["model_path"] = os.path.join(output_folder, "ckpts/model_best.pth")
-        df = evaluate(eval_configs, model_configs, output_folder, c_mean=c_mean)
-    
-        n_records = df.shape[0]
-        df.insert(0, column="ctrl_attrs", value=[str(attrs)]*n_records)
-        df_list.append(df)
+        if not skip_final_evaluate:
+            eval_configs["eval"]["model_path"] = os.path.join(output_folder, "ckpts/model_best.pth")
+            df = evaluate(eval_configs, model_configs, output_folder, c_mean=c_mean)
+            n_records = df.shape[0]
+            df.insert(0, column="ctrl_attrs", value=[str(attrs)]*n_records)
+            df_list.append(df)
 
-    df_finetune = pd.concat(df_list, ignore_index=True)
+    if df_list:
+        df_finetune = pd.concat(df_list, ignore_index=True)
+    else:
+        df_finetune = pd.DataFrame()
     path = os.path.join(output_folder, "results_finetune.csv")
     df_finetune.to_csv(path)
     return df_finetune

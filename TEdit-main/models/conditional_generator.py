@@ -15,6 +15,11 @@ class ConditionalGenerator(nn.Module):
     def __init__(self, configs):
         super().__init__()
         self.device = configs["device"]
+        strength_cfg = dict(configs.get("diffusion", {}).get("strength_control") or {})
+        self.edit_region_loss_weight = float(strength_cfg.get("edit_region_loss_weight", 0.0))
+        self.background_loss_weight = float(strength_cfg.get("background_loss_weight", 0.0))
+        self.monotonic_loss_weight = float(strength_cfg.get("monotonic_loss_weight", 0.0))
+        self.monotonic_margin = float(strength_cfg.get("monotonic_margin", 1.0e-3))
 
         self._init_condition_encoders(configs["attrs"], configs["side"])
         self._init_diff(configs["diffusion"])
@@ -218,7 +223,66 @@ class ConditionalGenerator(nn.Module):
                         text_context=instruction_text,
                     )
             loss_tgt = loss_tgt/self.num_steps
-        return loss_tgt
+        total_loss = loss_tgt
+        mask_gt = batch.get("mask_gt")
+        family_sizes = batch.get("family_sizes")
+        if mask_gt is not None:
+            mask_gt = mask_gt.to(self.device).float()
+            if mask_gt.dim() == 3:
+                mask_gt = mask_gt.permute(0, 2, 1)
+            elif mask_gt.dim() == 2:
+                mask_gt = mask_gt.unsqueeze(1)
+            total_loss = total_loss + self._strength_supervision_loss(
+                src_x=src_x,
+                tgt_x=tgt_x,
+                tgt_x_pred=tgt_x_pred,
+                mask_gt=mask_gt,
+                family_sizes=family_sizes,
+            )
+        return total_loss
+
+    def _masked_mean(self, values, mask, eps=1.0e-8):
+        mask = mask.float()
+        denom = torch.clamp(mask.sum(dim=(1, 2)), min=eps)
+        numer = (values * mask).sum(dim=(1, 2))
+        return numer / denom
+
+    def _strength_supervision_loss(self, src_x, tgt_x, tgt_x_pred, mask_gt, family_sizes=None):
+        abs_pred_target = torch.abs(tgt_x_pred - tgt_x)
+        abs_pred_source = torch.abs(tgt_x_pred - src_x)
+        edit_mask = mask_gt
+        bg_mask = 1.0 - edit_mask
+
+        losses = []
+        if self.edit_region_loss_weight > 0.0:
+            edit_region_l1 = self._masked_mean(abs_pred_target, edit_mask).mean()
+            losses.append(self.edit_region_loss_weight * edit_region_l1)
+        if self.background_loss_weight > 0.0:
+            background_l1 = self._masked_mean(abs_pred_source, bg_mask).mean()
+            losses.append(self.background_loss_weight * background_l1)
+        if self.monotonic_loss_weight > 0.0 and family_sizes is not None:
+            gains = self._masked_mean(abs_pred_source, edit_mask)
+            monotonic_losses = []
+            start_idx = 0
+            for family_size in family_sizes.detach().cpu().tolist():
+                family_size = int(family_size)
+                family_gains = gains[start_idx:start_idx + family_size]
+                start_idx += family_size
+                if family_gains.numel() < 3:
+                    continue
+                weak_gain = family_gains[0]
+                medium_gain = family_gains[1]
+                strong_gain = family_gains[2]
+                monotonic_losses.append(
+                    torch.relu(self.monotonic_margin + weak_gain - medium_gain)
+                    + torch.relu(self.monotonic_margin + medium_gain - strong_gain)
+                )
+            if monotonic_losses:
+                monotonic_loss = torch.stack(monotonic_losses).mean()
+                losses.append(self.monotonic_loss_weight * monotonic_loss)
+        if not losses:
+            return src_x.new_tensor(0.0)
+        return torch.stack(losses).sum()
 
     def _bootstrap(self, tgt_x_pred, src_x, side_emb, src_attr_emb, tgt_attr_emb):
         """
