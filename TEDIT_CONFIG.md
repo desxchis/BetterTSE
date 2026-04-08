@@ -1,5 +1,9 @@
 # TEdit模型权重配置说明
 
+> 主线边界说明（2026-03-18）：
+> TEdit 在本仓库中的角色是 **forecast revision 执行器**（编辑层），用于将 planner 给出的 `what/where/how` 落地到预测修正。
+> TEdit 配置和示例用于服务 `run_forecast_revision.py` 与相关 benchmark 流程，不作为独立主线。
+
 ## 模型权重位置
 
 TEdit模型权重已经存在于以下位置：

@@ -25,6 +25,19 @@ diffusion:
   bootstrap_ratio: 0.5   # [0,1]
   
   is_attr_proj: False
+  strength_control:
+    enabled: false
+    mode: modulation_residual
+    num_strength_bins: 3
+    num_tasks: 8
+    emb_dim: 32
+    hidden_dim: 64
+    out_dim: 64
+    use_text_context: true
+    use_task_id: false
+    text_dim: 64
+    text_num_buckets: 4096
+    dropout: 0.0
 
   ##### attr projector: deprecated
   attr_heads: 8

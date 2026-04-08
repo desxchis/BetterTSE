@@ -29,6 +29,14 @@ DEFAULT_INJECTION_TYPES = [
     "noise_injection",
 ]
 
+TASK_NAME_TO_ID = {
+    "trend_up": 0,
+    "trend_down": 1,
+    "seasonality_neutral": 2,
+    "volatility_neutral": 3,
+    "mixed_neutral": 4,
+}
+
 DURATION_BUCKET_SPECS = {
     "short": (0.08, 0.12),
     "medium": (0.14, 0.20),
@@ -96,6 +104,22 @@ def _target_energy_type(base_ts: np.ndarray, target_ts: np.ndarray, start_step: 
     if area >= peak * 0.60:
         return "area_dominant"
     return "mixed"
+
+
+def _strength_label_id(bucket: str) -> int:
+    return {"weak": 0, "medium": 1, "strong": 2}.get(str(bucket), 1)
+
+
+def _task_id_from_intent(intent: Dict[str, Any]) -> int:
+    effect_family = str(intent.get("effect_family", "unknown"))
+    direction = str(intent.get("direction", "neutral"))
+    if effect_family == "trend":
+        return TASK_NAME_TO_ID["trend_down" if direction == "down" else "trend_up"]
+    if effect_family == "seasonality":
+        return TASK_NAME_TO_ID["seasonality_neutral"]
+    if effect_family == "volatility":
+        return TASK_NAME_TO_ID["volatility_neutral"]
+    return TASK_NAME_TO_ID["mixed_neutral"]
 
 
 def build_stress_benchmark(
@@ -179,9 +203,16 @@ def build_stress_benchmark(
             )
             sample_payload = asdict(sample)
             sample_payload["vague_prompt"] = prompt_text
+            sample_payload["source_ts"] = sample_payload["base_ts"]
+            sample_payload["instruction_text"] = prompt_text
+            sample_payload["strength_label"] = _strength_label_id(edit_intent_gt["strength"])
+            sample_payload["task_id"] = _task_id_from_intent(edit_intent_gt)
+            sample_payload["region"] = [int(sample.gt_start), int(sample.gt_end)]
             sample_payload["stress_metadata"] = {
                 "duration_bucket": duration_bucket,
                 "strength_bucket": edit_intent_gt["strength"],
+                "strength_label": sample_payload["strength_label"],
+                "task_id": sample_payload["task_id"],
                 "target_energy_type": _target_energy_type(base_ts, target_ts, sample.gt_start, sample.gt_end),
                 "injection_type": injection_type,
             }

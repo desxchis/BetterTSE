@@ -179,6 +179,21 @@ Current ETTh1 20-sample runtime smoke:
 - `mixed_capacity clip_softguard`
   - target MAE `1.1948`
   - preservation MAE `0.6430`
+- `mixed_capacity hard_head_semantic_calibration`
+  - ETTh1 heldout MAE `0.4579`
+  - ETTh1+ETTm1 combined MAE `0.4791`
+  - runtime target MAE `1.2267`
+  - runtime preservation MAE `0.7029`
+- `mixed_capacity hard_head_residual_semantic_calibration`
+  - ETTh1 heldout MAE `0.4580`
+  - ETTh1+ETTm1 combined MAE `0.4801`
+  - runtime target MAE `1.2068`
+  - runtime preservation MAE `0.6536`
+- `mixed_capacity hard_head_residual_semantic_calibration_v2`
+  - ETTh1 heldout MAE `0.4580`
+  - ETTh1+ETTm1 combined MAE `0.4789`
+  - runtime target MAE `1.1908`
+  - runtime preservation MAE `0.6392`
 
 Current interpretation:
 
@@ -187,6 +202,11 @@ Current interpretation:
 - per-tool softguard is now the best balanced deployment candidate:
   - it restores the combined ETTh1+ETTm1 heldout result to slightly better than heuristic
   - it remains clearly safer than raw `v1` and plain `clip` on runtime
+- the newest hard-head semantic calibration only targets `spike_inject` and `hybrid_up`
+  - both heads are now treated as semantic-risk heads rather than ordinary full-override heads
+  - the strongest candidate is `hard_head_residual_semantic_calibration`, which uses `heuristic base + bounded residual student`
+  - the newest `v2` variant goes further and treats the hardest heads as bounded correction heads with decomposed residual semantics
+  - that version is the first hard-head residual variant to beat `clip_softguard_v3` on the 20-sample runtime smoke
 - however, the student path still does not beat the frozen teacher-backed full chain on the 20-sample runtime smoke
 - the current bottleneck is therefore deployment calibration for the hardest heads, not taxonomy, routing, or volatility split design
 

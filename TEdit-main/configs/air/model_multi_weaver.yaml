@@ -27,6 +27,19 @@ diffusion:
   is_attr_proj: False
 
   attr_proj_type: avg
+  strength_control:
+    enabled: false
+    mode: modulation_residual
+    num_strength_bins: 3
+    num_tasks: 8
+    emb_dim: 32
+    hidden_dim: 64
+    out_dim: 64
+    use_text_context: true
+    use_task_id: false
+    text_dim: 64
+    text_num_buckets: 4096
+    dropout: 0.0
   ##### attr projector: deprecated
   attr_heads: 8
   attr_layers: 2

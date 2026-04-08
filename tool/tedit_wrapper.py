@@ -131,11 +131,11 @@ class TEditWrapper:
             # Load state dict
             if isinstance(checkpoint, dict):
                 if "model_state_dict" in checkpoint:
-                    self.model.load_state_dict(checkpoint["model_state_dict"])
+                    self.model.load_state_dict(checkpoint["model_state_dict"], strict=False)
                 else:
-                    self.model.load_state_dict(checkpoint)
+                    self.model.load_state_dict(checkpoint, strict=False)
             else:
-                self.model.load_state_dict(checkpoint)
+                self.model.load_state_dict(checkpoint, strict=False)
             
             self.model.eval()
             self.is_loaded = True
@@ -150,6 +150,9 @@ class TEditWrapper:
         n_samples: int = 1,
         sampler: str = "ddim",
         edit_steps: Optional[int] = None,
+        strength_label: Optional[int] = None,
+        task_id: Optional[int] = None,
+        instruction_text: Optional[np.ndarray] = None,
     ) -> np.ndarray:
         """Edit time series using TEdit model.
 
@@ -210,6 +213,15 @@ class TEditWrapper:
                 "tgt_x": x.permute(0, 2, 1),
                 "tp": tp,
             }
+            if strength_label is not None:
+                batch["strength_label"] = torch.full((B,), int(strength_label), device=self.device, dtype=torch.long)
+            if task_id is not None:
+                batch["task_id"] = torch.full((B,), int(task_id), device=self.device, dtype=torch.long)
+            if instruction_text is not None:
+                if isinstance(instruction_text, (str, list, tuple)):
+                    batch["instruction_text"] = instruction_text
+                else:
+                    batch["instruction_text"] = torch.as_tensor(instruction_text, device=self.device)
 
             if edit_steps is not None:
                 self.model.edit_steps = edit_steps
@@ -229,6 +241,9 @@ class TEditWrapper:
         tgt_attrs: np.ndarray,
         n_samples: int = 1,
         sampler: str = "ddim",
+        strength_label: Optional[int] = None,
+        task_id: Optional[int] = None,
+        instruction_text: Optional[np.ndarray] = None,
     ) -> np.ndarray:
         """Edit a specific region of time series.
 
@@ -252,7 +267,14 @@ class TEditWrapper:
         region = ts_array[start_idx:end_idx].copy()
 
         edited_region = self.edit_time_series(
-            region, src_attrs, tgt_attrs, n_samples, sampler
+            region,
+            src_attrs,
+            tgt_attrs,
+            strength_label=strength_label,
+            task_id=task_id,
+            instruction_text=instruction_text,
+            n_samples=n_samples,
+            sampler=sampler,
         )
 
         result = ts_array.copy()
@@ -328,6 +350,9 @@ class TEditWrapper:
         n_samples: int = 1,
         sampler: str = "ddim",
         smooth_radius: float = 3.0,
+        strength_label: Optional[int] = None,
+        task_id: Optional[int] = None,
+        instruction_text: Optional[np.ndarray] = None,
     ) -> np.ndarray:
         """Edit a specific region using Latent Blending (State-Space Mixing).
 
@@ -394,6 +419,15 @@ class TEditWrapper:
                 "tgt_x": x.permute(0, 2, 1),
                 "tp": tp,
             }
+            if strength_label is not None:
+                batch["strength_label"] = torch.full((B,), int(strength_label), device=self.device, dtype=torch.long)
+            if task_id is not None:
+                batch["task_id"] = torch.full((B,), int(task_id), device=self.device, dtype=torch.long)
+            if instruction_text is not None:
+                if isinstance(instruction_text, (str, list, tuple)):
+                    batch["instruction_text"] = instruction_text
+                else:
+                    batch["instruction_text"] = torch.as_tensor(instruction_text, device=self.device)
 
             samples = self.model.edit_soft(
                 batch,

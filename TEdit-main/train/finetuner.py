@@ -1,5 +1,6 @@
 import os
 import time
+import json
 
 import torch
 from torch.optim import Adam
@@ -33,12 +34,18 @@ class Finetuner:
         self.display_epoch_interval = self.configs["display_interval"]
 
         self.lr = self.configs["lr"]
+        self.strength_lr_scale = float(self.configs.get("strength_lr_scale", 1.0))
         self.batch_size = self.configs["batch_size"]
+        self.strength_diagnostics_enabled = bool(self.configs.get("strength_diagnostics_enabled", False))
+        self.strength_diagnostics_interval = int(self.configs.get("strength_diagnostics_interval", 50))
+        self.freeze_backbone_for_strength = bool(self.configs.get("freeze_backbone_for_strength", False))
+        self.instruction_text_dropout_prob = float(self.configs.get("instruction_text_dropout_prob", 0.0))
 
         self.include_self = self.configs["include_self"]
 
         self.model_path = self.configs["model_path"]  # resume training
         self.output_folder = configs["output_folder"]
+        self.strength_diag_path = os.path.join(self.output_folder, "strength_diagnostics.jsonl")
         
         os.makedirs(self.output_folder, exist_ok=True)
 
@@ -47,6 +54,8 @@ class Finetuner:
         if self.model_path != "":
             print("Laoding pretrained model from {}".format(self.model_path))
             self.model.load_state_dict(torch.load(self.model_path), strict=False)
+        if self.freeze_backbone_for_strength:
+            self._freeze_backbone_for_strength()
 
     def _init_guider(self, guider):
         self.guider = guider.to(self.model.device)
@@ -54,7 +63,29 @@ class Finetuner:
         self.guider.load_state_dict(torch.load(self.model_path), strict=False)
 
     def _init_opt(self):
-        self.opt = Adam(self.model.parameters(), lr=self.lr, weight_decay=1e-6)
+        named_params = list(self.model.named_parameters())
+        strength_params = []
+        backbone_params = []
+        self._strength_param_meta = []
+        for name, param in named_params:
+            if not param.requires_grad:
+                continue
+            if self._is_strength_parameter(name):
+                strength_params.append(param)
+                self._strength_param_meta.append((name, param))
+            else:
+                backbone_params.append(param)
+
+        param_groups = []
+        if backbone_params:
+            param_groups.append({"params": backbone_params, "lr": self.lr})
+        if strength_params:
+            param_groups.append({"params": strength_params, "lr": self.lr * self.strength_lr_scale})
+        self.opt = Adam(param_groups, lr=self.lr, weight_decay=1e-6)
+        self._strength_param_init = {
+            name: param.detach().cpu().clone()
+            for name, param in self._strength_param_meta
+        }
 
     def _init_data(self, dataset):
         self.dataset = dataset
@@ -66,6 +97,120 @@ class Finetuner:
     def _reset_train(self):
         self._best_valid_loss = 1e10
         self._global_batch_no = 0
+        if self.strength_diagnostics_enabled and os.path.exists(self.strength_diag_path):
+            os.remove(self.strength_diag_path)
+
+    def _is_strength_parameter(self, name):
+        return (
+            "strength_projector" in name
+            or "strength_modulation" in name
+            or "strength_input_projection" in name
+        )
+
+    def _is_modulation_neighbor_parameter(self, name):
+        return (
+            "base_modulation" in name
+            or "diffusion_projection" in name
+            or "attr_projection" in name
+        )
+
+    def _freeze_backbone_for_strength(self):
+        for name, param in self.model.named_parameters():
+            param.requires_grad = self._is_strength_parameter(name) or self._is_modulation_neighbor_parameter(name)
+
+    def _tensor_histogram(self, values):
+        if values is None:
+            return {}
+        if not isinstance(values, torch.Tensor):
+            values = torch.as_tensor(values)
+        if values.numel() == 0:
+            return {}
+        unique, counts = torch.unique(values.detach().cpu().long(), return_counts=True)
+        return {str(int(k)): int(v) for k, v in zip(unique.tolist(), counts.tolist())}
+
+    def _batch_strength_stats(self, batch):
+        stats = {
+            "strength_hist": self._tensor_histogram(batch.get("strength_label")),
+            "task_hist": self._tensor_histogram(batch.get("task_id")),
+        }
+        tgt_x = batch.get("tgt_x")
+        src_x = batch.get("src_x")
+        strength_label = batch.get("strength_label")
+        task_id = batch.get("task_id")
+        if not isinstance(tgt_x, torch.Tensor) or not isinstance(strength_label, torch.Tensor):
+            return stats
+
+        tgt_cpu = tgt_x.detach().cpu().float()
+        src_cpu = src_x.detach().cpu().float() if isinstance(src_x, torch.Tensor) else None
+        strength_cpu = strength_label.detach().cpu().long()
+        task_cpu = task_id.detach().cpu().long() if isinstance(task_id, torch.Tensor) else torch.zeros_like(strength_cpu)
+        task_gap_stats = []
+        for task_value in torch.unique(task_cpu):
+            task_mask = task_cpu == task_value
+            weak_mask = task_mask & (strength_cpu == 0)
+            strong_mask = task_mask & (strength_cpu == 2)
+            if int(weak_mask.sum()) == 0 or int(strong_mask.sum()) == 0:
+                continue
+            weak_target = tgt_cpu[weak_mask].mean(dim=0)
+            strong_target = tgt_cpu[strong_mask].mean(dim=0)
+            target_mse = float(torch.mean((weak_target - strong_target) ** 2).item())
+            gap = {"task_id": int(task_value.item()), "target_mse": target_mse}
+            if src_cpu is not None:
+                weak_src = src_cpu[weak_mask].mean(dim=0)
+                strong_src = src_cpu[strong_mask].mean(dim=0)
+                weak_delta = weak_target - weak_src
+                strong_delta = strong_target - strong_src
+                gap["peak_delta_gap"] = float((strong_delta.abs().max() - weak_delta.abs().max()).item())
+                gap["signed_area_gap"] = float((strong_delta.sum() - weak_delta.sum()).item())
+            task_gap_stats.append(gap)
+        stats["task_gap_stats"] = task_gap_stats
+        return stats
+
+    def _collect_strength_diagnostics(self, batch, loss):
+        modules = []
+        for name, param in self._strength_param_meta:
+            grad_norm = None if param.grad is None else float(param.grad.detach().norm().item())
+            init_tensor = self._strength_param_init[name].to(param.device)
+            delta_norm = float((param.detach() - init_tensor).norm().item())
+            modules.append(
+                {
+                    "name": name,
+                    "grad_norm": grad_norm,
+                    "param_norm": float(param.detach().norm().item()),
+                    "delta_from_init_norm": delta_norm,
+                }
+            )
+        payload = {
+            "step": int(self._global_batch_no),
+            "loss": float(loss.item()),
+            "strength_lr_scale": float(self.strength_lr_scale),
+            "strength_modules": modules,
+            "batch_stats": self._batch_strength_stats(batch),
+        }
+        with open(self.strength_diag_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+
+    def _apply_instruction_text_dropout(self, batch):
+        if self.instruction_text_dropout_prob <= 0.0:
+            return batch
+        instruction_text = batch.get("instruction_text")
+        if instruction_text is None:
+            return batch
+
+        dropped_batch = dict(batch)
+        if isinstance(instruction_text, torch.Tensor):
+            mask = torch.rand(instruction_text.shape[0]) < self.instruction_text_dropout_prob
+            dropped = instruction_text.clone()
+            if dropped.dim() >= 2:
+                dropped[mask] = 0
+            dropped_batch["instruction_text"] = dropped
+        elif isinstance(instruction_text, (list, tuple)):
+            dropped = list(instruction_text)
+            for idx in range(len(dropped)):
+                if torch.rand(1).item() < self.instruction_text_dropout_prob:
+                    dropped[idx] = ""
+            dropped_batch["instruction_text"] = dropped
+        return dropped_batch
 
     """
     Train.
@@ -109,10 +254,17 @@ class Finetuner:
             self.model.train()
             for batch_no, train_batch in enumerate(self.train_loader):
                 self._global_batch_no += 1
+                train_batch = self._apply_instruction_text_dropout(train_batch)
 
                 self.opt.zero_grad()
                 loss = self.model(train_batch, is_train=True, mode="finetune")
                 loss.backward()
+                if (
+                    self.strength_diagnostics_enabled
+                    and self._strength_param_meta
+                    and self._global_batch_no % max(1, self.strength_diagnostics_interval) == 0
+                ):
+                    self._collect_strength_diagnostics(train_batch, loss)
                 self.opt.step()
                 avg_loss += loss.item()
                 self.tf_writer.add_scalar("Finetune/Train/batch_loss", loss.item(), self._global_batch_no)

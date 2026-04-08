@@ -180,6 +180,11 @@ parser.add_argument("--bootstrap_ratio", type=float, default=0.5)  # the bootstr
 parser.add_argument("--lr", type=float, default=1e-5)  # learning rate, should be smaller than pretrain lr
 parser.add_argument("--epochs", type=int, default=50)  # training epochs
 parser.add_argument("--include_self", type=int, default=1)  # true or false
+parser.add_argument("--freeze-backbone-for-strength", type=int, default=-1)
+parser.add_argument("--instruction-text-dropout-prob", type=float, default=-1.0)
+parser.add_argument("--strength-lr-scale", type=float, default=1.0)
+parser.add_argument("--strength-diagnostics", type=int, default=0)
+parser.add_argument("--strength-diagnostics-interval", type=int, default=50)
 
 args = parser.parse_args()
 
@@ -195,6 +200,13 @@ eval_configs = yaml.safe_load(open(args.evaluate_config_path))
 finetune_configs["train"]["lr"] = args.lr
 finetune_configs["train"]["epochs"] = args.epochs
 finetune_configs["train"]["include_self"] = bool(args.include_self)
+if args.freeze_backbone_for_strength >= 0:
+    finetune_configs["train"]["freeze_backbone_for_strength"] = bool(args.freeze_backbone_for_strength)
+if args.instruction_text_dropout_prob >= 0.0:
+    finetune_configs["train"]["instruction_text_dropout_prob"] = args.instruction_text_dropout_prob
+finetune_configs["train"]["strength_lr_scale"] = args.strength_lr_scale
+finetune_configs["train"]["strength_diagnostics_enabled"] = bool(args.strength_diagnostics)
+finetune_configs["train"]["strength_diagnostics_interval"] = args.strength_diagnostics_interval
 finetune_configs["data"]["name"] = args.data_type
 
 eval_configs["data"]["name"] = args.data_type

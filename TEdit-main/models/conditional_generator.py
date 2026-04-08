@@ -56,8 +56,19 @@ class ConditionalGenerator(nn.Module):
         self.edit_steps = configs["edit_steps"]
         self.bootstrap_ratio = configs["bootstrap_ratio"]
 
-    def predict_noise(self, xt, side_emb, src_attr_emb, t, 
-                       soft_mask=None, keys_null=None, values_null=None):
+    def predict_noise(
+        self,
+        xt,
+        side_emb,
+        src_attr_emb,
+        t,
+        strength_label=None,
+        task_id=None,
+        text_context=None,
+        soft_mask=None,
+        keys_null=None,
+        values_null=None,
+    ):
         """
         Predict noise with optional attention injection for soft-boundary editing.
         
@@ -71,16 +82,35 @@ class ConditionalGenerator(nn.Module):
             values_null: [B, L, D] - Values from null/background condition
         """
         noisy_x = torch.unsqueeze(xt, 1)  # (B,1,K,L): this is required by the diff model
-        pred_noise = self.diff_model(
-            noisy_x, side_emb, src_attr_emb, t,
-            soft_mask=soft_mask, keys_null=keys_null, values_null=values_null
-        )  # (B,K,L)
+        model_kwargs = {}
+        if soft_mask is not None:
+            model_kwargs["soft_mask"] = soft_mask
+        if keys_null is not None:
+            model_kwargs["keys_null"] = keys_null
+        if values_null is not None:
+            model_kwargs["values_null"] = values_null
+        if strength_label is not None:
+            model_kwargs["strength_label"] = strength_label
+        if task_id is not None:
+            model_kwargs["task_id"] = task_id
+        if text_context is not None:
+            model_kwargs["text_context"] = text_context
+
+        pred_noise = self.diff_model(noisy_x, side_emb, src_attr_emb, t, **model_kwargs)  # (B,K,L)
         return pred_noise
 
-    def _noise_estimation_loss(self, x, side_emb, attr_emb, t):        
+    def _noise_estimation_loss(self, x, side_emb, attr_emb, t, strength_label=None, task_id=None, text_context=None):
         noise = torch.randn_like(x)
         noisy_x = self.ddpm.forward(x, t, noise)
-        pred_noise = self.predict_noise(noisy_x, side_emb, attr_emb, t)
+        pred_noise = self.predict_noise(
+            noisy_x,
+            side_emb,
+            attr_emb,
+            t,
+            strength_label=strength_label,
+            task_id=task_id,
+            text_context=text_context,
+        )
         
         residual = noise - pred_noise
         loss = (residual ** 2).mean()
@@ -129,14 +159,23 @@ class ConditionalGenerator(nn.Module):
     """
 
     def fintune(self, batch, is_train):
-        src_x, tp, src_attrs, tgt_attrs, tgt_x = self._unpack_data_edit(batch)
+        src_x, tp, src_attrs, tgt_attrs, tgt_x, strength_label, task_id, instruction_text = self._unpack_data_edit(batch)
 
         side_emb = self.side_en(tp)
         src_attr_emb = self.attr_en(src_attrs)
         tgt_attr_emb = self.attr_en(tgt_attrs)
 
         # src -> tgt
-        tgt_x_pred = self._edit(src_x, side_emb, src_attr_emb, tgt_attr_emb, sampler="ddim")  # (B,V,L)
+        tgt_x_pred = self._edit(
+            src_x,
+            side_emb,
+            src_attr_emb,
+            tgt_attr_emb,
+            sampler="ddim",
+            strength_label=strength_label,
+            task_id=task_id,
+            text_context=instruction_text,
+        )  # (B,V,L)
         if self.bootstrap_ratio > 0:
             bs_ids = self._bootstrap(tgt_x_pred, src_x, side_emb, src_attr_emb, tgt_attr_emb)  # (B)
         else:
@@ -146,7 +185,21 @@ class ConditionalGenerator(nn.Module):
             # tgt
             if bs_ids is not None:
                 t = torch.randint(0, self.num_steps, [len(bs_ids)], device=self.device)
-                loss_tgt = self._noise_estimation_loss(tgt_x_pred[bs_ids], side_emb[bs_ids], tgt_attr_emb[bs_ids], t)
+                loss_tgt = self._noise_estimation_loss(
+                    tgt_x_pred[bs_ids],
+                    side_emb[bs_ids],
+                    tgt_attr_emb[bs_ids],
+                    t,
+                    strength_label=None if strength_label is None else strength_label[bs_ids],
+                    task_id=None if task_id is None else task_id[bs_ids],
+                    text_context=(
+                        None
+                        if instruction_text is None
+                        else [instruction_text[int(i)] for i in bs_ids.detach().cpu().tolist()]
+                        if isinstance(instruction_text, list)
+                        else instruction_text[bs_ids]
+                    ),
+                )
             else:
                 loss_tgt = 0.0
         else:
@@ -155,7 +208,15 @@ class ConditionalGenerator(nn.Module):
             for t in range(self.num_steps):
                 t = (torch.ones(B, device=self.device) * t).long()
                 if self.bootstrap_ratio > 0:
-                    loss_tgt += self._noise_estimation_loss(tgt_x_pred, side_emb, tgt_attr_emb, t)
+                    loss_tgt += self._noise_estimation_loss(
+                        tgt_x_pred,
+                        side_emb,
+                        tgt_attr_emb,
+                        t,
+                        strength_label=strength_label,
+                        task_id=task_id,
+                        text_context=instruction_text,
+                    )
             loss_tgt = loss_tgt/self.num_steps
         return loss_tgt
 
@@ -188,7 +249,22 @@ class ConditionalGenerator(nn.Module):
         
         src_x = src_x.permute(0, 2, 1)  # (B,L,K) -> (B,K,L)
         tgt_x = tgt_x.permute(0, 2, 1)
-        return src_x, tp, src_attrs, tgt_attrs, tgt_x
+        strength_label = batch.get("strength_label")
+        if strength_label is not None:
+            strength_label = strength_label.to(self.device).long()
+        task_id = batch.get("task_id")
+        if task_id is not None:
+            task_id = task_id.to(self.device).long()
+        instruction_text = batch.get("instruction_text")
+        if isinstance(instruction_text, torch.Tensor):
+            instruction_text = instruction_text.to(self.device).float()
+        elif isinstance(instruction_text, str):
+            instruction_text = [instruction_text]
+        elif isinstance(instruction_text, (list, tuple)):
+            instruction_text = [str(item) for item in instruction_text]
+        else:
+            instruction_text = None
+        return src_x, tp, src_attrs, tgt_attrs, tgt_x, strength_label, task_id, instruction_text
 
     """
     Generation.
@@ -198,7 +274,7 @@ class ConditionalGenerator(nn.Module):
         return self.__getattribute__(mode)(batch, n_samples, sampler)
 
     def cond_gen(self, batch, n_samples, sampler="ddpm"):
-        src_x, tp, src_attrs, tgt_attrs, tgt_x = self._unpack_data_edit(batch)
+        src_x, tp, src_attrs, tgt_attrs, tgt_x, strength_label, task_id, instruction_text = self._unpack_data_edit(batch)
 
         side_emb = self.side_en(tp)
         attr_emb = self.attr_en(tgt_attrs)
@@ -209,7 +285,15 @@ class ConditionalGenerator(nn.Module):
             x = torch.randn_like(src_x)
             for t in range(self.num_steps-1, -1, -1):
                 noise = torch.randn_like(x)  # noise for std
-                pred_noise = self.predict_noise(x, side_emb, attr_emb, t)
+                pred_noise = self.predict_noise(
+                    x,
+                    side_emb,
+                    attr_emb,
+                    t,
+                    strength_label=strength_label,
+                    task_id=task_id,
+                    text_context=instruction_text,
+                )
                 t = (torch.ones(B, device=self.device) * t).long()
                 if sampler == "ddpm":
                     x = self.ddpm.reverse(x, pred_noise, t, noise)
@@ -223,7 +307,7 @@ class ConditionalGenerator(nn.Module):
         Args:
            sampler: forward-backward: ddim-ddim or ddim. 
         """
-        src_x, tp, src_attrs, tgt_attrs, tgt_x = self._unpack_data_edit(batch)
+        src_x, tp, src_attrs, tgt_attrs, tgt_x, strength_label, task_id, instruction_text = self._unpack_data_edit(batch)
 
         side_emb = self.side_en(tp)
         src_attr_emb = self.attr_en(src_attrs)
@@ -231,11 +315,20 @@ class ConditionalGenerator(nn.Module):
 
         samples = []        
         for i in range(n_samples):
-            tgt_x_pred = self._edit(src_x, side_emb, src_attr_emb, tgt_attr_emb, sampler)
+            tgt_x_pred = self._edit(
+                src_x,
+                side_emb,
+                src_attr_emb,
+                tgt_attr_emb,
+                sampler,
+                strength_label=strength_label,
+                task_id=task_id,
+                text_context=instruction_text,
+            )
             samples.append(tgt_x_pred)
         return torch.stack(samples)
     
-    def _edit(self, src_x, side_emb, src_attr_emb, tgt_attr_emb, sampler):
+    def _edit(self, src_x, side_emb, src_attr_emb, tgt_attr_emb, sampler, strength_label=None, task_id=None, text_context=None):
         B = src_x.shape[0]
 
         # forward
@@ -257,7 +350,15 @@ class ConditionalGenerator(nn.Module):
         for t in range(self.edit_steps-1, -1, -1):
             noise = torch.randn_like(xt)
             t = (torch.ones(B, device=self.device) * t).long()
-            pred_noise = self.predict_noise(xt, side_emb, tgt_attr_emb, t)
+            pred_noise = self.predict_noise(
+                xt,
+                side_emb,
+                tgt_attr_emb,
+                t,
+                strength_label=strength_label,
+                task_id=task_id,
+                text_context=text_context,
+            )
             if sampler[-4:] == "ddpm":
                 xt = self.ddpm.reverse(xt, pred_noise, t, noise)
             else:
@@ -317,7 +418,7 @@ class ConditionalGenerator(nn.Module):
         Returns:
             torch.Tensor: Edited samples (n_samples, B, K, L)
         """
-        src_x, tp, src_attrs, tgt_attrs, tgt_x = self._unpack_data_edit(batch)
+        src_x, tp, src_attrs, tgt_attrs, tgt_x, strength_label, task_id, instruction_text = self._unpack_data_edit(batch)
 
         side_emb = self.side_en(tp)
         src_attr_emb = self.attr_en(src_attrs)
@@ -329,13 +430,23 @@ class ConditionalGenerator(nn.Module):
 
         samples = []
         for i in range(n_samples):
-            tgt_x_pred = self._edit_soft(src_x, side_emb, src_attr_emb, tgt_attr_emb, sampler, soft_mask)
+            tgt_x_pred = self._edit_soft(
+                src_x,
+                side_emb,
+                src_attr_emb,
+                tgt_attr_emb,
+                sampler,
+                soft_mask,
+                strength_label=strength_label,
+                task_id=task_id,
+                text_context=instruction_text,
+            )
             samples.append(tgt_x_pred)
             
         return torch.stack(samples)
 
     @torch.no_grad()
-    def _edit_soft(self, src_x, side_emb, src_attr_emb, tgt_attr_emb, sampler, soft_mask):
+    def _edit_soft(self, src_x, side_emb, src_attr_emb, tgt_attr_emb, sampler, soft_mask, strength_label=None, task_id=None, text_context=None):
         """
         Core Innovation: Latent Blending (State-Space Mixing) for Ground-Truth Preservation.
 
@@ -405,7 +516,12 @@ class ConditionalGenerator(nn.Module):
             # Foreground: model prediction with target attributes
             pred_noise_tgt = self.predict_noise(
                 xt, side_emb, tgt_attr_emb, t_tensor,
-                soft_mask=soft_mask_attn, keys_null=xt_orig, values_null=xt_orig
+                strength_label=strength_label,
+                task_id=task_id,
+                text_context=text_context,
+                soft_mask=soft_mask_attn,
+                keys_null=xt_orig,
+                values_null=xt_orig,
             )
             if sampler[-4:] == "ddpm":
                 xt_pred = self.ddpm.reverse(xt, pred_noise_tgt, t_tensor, noise)

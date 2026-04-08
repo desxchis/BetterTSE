@@ -15,4 +15,9 @@ train:
   val_epoch_interval: 1
   display_interval: 1
   include_self: True
+  freeze_backbone_for_strength: true
+  instruction_text_dropout_prob: 0.0
+  strength_lr_scale: 1.0
+  strength_diagnostics_enabled: false
+  strength_diagnostics_interval: 50
   ctrl_attrs: [[trend_types], [trend_directions], [season_cycles], [trend_types, trend_directions], [trend_types, season_cycles], [trend_directions, season_cycles]]

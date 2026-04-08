@@ -5,6 +5,8 @@ import math
 from linear_attention_transformer import LinearAttentionTransformer
 import numpy as np
 
+from models.conditioning import StrengthProjector
+
 def get_torch_trans(heads=8, layers=1, channels=64):
     encoder_layer = nn.TransformerEncoderLayer(
         d_model=channels, nhead=heads, dim_feedforward=64, activation="gelu", batch_first=True
@@ -57,13 +59,41 @@ class DiffusionEmbedding(nn.Module):
         return table
 
 class ResidualBlock(nn.Module):
-    def __init__(self, side_dim, attr_dim, channels, diffusion_embedding_dim, nheads, is_linear=False, is_attr_proj=False):
+    def __init__(
+        self,
+        side_dim,
+        attr_dim,
+        channels,
+        diffusion_embedding_dim,
+        nheads,
+        is_linear=False,
+        is_attr_proj=False,
+        strength_cond_dim=0,
+        strength_mode="modulation_residual",
+    ):
         super().__init__()
         self.diffusion_projection = nn.Linear(diffusion_embedding_dim, channels)
         if is_attr_proj:
             self.attr_projection = nn.Linear(attr_dim, channels)
         else:
             self.attr_projection = nn.Identity()
+        self.base_modulation = nn.Sequential(
+            nn.Linear(channels + channels, channels),
+            nn.SiLU(),
+            nn.Linear(channels, 2 * channels),
+        )
+        nn.init.zeros_(self.base_modulation[-1].weight)
+        nn.init.zeros_(self.base_modulation[-1].bias)
+        self.strength_mode = strength_mode
+        self.strength_modulation = None
+        if strength_cond_dim > 0:
+            self.strength_modulation = nn.Sequential(
+                nn.Linear(strength_cond_dim, channels),
+                nn.SiLU(),
+                nn.Linear(channels, 2 * channels),
+            )
+            nn.init.zeros_(self.strength_modulation[-1].weight)
+            nn.init.zeros_(self.strength_modulation[-1].bias)
         self.side_projection = Conv1d_with_init(side_dim, 2 * channels, 1)
         self.mid_projection = Conv1d_with_init(channels, 2 * channels, 1)
         self.output_projection = Conv1d_with_init(channels, 2 * channels, 1)
@@ -101,7 +131,16 @@ class ResidualBlock(nn.Module):
         y = y.reshape(B, L, channel, K).permute(0, 2, 3, 1).reshape(B, channel, K * L)
         return y
 
-    def forward(self, x, side_emb, attr_emb, diffusion_emb, attention_mask=None):
+    def _compute_modulation(self, attr_emb, diffusion_cond, strength_cond):
+        pooled_attr = torch.mean(attr_emb, dim=1)
+        base_input = torch.cat([diffusion_cond, pooled_attr], dim=-1)
+        gamma_orig, beta_orig = torch.chunk(self.base_modulation(base_input), 2, dim=-1)
+        if self.strength_modulation is None or strength_cond is None or self.strength_mode != "modulation_residual":
+            return gamma_orig, beta_orig
+        delta_gamma, delta_beta = torch.chunk(self.strength_modulation(strength_cond), 2, dim=-1)
+        return gamma_orig + delta_gamma, beta_orig + delta_beta
+
+    def forward(self, x, side_emb, attr_emb, diffusion_emb, attention_mask=None, strength_cond=None):
         B, channel, K, L = x.shape
         base_shape = x.shape
         
@@ -114,8 +153,12 @@ class ResidualBlock(nn.Module):
         base_shape_a = a_x.shape
         a_x = a_x.reshape(B, channel, -1)  # (B,channel,K*(N+L))
 
-        diffusion_emb = self.diffusion_projection(diffusion_emb).unsqueeze(-1)  # (B,channel,1)
-        y = a_x + diffusion_emb  # (B,C,K*(N+1))
+        diffusion_cond = self.diffusion_projection(diffusion_emb)
+        gamma, beta = self._compute_modulation(attr_emb, diffusion_cond, strength_cond)
+        diffusion_emb = diffusion_cond.unsqueeze(-1)  # (B,channel,1)
+        gamma = gamma.unsqueeze(-1)
+        beta = beta.unsqueeze(-1)
+        y = (a_x + diffusion_emb) * (1.0 + gamma) + beta
 
         y = self.forward_time(y, base_shape_a, attention_mask)
         y = self.forward_feature(y, base_shape_a, attention_mask)  # (B,channel,K*(N+L))
@@ -229,7 +272,7 @@ class Diff_CSDI_Patch(nn.Module):
             ]
         )
 
-    def forward(self, x, side_emb, attr_emb, diffusion_step):
+    def forward(self, x, side_emb, attr_emb, diffusion_step, **kwargs):
         B, inputdim, K, L = x.shape
         x = self.ts_downsample(x)
         side_emb = self.side_downsample(side_emb)
@@ -284,7 +327,7 @@ class Diff_CSDI_MultiPatch(nn.Module):
             ]
         )
 
-    def forward(self, x_raw, side_emb_raw, attr_emb_raw, diffusion_step):
+    def forward(self, x_raw, side_emb_raw, attr_emb_raw, diffusion_step, **kwargs):
         B, inputdim, K, L = x_raw.shape
         diffusion_emb = self.diffusion_embedding(diffusion_step)
         all_out = []
@@ -317,6 +360,28 @@ class Diff_CSDI_MultiPatch_Parallel(nn.Module):
         super().__init__()
         self.channels = config["channels"]
         self.multipatch_num = config["multipatch_num"]
+        strength_cfg = dict(config.get("strength_control") or {})
+        self.strength_enabled = bool(strength_cfg.get("enabled", False))
+        self.strength_mode = str(strength_cfg.get("mode", "modulation_residual"))
+        self.strength_cond_dim = int(strength_cfg.get("out_dim", self.channels))
+        self.strength_projector = None
+        self.strength_input_projection = None
+        if self.strength_enabled:
+            self.strength_projector = StrengthProjector(
+                num_strength_bins=int(strength_cfg.get("num_strength_bins", 3)),
+                num_tasks=int(strength_cfg.get("num_tasks", 8)),
+                emb_dim=int(strength_cfg.get("emb_dim", 32)),
+                hidden_dim=int(strength_cfg.get("hidden_dim", 64)),
+                out_dim=self.strength_cond_dim,
+                use_text_context=bool(strength_cfg.get("use_text_context", True)),
+                text_dim=int(strength_cfg.get("text_dim", self.strength_cond_dim)),
+                dropout=float(strength_cfg.get("dropout", 0.0)),
+                use_task_id=bool(strength_cfg.get("use_task_id", False)),
+                text_num_buckets=int(strength_cfg.get("text_num_buckets", 4096)),
+            )
+            self.strength_input_projection = nn.Linear(self.strength_cond_dim, self.channels)
+            nn.init.zeros_(self.strength_input_projection.weight)
+            nn.init.zeros_(self.strength_input_projection.bias)
         self.diffusion_embedding = DiffusionEmbedding(
             num_steps=config["num_steps"],
             embedding_dim=config["diffusion_embedding_dim"],
@@ -341,12 +406,22 @@ class Diff_CSDI_MultiPatch_Parallel(nn.Module):
                     diffusion_embedding_dim=config["diffusion_embedding_dim"],
                     nheads=config["nheads"],
                     is_linear=config["is_linear"],
+                    strength_cond_dim=self.strength_cond_dim if self.strength_enabled else 0,
+                    strength_mode=self.strength_mode,
                 )
                 for _ in range(config["layers"])
             ]
         )
     
-    def forward(self, x_raw, side_emb_raw, attr_emb_raw, diffusion_step):
+    def _build_strength_condition(self, strength_label=None, task_id=None, text_context=None):
+        if not self.strength_enabled:
+            return None
+        if strength_label is None:
+            return None
+        return self.strength_projector(strength_label, task_id, text_context=text_context)
+
+    def forward(self, x_raw, side_emb_raw, attr_emb_raw, diffusion_step,
+                strength_label=None, task_id=None, text_context=None):
         B, inputdim, K, L = x_raw.shape
         diffusion_emb = self.diffusion_embedding(diffusion_step)
         x_list = []
@@ -364,10 +439,25 @@ class Diff_CSDI_MultiPatch_Parallel(nn.Module):
         x_in = torch.cat(x_list, dim=-1)
         side_in = torch.cat(side_list, dim=-1)
         B, _, Nk, Nl = x_in.shape
+        strength_cond = self._build_strength_condition(
+            strength_label=strength_label,
+            task_id=task_id,
+            text_context=text_context,
+        )
+        if strength_cond is not None and self.strength_mode == "input_concat_baseline":
+            strength_map = self.strength_input_projection(strength_cond).unsqueeze(-1).unsqueeze(-1)
+            x_in = x_in + strength_map
 
         skip = []
         for layer in self.residual_layers:
-            x_in, skip_connection = layer(x_in, side_in, attr_emb_raw, diffusion_emb, attention_mask=attention_mask)
+            x_in, skip_connection = layer(
+                x_in,
+                side_in,
+                attr_emb_raw,
+                diffusion_emb,
+                attention_mask=attention_mask,
+                strength_cond=strength_cond,
+            )
             skip.append(skip_connection)        
         
         x = torch.sum(torch.stack(skip), dim=0) / math.sqrt(len(self.residual_layers))
