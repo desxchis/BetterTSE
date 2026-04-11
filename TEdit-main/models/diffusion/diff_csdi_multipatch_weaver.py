@@ -1,3 +1,4 @@
+import copy
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -141,6 +142,26 @@ class DiffusionEmbedding(nn.Module):
         return table
 
 class ResidualBlock(nn.Module):
+    _diag_enabled = False
+    _diag_records = []
+    _diag_max_records = 64
+
+    @classmethod
+    def enable_diagnostics(cls, enabled: bool = True, max_records: int = 64) -> None:
+        cls._diag_enabled = bool(enabled)
+        cls._diag_max_records = max(1, int(max_records))
+        cls._diag_records = []
+
+    @classmethod
+    def disable_diagnostics(cls) -> None:
+        cls._diag_enabled = False
+
+    @classmethod
+    def consume_diagnostics(cls):
+        records = copy.deepcopy(cls._diag_records)
+        cls._diag_records = []
+        return records
+
     def __init__(
         self,
         side_dim,
@@ -213,6 +234,64 @@ class ResidualBlock(nn.Module):
         y = y.reshape(B, L, channel, K).permute(0, 2, 3, 1).reshape(B, channel, K * L)
         return y
 
+    def _record_modulation_diagnostics(self, gamma_orig, beta_orig, delta_gamma, delta_beta, strength_cond):
+        if not self.__class__._diag_enabled:
+            return
+        if len(self.__class__._diag_records) >= self.__class__._diag_max_records:
+            return
+        with torch.no_grad():
+            gamma_orig_cpu = gamma_orig.detach().cpu().float()
+            beta_orig_cpu = beta_orig.detach().cpu().float()
+            delta_gamma_cpu = delta_gamma.detach().cpu().float()
+            delta_beta_cpu = delta_beta.detach().cpu().float()
+            strength_cond_cpu = strength_cond.detach().cpu().float()
+            gamma_orig_norm = gamma_orig_cpu.norm(dim=-1)
+            beta_orig_norm = beta_orig_cpu.norm(dim=-1)
+            delta_gamma_norm = delta_gamma_cpu.norm(dim=-1)
+            delta_beta_norm = delta_beta_cpu.norm(dim=-1)
+            eps = 1.0e-8
+            record = {
+                "layer_id": id(self),
+                "gamma_orig_norm_mean": float(gamma_orig_norm.mean().item()),
+                "beta_orig_norm_mean": float(beta_orig_norm.mean().item()),
+                "delta_gamma_norm_mean": float(delta_gamma_norm.mean().item()),
+                "delta_beta_norm_mean": float(delta_beta_norm.mean().item()),
+                "delta_gamma_abs_mean": float(delta_gamma_cpu.abs().mean().item()),
+                "delta_beta_abs_mean": float(delta_beta_cpu.abs().mean().item()),
+                "delta_gamma_over_base_mean": float((delta_gamma_norm / torch.clamp(gamma_orig_norm, min=eps)).mean().item()),
+                "delta_beta_over_base_mean": float((delta_beta_norm / torch.clamp(beta_orig_norm, min=eps)).mean().item()),
+                "strength_cond_norm_mean": float(strength_cond_cpu.norm(dim=-1).mean().item()),
+            }
+            labels = None
+            if strength_cond_cpu.shape[0] >= 3 and strength_cond_cpu.shape[0] % 3 == 0:
+                labels = torch.arange(strength_cond_cpu.shape[0], dtype=torch.long) % 3
+            if labels is not None:
+                for name, tensor in (("delta_gamma", delta_gamma_cpu), ("delta_beta", delta_beta_cpu)):
+                    means = {}
+                    for label in [0, 1, 2]:
+                        mask = labels == label
+                        if int(mask.sum().item()) == 0:
+                            continue
+                        mean_vec = tensor[mask].mean(dim=0)
+                        means[str(label)] = {
+                            "count": int(mask.sum().item()),
+                            "norm": float(mean_vec.norm().item()),
+                            "mean_abs": float(mean_vec.abs().mean().item()),
+                        }
+                    pairwise = {}
+                    for left in [0, 1, 2]:
+                        for right in range(left + 1, 3):
+                            if str(left) not in means or str(right) not in means:
+                                continue
+                            left_mean = tensor[labels == left].mean(dim=0)
+                            right_mean = tensor[labels == right].mean(dim=0)
+                            diff = left_mean - right_mean
+                            pairwise[f"{left}_{right}"] = float(diff.norm().item())
+                            pairwise[f"{left}_{right}_mean_abs"] = float(diff.abs().mean().item())
+                    record[f"{name}_mean_by_strength"] = means
+                    record[f"{name}_pairwise_l2"] = pairwise
+            self.__class__._diag_records.append(record)
+
     def _compute_modulation(self, attr_emb, diffusion_cond, strength_cond):
         pooled_attr = torch.mean(self.attr_projection(attr_emb), dim=1)
         base_input = torch.cat([diffusion_cond, pooled_attr], dim=-1)
@@ -222,6 +301,7 @@ class ResidualBlock(nn.Module):
             return gamma_orig, beta_orig
 
         delta_gamma, delta_beta = torch.chunk(self.strength_modulation(strength_cond), 2, dim=-1)
+        self._record_modulation_diagnostics(gamma_orig, beta_orig, delta_gamma, delta_beta, strength_cond)
         return gamma_orig + delta_gamma, beta_orig + delta_beta
 
     def forward(self, x, side_emb, attr_emb, diffusion_emb, attention_mask=None,

@@ -250,6 +250,24 @@ for n in range(args.n_runs):
 
     model_configs = yaml.safe_load(open(fr"{args.pretrained_dir}/{n}/{args.model_config_path}"))
     model_configs["diffusion"]["bootstrap_ratio"] = args.bootstrap_ratio
+    if bool(finetune_configs["train"].get("enable_strength_control", False)):
+        strength_cfg = dict(model_configs["diffusion"].get("strength_control") or {})
+        template_model_cfg = yaml.safe_load(open("configs/synthetic/model_multi_weaver.yaml"))
+        template_strength_cfg = dict(template_model_cfg.get("diffusion", {}).get("strength_control") or {})
+        merged_strength_cfg = dict(template_strength_cfg)
+        merged_strength_cfg.update(strength_cfg)
+        for key in [
+            "edit_region_loss_weight",
+            "background_loss_weight",
+            "monotonic_loss_weight",
+            "monotonic_margin",
+            "gain_match_loss_weight",
+        ]:
+            if key in finetune_configs["train"]:
+                merged_strength_cfg[key] = finetune_configs["train"][key]
+        merged_strength_cfg["enabled"] = True
+        model_configs["diffusion"]["strength_control"] = merged_strength_cfg
+        print("Strength control runtime config:", json.dumps(model_configs["diffusion"]["strength_control"], indent=2))
     finetune_configs["train"]["model_path"] = fr"{args.pretrained_dir}/{n}/{args.pretrained_model_path}"
 
     output_folder = os.path.join(save_folder, str(n))
@@ -262,7 +280,10 @@ for n in range(args.n_runs):
     df.insert(0, column="run", value=[n]*n_records)
     df_list.append(df)
 
-df = pd.concat(df_list, ignore_index=True)
+if df_list:
+    df = pd.concat(df_list, ignore_index=True)
+else:
+    df = pd.DataFrame()
 path = os.path.join(save_folder, "results_finetune.csv")
 df.to_csv(path)
 
@@ -270,5 +291,8 @@ df.to_csv(path)
 print("\n**************************************")
 print("*****", "Simple Statistics")
 print("**************************************")
-df_stat = df.groupby(["ctrl_attrs", "mode", "sampler", "steps", "n_samples"], as_index=False).agg(["mean", "std"])
-df_stat.to_csv(os.path.join(save_folder, fr"results_finetune_stat.csv"))
+if not df.empty and all(col in df.columns for col in ["ctrl_attrs", "mode", "sampler", "steps", "n_samples"]):
+    df_stat = df.groupby(["ctrl_attrs", "mode", "sampler", "steps", "n_samples"], as_index=False).agg(["mean", "std"])
+    df_stat.to_csv(os.path.join(save_folder, fr"results_finetune_stat.csv"))
+else:
+    print("Skip statistics because no evaluation records were produced.")

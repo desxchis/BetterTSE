@@ -1,12 +1,18 @@
 import os
 import time
 import json
+import copy
+from collections import defaultdict
 
 import torch
 from torch.optim import Adam
 from torch.utils.tensorboard import SummaryWriter
 from data import EditDataset
 from evaluation.base_evaluator import BaseEvaluator
+from models.conditioning.numeric_projector import StrengthProjector
+from models.diffusion.diff_csdi_multipatch import ResidualBlock as ResidualBlockBase
+from models.diffusion.diff_csdi_multipatch_weaver import ResidualBlock as ResidualBlockWeaver
+from models.conditional_generator import ConditionalGenerator
 
 class Finetuner:
     def __init__(self, configs, eval_configs, dataset, model, c_mean):
@@ -100,6 +106,148 @@ class Finetuner:
         self._global_batch_no = 0
         if self.strength_diagnostics_enabled and os.path.exists(self.strength_diag_path):
             os.remove(self.strength_diag_path)
+        if self.strength_diagnostics_enabled:
+            StrengthProjector.enable_diagnostics(True)
+            ResidualBlockBase.enable_diagnostics(True)
+            ResidualBlockWeaver.enable_diagnostics(True)
+            ConditionalGenerator.enable_strength_diagnostics(True)
+        else:
+            StrengthProjector.disable_diagnostics()
+            ResidualBlockBase.disable_diagnostics()
+            ResidualBlockWeaver.disable_diagnostics()
+            ConditionalGenerator.disable_strength_diagnostics()
+
+    def _summarize_numeric_dicts(self, records):
+        scalars = defaultdict(list)
+        for record in records:
+            if not isinstance(record, dict):
+                continue
+            for key, value in record.items():
+                if isinstance(value, (int, float)) and not isinstance(value, bool):
+                    scalars[key].append(float(value))
+        summary = {}
+        for key, values in scalars.items():
+            if values:
+                summary[key] = float(sum(values) / len(values))
+        return summary
+
+    def _summarize_nested_metric(self, records, key):
+        bucket = defaultdict(list)
+        for record in records:
+            nested = record.get(key)
+            if not isinstance(nested, dict):
+                continue
+            for sub_key, sub_value in nested.items():
+                if isinstance(sub_value, (int, float)) and not isinstance(sub_value, bool):
+                    bucket[sub_key].append(float(sub_value))
+        return {sub_key: float(sum(values) / len(values)) for sub_key, values in bucket.items() if values}
+
+    def _summarize_strength_means(self, records, key):
+        stats = defaultdict(lambda: defaultdict(list))
+        for record in records:
+            nested = record.get(key)
+            if not isinstance(nested, dict):
+                continue
+            for strength, payload in nested.items():
+                if not isinstance(payload, dict):
+                    continue
+                for metric_name, metric_value in payload.items():
+                    if isinstance(metric_value, (int, float)) and not isinstance(metric_value, bool):
+                        stats[str(strength)][metric_name].append(float(metric_value))
+        return {
+            strength: {
+                metric_name: float(sum(values) / len(values))
+                for metric_name, values in metric_dict.items() if values
+            }
+            for strength, metric_dict in stats.items()
+        }
+
+    def _summarize_condition_diagnostics(self):
+        projector_records = StrengthProjector.consume_diagnostics()
+        modulation_base_records = ResidualBlockBase.consume_diagnostics()
+        modulation_weaver_records = ResidualBlockWeaver.consume_diagnostics()
+        generator_records = ConditionalGenerator.consume_strength_diagnostics()
+        return {
+            "projector": {
+                "count": int(len(projector_records)),
+                "scalars": self._summarize_numeric_dicts(projector_records),
+                "pairwise_l2": self._summarize_nested_metric(projector_records, "projector_output_pairwise_l2"),
+                "mean_norm_by_strength": self._summarize_strength_means(projector_records, "projector_output_mean_norm_by_strength"),
+            },
+            "modulation_base": {
+                "count": int(len(modulation_base_records)),
+                "scalars": self._summarize_numeric_dicts(modulation_base_records),
+                "delta_gamma_pairwise_l2": self._summarize_nested_metric(modulation_base_records, "delta_gamma_pairwise_l2"),
+                "delta_beta_pairwise_l2": self._summarize_nested_metric(modulation_base_records, "delta_beta_pairwise_l2"),
+                "delta_gamma_mean_by_strength": self._summarize_strength_means(modulation_base_records, "delta_gamma_mean_by_strength"),
+                "delta_beta_mean_by_strength": self._summarize_strength_means(modulation_base_records, "delta_beta_mean_by_strength"),
+            },
+            "modulation_weaver": {
+                "count": int(len(modulation_weaver_records)),
+                "scalars": self._summarize_numeric_dicts(modulation_weaver_records),
+                "delta_gamma_pairwise_l2": self._summarize_nested_metric(modulation_weaver_records, "delta_gamma_pairwise_l2"),
+                "delta_beta_pairwise_l2": self._summarize_nested_metric(modulation_weaver_records, "delta_beta_pairwise_l2"),
+                "delta_gamma_mean_by_strength": self._summarize_strength_means(modulation_weaver_records, "delta_gamma_mean_by_strength"),
+                "delta_beta_mean_by_strength": self._summarize_strength_means(modulation_weaver_records, "delta_beta_mean_by_strength"),
+            },
+            "generator": {
+                "count": int(len(generator_records)),
+                "scalars": self._summarize_numeric_dicts(generator_records),
+                "train_edit_gain_by_strength": self._summarize_nested_metric(generator_records, "train_edit_gain_by_strength"),
+                "train_target_gain_by_strength": self._summarize_nested_metric(generator_records, "train_target_gain_by_strength"),
+            },
+        }
+
+    def _family_gain_summaries(self, batch):
+        src_x = batch.get("src_x")
+        tgt_x = batch.get("tgt_x")
+        mask_gt = batch.get("mask_gt")
+        family_sizes = batch.get("family_sizes")
+        strength_label = batch.get("strength_label")
+        if not all(isinstance(item, torch.Tensor) for item in (src_x, tgt_x, mask_gt, family_sizes, strength_label)):
+            return {}
+        src = src_x.detach().cpu().float()
+        tgt = tgt_x.detach().cpu().float()
+        mask = mask_gt.detach().cpu().float()
+        if mask.dim() == 3:
+            mask = mask.permute(0, 2, 1)
+        if mask.dim() == 2:
+            mask = mask.unsqueeze(1)
+        denom = torch.clamp(mask.sum(dim=(1, 2)), min=1.0)
+        gains = (torch.abs(tgt - src) * mask).sum(dim=(1, 2)) / denom
+        labels = strength_label.detach().cpu().long().view(-1)
+        summary = {
+            "target_gain_by_strength": {
+                str(label): float(gains[labels == label].mean().item())
+                for label in [0, 1, 2] if int((labels == label).sum().item()) > 0
+            },
+            "family_monotonic_target_hit_rate": 0.0,
+        }
+        hits = []
+        start = 0
+        for size in family_sizes.detach().cpu().tolist():
+            size = int(size)
+            family_gains = gains[start:start + size]
+            start += size
+            if family_gains.numel() < 3:
+                continue
+            hits.append(float(family_gains[0] <= family_gains[1] and family_gains[1] <= family_gains[2]))
+        if hits:
+            summary["family_monotonic_target_hit_rate"] = float(sum(hits) / len(hits))
+        return summary
+
+    def _family_flags(self, batch):
+        return {
+            "family_valid": bool(batch.get("family_valid", False)),
+            "family_order_valid": bool(batch.get("family_order_valid", False)),
+        }
+
+    def _training_batch_diagnostics(self, batch):
+        payload = {}
+        payload.update(self._family_flags(batch))
+        payload.update(self._family_gain_summaries(batch))
+        payload["condition_path"] = self._summarize_condition_diagnostics()
+        return payload
 
     def _is_strength_parameter(self, name):
         return (
@@ -187,6 +335,8 @@ class Finetuner:
             "strength_lr_scale": float(self.strength_lr_scale),
             "strength_modules": modules,
             "batch_stats": self._batch_strength_stats(batch),
+            "loss_breakdown": copy.deepcopy(getattr(self.model, "_latest_loss_breakdown", None)),
+            "training_batch_diagnostics": self._training_batch_diagnostics(batch),
         }
         with open(self.strength_diag_path, "a", encoding="utf-8") as f:
             f.write(json.dumps(payload, ensure_ascii=False) + "\n")

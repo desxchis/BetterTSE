@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Tuple
 
 import numpy as np
 import torch
@@ -11,6 +11,90 @@ from torch.utils.data import DataLoader, Dataset
 
 
 STRENGTH_ORDER = {"weak": 0, "medium": 1, "strong": 2}
+STRENGTH_SEQUENCE = ["weak", "medium", "strong"]
+FLOAT_TOL = 1.0e-6
+
+
+def _mean_abs_edit_gain(source_ts: np.ndarray, target_ts: np.ndarray, mask_gt: np.ndarray) -> float:
+    edit_mask = np.asarray(mask_gt, dtype=bool)
+    if not np.any(edit_mask):
+        raise ValueError("edit mask must be non-empty")
+    src = np.asarray(source_ts, dtype=np.float32).reshape(-1)
+    tgt = np.asarray(target_ts, dtype=np.float32).reshape(-1)
+    return float(np.mean(np.abs(tgt[edit_mask] - src[edit_mask])))
+
+
+def _background_leakage(source_ts: np.ndarray, target_ts: np.ndarray, mask_gt: np.ndarray) -> float:
+    edit_mask = np.asarray(mask_gt, dtype=bool)
+    bg_mask = ~edit_mask
+    if not np.any(bg_mask):
+        return 0.0
+    src = np.asarray(source_ts, dtype=np.float32).reshape(-1)
+    tgt = np.asarray(target_ts, dtype=np.float32).reshape(-1)
+    return float(np.max(np.abs(tgt[bg_mask] - src[bg_mask])))
+
+
+def _family_metadata_signature(sample: Dict[str, Any]) -> Tuple[Any, ...]:
+    return (
+        sample.get("direction"),
+        sample.get("tool_name"),
+        sample.get("duration_bucket"),
+        sample.get("region_start"),
+        sample.get("region_end"),
+        sample.get("series_length"),
+    )
+
+
+def _validate_family(family: Dict[str, Any]) -> List[Dict[str, Any]]:
+    family_id = str(family.get("family_id"))
+    samples = [dict(sample) for sample in family.get("samples", [])]
+    if len(samples) != 3:
+        raise ValueError(f"Family {family_id} must contain exactly 3 samples, got {len(samples)}")
+
+    samples = sorted(samples, key=lambda sample: STRENGTH_ORDER[str(sample["strength_text"])])
+    strength_texts = [str(sample["strength_text"]) for sample in samples]
+    if strength_texts != STRENGTH_SEQUENCE:
+        raise ValueError(f"Family {family_id} strengths must be ordered weak/medium/strong, got {strength_texts}")
+
+    base_source = np.asarray(samples[0]["source_ts"], dtype=np.float32).reshape(-1)
+    base_mask = np.asarray(samples[0]["mask_gt"], dtype=np.float32).reshape(-1)
+    if not np.any(base_mask > 0.5):
+        raise ValueError(f"Family {family_id} has empty edit mask")
+    base_signature = _family_metadata_signature(samples[0])
+    target_gains: List[float] = []
+
+    for expected_label, sample in enumerate(samples):
+        strength_text = str(sample["strength_text"])
+        strength_label = int(sample["strength_label"])
+        if strength_label != expected_label:
+            raise ValueError(
+                f"Family {family_id} sample {strength_text} has strength_label={strength_label}, expected {expected_label}"
+            )
+        if STRENGTH_ORDER[strength_text] != strength_label:
+            raise ValueError(f"Family {family_id} has mismatched strength text/label for {strength_text}")
+
+        source_ts = np.asarray(sample["source_ts"], dtype=np.float32).reshape(-1)
+        target_ts = np.asarray(sample["target_ts"], dtype=np.float32).reshape(-1)
+        mask_gt = np.asarray(sample["mask_gt"], dtype=np.float32).reshape(-1)
+        if source_ts.shape != base_source.shape:
+            raise ValueError(f"Family {family_id} source length mismatch across strengths")
+        if target_ts.shape != base_source.shape or mask_gt.shape != base_source.shape:
+            raise ValueError(f"Family {family_id} target/mask length mismatch across strengths")
+        if not np.allclose(source_ts, base_source, atol=FLOAT_TOL, rtol=0.0):
+            raise ValueError(f"Family {family_id} source_ts differs across strengths")
+        if not np.allclose(mask_gt, base_mask, atol=FLOAT_TOL, rtol=0.0):
+            raise ValueError(f"Family {family_id} mask_gt differs across strengths")
+        if _family_metadata_signature(sample) != base_signature:
+            raise ValueError(f"Family {family_id} metadata differs across strengths")
+        if _background_leakage(source_ts, target_ts, mask_gt) > 1.0e-5:
+            raise ValueError(f"Family {family_id} target background leakage exceeds tolerance")
+        target_gains.append(_mean_abs_edit_gain(source_ts, target_ts, mask_gt))
+
+    if not (target_gains[0] <= target_gains[1] + FLOAT_TOL and target_gains[1] <= target_gains[2] + FLOAT_TOL):
+        raise ValueError(f"Family {family_id} target gains are not monotonic: {target_gains}")
+    if target_gains[0] > target_gains[1] + FLOAT_TOL or target_gains[1] > target_gains[2] + FLOAT_TOL:
+        raise ValueError(f"Family {family_id} target gains violate monotonic ordering beyond tolerance: {target_gains}")
+    return samples
 
 
 def _trend_attrs(direction: str) -> tuple[np.ndarray, np.ndarray]:
@@ -65,18 +149,14 @@ class DiscreteStrengthFamilySplit(Dataset):
         self.families = list(payload.get("families", []))
         self.attr_list = list(meta["attr_list"])
         self.n_attrs = len(self.attr_list)
+        self.validated_samples: List[List[Dict[str, Any]]] = [_validate_family(family) for family in self.families]
 
     def __len__(self) -> int:
         return len(self.families)
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         family = dict(self.families[idx])
-        samples = sorted(
-            [dict(sample) for sample in family.get("samples", [])],
-            key=lambda sample: STRENGTH_ORDER[str(sample["strength_text"])],
-        )
-        if [str(sample["strength_text"]) for sample in samples] != ["weak", "medium", "strong"]:
-            raise ValueError(f"Family {family.get('family_id')} does not contain ordered weak/medium/strong samples.")
+        samples = [dict(sample) for sample in self.validated_samples[idx]]
 
         direction = str(samples[0].get("direction", family.get("direction", "up")))
         src_attrs, tgt_attrs = _trend_attrs(direction)
@@ -119,6 +199,12 @@ def collate_discrete_strength_families(batch: List[Dict[str, Any]]) -> Dict[str,
     instruction_text = [str(sample["instruction_text"]) for sample in flat_samples]
     strength_text = [str(sample["strength_text"]) for sample in flat_samples]
 
+    family_valid = all(size == 3 for size in family_sizes)
+    family_order_valid = all(
+        strength_text[start:start + size] == STRENGTH_SEQUENCE
+        for start, size in zip(np.cumsum([0] + family_sizes[:-1]).tolist(), family_sizes)
+    )
+
     return {
         "src_x": _stack_array("src_x", torch.float32),
         "tgt_x": _stack_array("tgt_x", torch.float32),
@@ -131,4 +217,6 @@ def collate_discrete_strength_families(batch: List[Dict[str, Any]]) -> Dict[str,
         "strength_text": strength_text,
         "family_sizes": torch.as_tensor(family_sizes, dtype=torch.long),
         "family_ids": family_ids,
+        "family_valid": bool(family_valid),
+        "family_order_valid": bool(family_order_valid),
     }

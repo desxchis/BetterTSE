@@ -15,6 +15,12 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+
+StrengthProjector = None
+ResidualBlockBase = None
+ResidualBlockWeaver = None
+ConditionalGenerator = None
+
 import numpy as np
 import torch
 import torch.nn as nn
@@ -63,6 +69,20 @@ class TEditWrapper:
         if model_path and config_path:
             self.load_model(model_path, config_path)
 
+    def _resolve_strength_diagnostic_classes(self) -> None:
+        global StrengthProjector, ResidualBlockBase, ResidualBlockWeaver, ConditionalGenerator
+        if StrengthProjector is not None:
+            return
+        from models.conditioning.numeric_projector import StrengthProjector as _StrengthProjector
+        from models.diffusion.diff_csdi_multipatch import ResidualBlock as _ResidualBlockBase
+        from models.diffusion.diff_csdi_multipatch_weaver import ResidualBlock as _ResidualBlockWeaver
+        from models.conditional_generator import ConditionalGenerator as _ConditionalGenerator
+
+        StrengthProjector = _StrengthProjector
+        ResidualBlockBase = _ResidualBlockBase
+        ResidualBlockWeaver = _ResidualBlockWeaver
+        ConditionalGenerator = _ConditionalGenerator
+
     def load_model(
         self,
         model_path: str,
@@ -86,6 +106,7 @@ class TEditWrapper:
         
         try:
             from models.conditional_generator import ConditionalGenerator
+            self._resolve_strength_diagnostic_classes()
         except ImportError as e:
             raise ImportError(
                 f"Failed to import TEdit modules from {self.tedit_root}. Error: {e}"
@@ -153,6 +174,8 @@ class TEditWrapper:
         strength_label: Optional[int] = None,
         task_id: Optional[int] = None,
         instruction_text: Optional[np.ndarray] = None,
+        return_diagnostics: bool = False,
+        enable_strength_diagnostics: bool = False,
     ) -> np.ndarray:
         """Edit time series using TEdit model.
 
@@ -226,9 +249,47 @@ class TEditWrapper:
             if edit_steps is not None:
                 self.model.edit_steps = edit_steps
 
-            samples = self.model.generate(batch, n_samples=n_samples, mode="edit", sampler=sampler)
+            if enable_strength_diagnostics:
+                if StrengthProjector is not None:
+                    StrengthProjector.enable_diagnostics(True)
+                if ResidualBlockBase is not None:
+                    ResidualBlockBase.enable_diagnostics(True)
+                if ResidualBlockWeaver is not None:
+                    ResidualBlockWeaver.enable_diagnostics(True)
+                if ConditionalGenerator is not None:
+                    ConditionalGenerator.enable_strength_diagnostics(True)
+
+            samples = self.model.generate(
+                batch,
+                n_samples=n_samples,
+                mode="edit",
+                sampler=sampler,
+                return_diagnostics=return_diagnostics,
+            )
+
+        diagnostics = None
+        if return_diagnostics:
+            sample_tensor, model_diagnostics = samples
+            edited_ts = sample_tensor.cpu().numpy().squeeze(1)
+            diagnostics = {
+                "model": model_diagnostics,
+                "projector": [] if StrengthProjector is None else StrengthProjector.consume_diagnostics(),
+                "modulation_base": [] if ResidualBlockBase is None else ResidualBlockBase.consume_diagnostics(),
+                "modulation_weaver": [] if ResidualBlockWeaver is None else ResidualBlockWeaver.consume_diagnostics(),
+                "generator": [] if ConditionalGenerator is None else ConditionalGenerator.consume_strength_diagnostics(),
+            }
+            return edited_ts, diagnostics
 
         edited_ts = samples.cpu().numpy().squeeze(1)
+        if enable_strength_diagnostics:
+            if StrengthProjector is not None:
+                StrengthProjector.consume_diagnostics()
+            if ResidualBlockBase is not None:
+                ResidualBlockBase.consume_diagnostics()
+            if ResidualBlockWeaver is not None:
+                ResidualBlockWeaver.consume_diagnostics()
+            if ConditionalGenerator is not None:
+                ConditionalGenerator.consume_strength_diagnostics()
 
         return edited_ts
 

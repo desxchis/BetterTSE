@@ -1,3 +1,4 @@
+import copy
 import torch
 import torch.nn as nn
 
@@ -12,6 +13,26 @@ from samplers import DDPMSampler, DDIMSampler
 
 
 class ConditionalGenerator(nn.Module):
+    _strength_diag_enabled = False
+    _strength_diag_records = []
+    _strength_diag_max_records = 32
+
+    @classmethod
+    def enable_strength_diagnostics(cls, enabled: bool = True, max_records: int = 32) -> None:
+        cls._strength_diag_enabled = bool(enabled)
+        cls._strength_diag_max_records = max(1, int(max_records))
+        cls._strength_diag_records = []
+
+    @classmethod
+    def disable_strength_diagnostics(cls) -> None:
+        cls._strength_diag_enabled = False
+
+    @classmethod
+    def consume_strength_diagnostics(cls):
+        records = copy.deepcopy(cls._strength_diag_records)
+        cls._strength_diag_records = []
+        return records
+
     def __init__(self, configs):
         super().__init__()
         self.device = configs["device"]
@@ -20,6 +41,8 @@ class ConditionalGenerator(nn.Module):
         self.background_loss_weight = float(strength_cfg.get("background_loss_weight", 0.0))
         self.monotonic_loss_weight = float(strength_cfg.get("monotonic_loss_weight", 0.0))
         self.monotonic_margin = float(strength_cfg.get("monotonic_margin", 1.0e-3))
+        self.gain_match_loss_weight = float(strength_cfg.get("gain_match_loss_weight", 0.0))
+        self._latest_loss_breakdown = None
 
         self._init_condition_encoders(configs["attrs"], configs["side"])
         self._init_diff(configs["diffusion"])
@@ -224,6 +247,20 @@ class ConditionalGenerator(nn.Module):
                     )
             loss_tgt = loss_tgt/self.num_steps
         total_loss = loss_tgt
+        loss_breakdown = {
+            "loss_tgt": float(loss_tgt.detach().item()) if isinstance(loss_tgt, torch.Tensor) else float(loss_tgt),
+            "edit_region_loss": 0.0,
+            "background_loss": 0.0,
+            "monotonic_loss": 0.0,
+            "gain_match_loss": 0.0,
+            "weighted_edit_region_loss": 0.0,
+            "weighted_background_loss": 0.0,
+            "weighted_monotonic_loss": 0.0,
+            "weighted_gain_match_loss": 0.0,
+            "total_loss": float(total_loss.detach().item()) if isinstance(total_loss, torch.Tensor) else float(total_loss),
+            "bootstrap_selected": None if bs_ids is None else int(len(bs_ids)),
+            "batch_size": int(tgt_x_pred.shape[0]),
+        }
         mask_gt = batch.get("mask_gt")
         family_sizes = batch.get("family_sizes")
         if mask_gt is not None:
@@ -232,13 +269,19 @@ class ConditionalGenerator(nn.Module):
                 mask_gt = mask_gt.permute(0, 2, 1)
             elif mask_gt.dim() == 2:
                 mask_gt = mask_gt.unsqueeze(1)
-            total_loss = total_loss + self._strength_supervision_loss(
+            strength_loss, strength_breakdown = self._strength_supervision_loss(
                 src_x=src_x,
                 tgt_x=tgt_x,
                 tgt_x_pred=tgt_x_pred,
                 mask_gt=mask_gt,
                 family_sizes=family_sizes,
+                strength_label=strength_label,
+                return_breakdown=True,
             )
+            total_loss = total_loss + strength_loss
+            loss_breakdown.update(strength_breakdown)
+            loss_breakdown["total_loss"] = float(total_loss.detach().item())
+        self._latest_loss_breakdown = loss_breakdown
         return total_loss
 
     def _masked_mean(self, values, mask, eps=1.0e-8):
@@ -247,42 +290,105 @@ class ConditionalGenerator(nn.Module):
         numer = (values * mask).sum(dim=(1, 2))
         return numer / denom
 
-    def _strength_supervision_loss(self, src_x, tgt_x, tgt_x_pred, mask_gt, family_sizes=None):
+    def _strength_supervision_loss(self, src_x, tgt_x, tgt_x_pred, mask_gt, family_sizes=None, strength_label=None, return_breakdown=False):
         abs_pred_target = torch.abs(tgt_x_pred - tgt_x)
         abs_pred_source = torch.abs(tgt_x_pred - src_x)
         edit_mask = mask_gt
         bg_mask = 1.0 - edit_mask
 
-        losses = []
+        edit_region_l1 = src_x.new_tensor(0.0)
+        background_l1 = src_x.new_tensor(0.0)
+        monotonic_loss = src_x.new_tensor(0.0)
+        gain_match_loss = src_x.new_tensor(0.0)
+        weighted_losses = []
+
         if self.edit_region_loss_weight > 0.0:
             edit_region_l1 = self._masked_mean(abs_pred_target, edit_mask).mean()
-            losses.append(self.edit_region_loss_weight * edit_region_l1)
+            weighted_losses.append(self.edit_region_loss_weight * edit_region_l1)
         if self.background_loss_weight > 0.0:
             background_l1 = self._masked_mean(abs_pred_source, bg_mask).mean()
-            losses.append(self.background_loss_weight * background_l1)
+            weighted_losses.append(self.background_loss_weight * background_l1)
+
+        gains = self._masked_mean(abs_pred_source, edit_mask)
+        target_gains = self._masked_mean(torch.abs(tgt_x - src_x), edit_mask)
+
         if self.monotonic_loss_weight > 0.0 and family_sizes is not None:
-            gains = self._masked_mean(abs_pred_source, edit_mask)
             monotonic_losses = []
             start_idx = 0
             for family_size in family_sizes.detach().cpu().tolist():
                 family_size = int(family_size)
                 family_gains = gains[start_idx:start_idx + family_size]
+                family_target_gains = target_gains[start_idx:start_idx + family_size]
                 start_idx += family_size
                 if family_gains.numel() < 3:
                     continue
                 weak_gain = family_gains[0]
                 medium_gain = family_gains[1]
                 strong_gain = family_gains[2]
+                weak_target = family_target_gains[0]
+                medium_target = family_target_gains[1]
+                strong_target = family_target_gains[2]
+                target_gap_wm = torch.clamp(medium_target - weak_target, min=self.monotonic_margin)
+                target_gap_ms = torch.clamp(strong_target - medium_target, min=self.monotonic_margin)
+                target_gap_ws = torch.clamp(strong_target - weak_target, min=self.monotonic_margin)
                 monotonic_losses.append(
-                    torch.relu(self.monotonic_margin + weak_gain - medium_gain)
-                    + torch.relu(self.monotonic_margin + medium_gain - strong_gain)
+                    torch.relu(target_gap_wm - (medium_gain - weak_gain))
+                    + torch.relu(target_gap_ms - (strong_gain - medium_gain))
+                    + 0.5 * torch.relu(target_gap_ws - (strong_gain - weak_gain))
                 )
             if monotonic_losses:
                 monotonic_loss = torch.stack(monotonic_losses).mean()
-                losses.append(self.monotonic_loss_weight * monotonic_loss)
-        if not losses:
-            return src_x.new_tensor(0.0)
-        return torch.stack(losses).sum()
+                weighted_losses.append(self.monotonic_loss_weight * monotonic_loss)
+
+        if self.gain_match_loss_weight > 0.0:
+            gain_match_loss = torch.mean(torch.abs(gains - target_gains))
+            weighted_losses.append(self.gain_match_loss_weight * gain_match_loss)
+
+        diag_payload = {
+            'train_edit_gain_mean': float(gains.detach().mean().item()),
+            'train_target_gain_mean': float(target_gains.detach().mean().item()),
+            'train_gain_gap_abs_mean': float(torch.abs(gains - target_gains).detach().mean().item()),
+        }
+        if strength_label is not None:
+            strength_diag = {}
+            target_strength_diag = {}
+            for label in torch.unique(strength_label.detach()).detach().cpu().tolist():
+                label = int(label)
+                label_mask = strength_label == label
+                if int(label_mask.sum().item()) == 0:
+                    continue
+                strength_diag[str(label)] = float(gains[label_mask].detach().mean().item())
+                target_strength_diag[str(label)] = float(target_gains[label_mask].detach().mean().item())
+            diag_payload['train_edit_gain_by_strength'] = strength_diag
+            diag_payload['train_target_gain_by_strength'] = target_strength_diag
+        if self.__class__._strength_diag_enabled:
+            self._record_strength_diagnostics(diag_payload)
+
+        if weighted_losses:
+            total_loss = torch.stack(weighted_losses).sum()
+        else:
+            total_loss = src_x.new_tensor(0.0)
+        if not return_breakdown:
+            return total_loss
+        breakdown = {
+            'edit_region_loss': float(edit_region_l1.detach().item()),
+            'background_loss': float(background_l1.detach().item()),
+            'monotonic_loss': float(monotonic_loss.detach().item()),
+            'gain_match_loss': float(gain_match_loss.detach().item()),
+            'weighted_edit_region_loss': float((self.edit_region_loss_weight * edit_region_l1).detach().item()) if self.edit_region_loss_weight > 0.0 else 0.0,
+            'weighted_background_loss': float((self.background_loss_weight * background_l1).detach().item()) if self.background_loss_weight > 0.0 else 0.0,
+            'weighted_monotonic_loss': float((self.monotonic_loss_weight * monotonic_loss).detach().item()) if self.monotonic_loss_weight > 0.0 else 0.0,
+            'weighted_gain_match_loss': float((self.gain_match_loss_weight * gain_match_loss).detach().item()) if self.gain_match_loss_weight > 0.0 else 0.0,
+            'strength_total_loss': float(total_loss.detach().item()),
+        }
+        return total_loss, breakdown
+
+    def _record_strength_diagnostics(self, payload):
+        if not self.__class__._strength_diag_enabled:
+            return
+        if len(self.__class__._strength_diag_records) >= self.__class__._strength_diag_max_records:
+            return
+        self.__class__._strength_diag_records.append(copy.deepcopy(payload))
 
     def _bootstrap(self, tgt_x_pred, src_x, side_emb, src_attr_emb, tgt_attr_emb):
         """
@@ -334,10 +440,22 @@ class ConditionalGenerator(nn.Module):
     Generation.
     """
     @torch.no_grad()
-    def generate(self, batch, n_samples, mode="edit", sampler="ddim"):
-        return self.__getattribute__(mode)(batch, n_samples, sampler)
+    def generate(self, batch, n_samples, mode="edit", sampler="ddim", return_diagnostics=False):
+        return self.__getattribute__(mode)(batch, n_samples, sampler, return_diagnostics=return_diagnostics)
 
-    def cond_gen(self, batch, n_samples, sampler="ddpm"):
+    def _prepare_generation_output(self, samples, diagnostics=None, return_diagnostics=False):
+        if return_diagnostics:
+            return samples, diagnostics
+        return samples
+
+    def _stack_sample_outputs(self, outputs, return_diagnostics=False):
+        sample_tensors = [item["sample"] for item in outputs]
+        if not return_diagnostics:
+            return torch.stack(sample_tensors)
+        diagnostics = [item["diagnostics"] for item in outputs]
+        return torch.stack(sample_tensors), diagnostics
+
+    def cond_gen(self, batch, n_samples, sampler="ddpm", return_diagnostics=False):
         src_x, tp, src_attrs, tgt_attrs, tgt_x, strength_label, task_id, instruction_text = self._unpack_data_edit(batch)
 
         side_emb = self.side_en(tp)
@@ -366,10 +484,10 @@ class ConditionalGenerator(nn.Module):
             samples.append(x)
         return torch.stack(samples)
     
-    def edit(self, batch, n_samples, sampler="ddim-ddim"):
+    def edit(self, batch, n_samples, sampler="ddim-ddim", return_diagnostics=False):
         """
         Args:
-           sampler: forward-backward: ddim-ddim or ddim. 
+           sampler: forward-backward: ddim-ddim or ddim.
         """
         src_x, tp, src_attrs, tgt_attrs, tgt_x, strength_label, task_id, instruction_text = self._unpack_data_edit(batch)
 
@@ -377,7 +495,7 @@ class ConditionalGenerator(nn.Module):
         src_attr_emb = self.attr_en(src_attrs)
         tgt_attr_emb = self.attr_en(tgt_attrs)
 
-        samples = []        
+        samples = []
         for i in range(n_samples):
             tgt_x_pred = self._edit(
                 src_x,
@@ -388,11 +506,16 @@ class ConditionalGenerator(nn.Module):
                 strength_label=strength_label,
                 task_id=task_id,
                 text_context=instruction_text,
+                return_diagnostics=return_diagnostics,
             )
-            samples.append(tgt_x_pred)
-        return torch.stack(samples)
-    
-    def _edit(self, src_x, side_emb, src_attr_emb, tgt_attr_emb, sampler, strength_label=None, task_id=None, text_context=None):
+            if return_diagnostics:
+                sample_tensor, diagnostics = tgt_x_pred
+                samples.append({"sample": sample_tensor, "diagnostics": diagnostics})
+            else:
+                samples.append({"sample": tgt_x_pred, "diagnostics": None})
+        return self._stack_sample_outputs(samples, return_diagnostics=return_diagnostics)
+
+    def _edit(self, src_x, side_emb, src_attr_emb, tgt_attr_emb, sampler, strength_label=None, task_id=None, text_context=None, return_diagnostics=False):
         B = src_x.shape[0]
 
         # forward
@@ -411,6 +534,7 @@ class ConditionalGenerator(nn.Module):
                 xt = self.ddim.forward(xt, pred_noise, t)
 
         # reverse
+        raw_reverse = None
         for t in range(self.edit_steps-1, -1, -1):
             noise = torch.randn_like(xt)
             t = (torch.ones(B, device=self.device) * t).long()
@@ -427,6 +551,24 @@ class ConditionalGenerator(nn.Module):
                 xt = self.ddpm.reverse(xt, pred_noise, t, noise)
             else:
                 xt = self.ddim.reverse(xt, pred_noise, t, noise, is_determin=True)
+            if t[0].item() == 0:
+                raw_reverse = xt.detach().clone()
+        if return_diagnostics:
+            final_output = xt
+            abs_delta = torch.abs(final_output - src_x)
+            diagnostics = {
+                "raw_reverse_output": raw_reverse.detach().cpu(),
+                "blended_output": final_output.detach().cpu(),
+                "final_output": final_output.detach().cpu(),
+                "raw_edit_region_mean_abs_delta": float(abs_delta.mean().item()),
+                "final_edit_region_mean_abs_delta": float(abs_delta.mean().item()),
+                "raw_background_mean_abs_delta": 0.0,
+                "final_background_mean_abs_delta": 0.0,
+                "blend_gap_edit_region_mean_abs": 0.0,
+                "blend_gap_background_mean_abs": 0.0,
+            }
+            self._record_strength_diagnostics(diagnostics)
+            return final_output, diagnostics
         return xt
 
     @staticmethod
@@ -463,8 +605,8 @@ class ConditionalGenerator(nn.Module):
         
         return soft_mask
 
-    def edit_soft(self, batch, n_samples, sampler="ddim", soft_mask=None, 
-                  hard_mask=None, smooth_width=5, smooth_type="gaussian"):
+    def edit_soft(self, batch, n_samples, sampler="ddim", soft_mask=None,
+                  hard_mask=None, smooth_width=5, smooth_type="gaussian", return_diagnostics=False):
         """
         Entry point: Execute local editing with soft boundary mask.
         
@@ -504,13 +646,18 @@ class ConditionalGenerator(nn.Module):
                 strength_label=strength_label,
                 task_id=task_id,
                 text_context=instruction_text,
+                return_diagnostics=return_diagnostics,
             )
-            samples.append(tgt_x_pred)
-            
-        return torch.stack(samples)
+            if return_diagnostics:
+                sample_tensor, diagnostics = tgt_x_pred
+                samples.append({"sample": sample_tensor, "diagnostics": diagnostics})
+            else:
+                samples.append({"sample": tgt_x_pred, "diagnostics": None})
+
+        return self._stack_sample_outputs(samples, return_diagnostics=return_diagnostics)
 
     @torch.no_grad()
-    def _edit_soft(self, src_x, side_emb, src_attr_emb, tgt_attr_emb, sampler, soft_mask, strength_label=None, task_id=None, text_context=None):
+    def _edit_soft(self, src_x, side_emb, src_attr_emb, tgt_attr_emb, sampler, soft_mask, strength_label=None, task_id=None, text_context=None, return_diagnostics=False):
         """
         Core Innovation: Latent Blending (State-Space Mixing) for Ground-Truth Preservation.
 
@@ -569,6 +716,9 @@ class ConditionalGenerator(nn.Module):
 
         xt_orig = xt.clone()  # Store noisy latent for attention injection
 
+        raw_reverse = None
+        blended_reverse = None
+
         # ==================== Step 2: Reverse Denoising with Latent Blending ====================
         # At every step t:
         #   z_{t-1}^{GT} = sqrt(ᾱ_{t-1}) * x_0 + sqrt(1-ᾱ_{t-1}) * ε_fixed   (direct formula)
@@ -605,5 +755,30 @@ class ConditionalGenerator(nn.Module):
             # ==================== CORE: Latent Blending ====================
             # z_{t-1} = M ⊙ z_{t-1}^{pred} + (1-M) ⊙ z_{t-1}^{GT}
             xt = mask_tensor * xt_pred + (1.0 - mask_tensor) * xt_gt_step
+            if t == 0:
+                raw_reverse = xt_pred.detach().clone()
+                blended_reverse = xt.detach().clone()
 
-        return xt
+        final_output = xt
+        diagnostics = None
+        if return_diagnostics:
+            raw_edit_delta = torch.abs(raw_reverse - src_x)
+            final_edit_delta = torch.abs(final_output - src_x)
+            blend_gap = torch.abs(final_output - raw_reverse)
+            edit_mask = mask_tensor.expand(B, K, L)
+            bg_mask = (1.0 - mask_tensor).expand(B, K, L)
+            diagnostics = {
+                "raw_reverse_output": raw_reverse.detach().cpu(),
+                "blended_output": blended_reverse.detach().cpu(),
+                "final_output": final_output.detach().cpu(),
+                "raw_edit_region_mean_abs_delta": float((raw_edit_delta * edit_mask).sum().item() / torch.clamp(edit_mask.sum(), min=1.0).item()),
+                "final_edit_region_mean_abs_delta": float((final_edit_delta * edit_mask).sum().item() / torch.clamp(edit_mask.sum(), min=1.0).item()),
+                "raw_background_mean_abs_delta": float((raw_edit_delta * bg_mask).sum().item() / torch.clamp(bg_mask.sum(), min=1.0).item()),
+                "final_background_mean_abs_delta": float((final_edit_delta * bg_mask).sum().item() / torch.clamp(bg_mask.sum(), min=1.0).item()),
+                "blend_gap_edit_region_mean_abs": float((blend_gap * edit_mask).sum().item() / torch.clamp(edit_mask.sum(), min=1.0).item()),
+                "blend_gap_background_mean_abs": float((blend_gap * bg_mask).sum().item() / torch.clamp(bg_mask.sum(), min=1.0).item()),
+            }
+            self._record_strength_diagnostics(diagnostics)
+            return final_output, diagnostics
+
+        return final_output

@@ -9,6 +9,7 @@ train:
   epochs: 10
   batch_size: 4
   lr: 1.0e-5
+  enable_strength_control: true
   itr_per_epoch: 1.0e+8
   model_path:
   output_folder: finetune
@@ -20,6 +21,11 @@ train:
   strength_lr_scale: 5.0
   strength_diagnostics_enabled: true
   strength_diagnostics_interval: 20
+  gain_match_loss_weight: 1.0
   run_generation_eval: false
   skip_final_evaluate: true
+  strength_debug:
+    compare_raw_and_final: true
+    projector_modulation_scalars: true
+    validate_family_invariants: true
   ctrl_attrs: [[trend_injection]]

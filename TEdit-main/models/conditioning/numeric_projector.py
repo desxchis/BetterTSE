@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import copy
 import hashlib
 import re
-from typing import Optional, Sequence
+from typing import Any, Optional, Sequence
 
 import torch
 import torch.nn as nn
@@ -63,6 +64,10 @@ class InstructionContextEncoder(nn.Module):
 class StrengthProjector(nn.Module):
     """Project strength controls into a shared conditioning vector."""
 
+    _diag_enabled = False
+    _diag_records = []
+    _diag_max_records = 32
+
     def __init__(
         self,
         num_strength_bins: int = 3,
@@ -106,6 +111,91 @@ class StrengthProjector(nn.Module):
 
         nn.init.zeros_(self.mlp[-1].weight)
         nn.init.zeros_(self.mlp[-1].bias)
+
+    @classmethod
+    def enable_diagnostics(cls, enabled: bool = True, max_records: int = 32) -> None:
+        cls._diag_enabled = bool(enabled)
+        cls._diag_max_records = max(1, int(max_records))
+        cls._diag_records = []
+
+    @classmethod
+    def disable_diagnostics(cls) -> None:
+        cls._diag_enabled = False
+
+    @classmethod
+    def consume_diagnostics(cls) -> list[dict[str, Any]]:
+        records = copy.deepcopy(cls._diag_records)
+        cls._diag_records = []
+        return records
+
+    def _record_diagnostics(
+        self,
+        strength_label: torch.Tensor,
+        projector_out: torch.Tensor,
+        task_id: Optional[torch.Tensor],
+        text_context: Optional[torch.Tensor | Sequence[str] | str],
+    ) -> None:
+        if not self.__class__._diag_enabled:
+            return
+        if len(self.__class__._diag_records) >= self.__class__._diag_max_records:
+            return
+
+        with torch.no_grad():
+            out_cpu = projector_out.detach().cpu().float()
+            labels_cpu = strength_label.detach().cpu().long().view(-1)
+            pairwise = {}
+            means = {}
+            full_norm_mean = float(out_cpu.norm(dim=-1).mean().item()) if out_cpu.numel() > 0 else 0.0
+            full_norm_std = float(out_cpu.norm(dim=-1).std(unbiased=False).item()) if out_cpu.shape[0] > 1 else 0.0
+            centered = out_cpu - out_cpu.mean(dim=0, keepdim=True)
+            full_std_mean = float(centered.std(dim=0, unbiased=False).mean().item()) if out_cpu.shape[0] > 1 else 0.0
+            for label in [0, 1, 2]:
+                mask = labels_cpu == label
+                if int(mask.sum().item()) == 0:
+                    continue
+                label_out = out_cpu[mask]
+                mean_vec = label_out.mean(dim=0)
+                means[str(label)] = {
+                    "count": int(mask.sum().item()),
+                    "norm": float(mean_vec.norm().item()),
+                    "mean_abs": float(label_out.abs().mean().item()),
+                    "std_mean": float(label_out.std(dim=0, unbiased=False).mean().item()) if label_out.shape[0] > 1 else 0.0,
+                }
+                pairwise[f"self_{label}"] = 0.0
+            for left in [0, 1, 2]:
+                for right in [left + 1, 2]:
+                    if right <= left:
+                        continue
+                    left_mask = labels_cpu == left
+                    right_mask = labels_cpu == right
+                    if int(left_mask.sum().item()) == 0 or int(right_mask.sum().item()) == 0:
+                        continue
+                    left_mean = out_cpu[left_mask].mean(dim=0)
+                    right_mean = out_cpu[right_mask].mean(dim=0)
+                    diff = left_mean - right_mean
+                    pairwise[f"{left}_{right}"] = float(diff.norm().item())
+                    pairwise[f"{left}_{right}_mean_abs"] = float(diff.abs().mean().item())
+
+            text_mode = "none"
+            if isinstance(text_context, torch.Tensor):
+                text_mode = "tensor"
+            elif isinstance(text_context, str):
+                text_mode = "string"
+            elif isinstance(text_context, Sequence):
+                text_mode = "sequence"
+
+            self.__class__._diag_records.append(
+                {
+                    "labels": labels_cpu.tolist(),
+                    "task_ids": None if task_id is None else task_id.detach().cpu().long().view(-1).tolist(),
+                    "text_mode": text_mode,
+                    "projector_output_norm_mean": full_norm_mean,
+                    "projector_output_norm_std": full_norm_std,
+                    "projector_output_feature_std_mean": full_std_mean,
+                    "projector_output_mean_norm_by_strength": means,
+                    "projector_output_pairwise_l2": pairwise,
+                }
+            )
 
     def _encode_text_context(
         self,
@@ -162,4 +252,11 @@ class StrengthProjector(nn.Module):
             )
 
         x = torch.cat(feats, dim=-1)
-        return self.mlp(x)
+        projector_out = self.mlp(x)
+        self._record_diagnostics(
+            strength_label=strength_label,
+            projector_out=projector_out,
+            task_id=task_id,
+            text_context=text_context,
+        )
+        return projector_out
