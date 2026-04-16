@@ -12,7 +12,12 @@ Usage:
 import os
 from pathlib import Path
 from typing import Dict, Any, Optional
-from dotenv import load_dotenv
+
+try:
+    from dotenv import load_dotenv
+except ImportError:  # pragma: no cover - optional dependency
+    def load_dotenv(*_args: Any, **_kwargs: Any) -> bool:
+        return False
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 

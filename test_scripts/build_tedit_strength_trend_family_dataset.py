@@ -12,6 +12,13 @@ if str(_ROOT) not in sys.path:
 from test_scripts.build_tedit_strength_discrete_benchmark import build_discrete_benchmark
 
 
+LEGACY_STRENGTH_TO_SCALAR = {
+    "weak": 0.0,
+    "medium": 0.5,
+    "strong": 1.0,
+}
+
+
 def build_family_dataset(
     *,
     csv_path: str,
@@ -45,6 +52,19 @@ def build_family_dataset(
         )
         src_json = Path(result["json_path"])
         payload = json.loads(src_json.read_text(encoding="utf-8"))
+        for family in payload.get("families", []):
+            samples = list(family.get("samples", []))
+            samples.sort(key=lambda sample: float(sample.get("strength_scalar", LEGACY_STRENGTH_TO_SCALAR.get(str(sample.get("strength_text", "")), 0.0))))
+            for sample in samples:
+                strength_text = str(sample.get("strength_text", ""))
+                strength_scalar = float(sample.get("strength_scalar", LEGACY_STRENGTH_TO_SCALAR.get(strength_text, 0.0)))
+                sample["strength_scalar"] = strength_scalar
+            family["samples"] = samples
+        payload["strength_axis"] = {
+            "type": "continuous_scalar",
+            "anchor_mapping": LEGACY_STRENGTH_TO_SCALAR,
+            "range": [0.0, 1.0],
+        }
         (output_root / f"{split}.json").write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
         split_results[split] = {
             "num_families": int(payload["num_families"]),
@@ -61,6 +81,11 @@ def build_family_dataset(
         "control_attr": ["trend_types"],
         "control_attr_ids": [0],
         "strength_bins": ["weak", "medium", "strong"],
+        "strength_axis": {
+            "type": "continuous_scalar",
+            "anchor_mapping": LEGACY_STRENGTH_TO_SCALAR,
+            "range": [0.0, 1.0],
+        },
         "splits": split_results,
     }
     (output_root / "meta.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
@@ -75,7 +100,7 @@ def build_family_dataset(
                 f"- valid_families: {valid_families}",
                 f"- test_families: {test_families}",
                 "",
-                "每个 family 固定 source/region/template，只改变 weak/medium/strong。",
+                "每个 family 固定 source/region/template，只改变有序 strength scalar（当前 anchor: weak=0.0, medium=0.5, strong=1.0）。",
             ]
         )
         + "\n",

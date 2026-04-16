@@ -52,6 +52,48 @@
 
 **状态**：训练链已收口，行为效果仍未成立
 
+## [2026-04-16] - 强度诊断推进到“方向反了 / 输出层映射有误”阶段
+
+**修改文件**：`TEdit-main/models/conditioning/numeric_projector.py`、`TEdit-main/models/diffusion/diff_csdi_multipatch.py`、`TEdit-main/models/diffusion/diff_csdi_multipatch_weaver.py`、`TEdit-main/models/conditional_generator.py`、`TEdit-main/train/finetuner.py`、`TEdit-main/run_finetune.py`、`tool/tedit_wrapper.py`、`test_scripts/evaluate_tedit_strength_effect.py`、`test_scripts/probe_tedit_strength_internal.py`、`test_scripts/probe_reversed_strength_scalar.py`、`test_scripts/run_tedit_strength_phase1_ablation.py`、`test_scripts/run_tedit_trend_monotonic_eval.py`、`results/strength_gainmult4_cuda0_validation/*`、`results/strength_second_gpu_validation_semantic_split/*`、`results/beta_only_repair_short/*`、`results/beta_only_repair_longer/*`、`results/beta_direction_pass2/*`、`results/beta_direction_pass2_w1/*`、`results/provenance_smoke*/*`
+
+**改动内容**：
+- 给 strength projector、modulation residual、generator loss、训练器增加分层诊断与审计输出，能够分别观察：
+  - projector 输出是否随强度变化
+  - modulation 的 `delta_gamma / delta_beta` 是否随强度变化
+  - 中间 stage 响应是否保留 strength 差异
+  - 最终输出是否仍保留 `weak < medium < strong`
+- 补充三类专用脚本：
+  - `evaluate_tedit_strength_effect.py`：对最终编辑结果做三档强度评估
+  - `probe_tedit_strength_internal.py`：直接探测内部调制与 stage 响应
+  - `probe_reversed_strength_scalar.py`：把强度标量反向喂入，验证方向是否被学反
+- 新增一轮 `gainmult4`、`semantic split rerun`、`beta flip`、`beta_only_repair`、`beta_direction_loss`、`provenance smoke` 实验
+- 给 `run_finetune.py` 增加 `resolved_runtime_config.json` 产物，固定记录运行时真实生效的 CLI 覆盖、合并后配置、checkpoint/data/output 路径与 git commit
+
+**关键结论**：
+- 当前问题已经不是“strength 通道不存在”：
+  - recent probe 显示内部 modulation 对不同强度存在可观测差异
+  - `delta_gamma / delta_beta` 会随 `0.0 -> 0.5 -> 1.0` 增大
+- 当前主要故障也不再像是“完全零响应”，而更像是：
+  - 最终输出层把强度差异压平
+  - 或者把方向学反，出现 `strong` 比 `weak` 改得更少
+- `semantic_split` rerun 的关键现象：
+  - 正常喂入 scalar 时，label-only probe 常出现负相关或负的 `strong_minus_weak_edit_gain_mean`
+  - 把 scalar 反向喂入后，整体趋势会显著翻正
+- `beta_flip` probe 的关键现象：
+  - 仅在推理时翻转 beta 路径符号，就能把局部 probe 从反向改成正向
+  - 这表明当前最可疑的问题集中在 beta 路径及其到最终输出的映射
+- `Pass 2A` 结论仍然保守：
+  - `beta_direction_loss_weight=1.0` 已经接入训练入口并实际运行
+  - 但 Gate 1 / Gate 2 仍未修复正式 monotonic 行为
+  - 目前还不能宣称“已经不需要 beta-flip”
+
+**关键决策**：
+- 后续排查重点从“有没有 strength signal”切到“为什么 signal 在输出阶段变平或反向”
+- provenance 记录必须保留，因为近期实验已细到“同一 checkpoint 不同运行口径会影响解释”
+- 当前不应把问题重新表述成 benchmark 不健康或文本解析失效；主故障已经收敛到输出方向与最终映射
+
+**状态**：已定位到输出方向层面的核心窄口，尚未完成修复
+
 ## [2026-04-08] - 新 strength-injection 主线切断旧属性监督并落地 family 训练路径
 
 **修改文件**：`TEdit-main/data/discrete_strength_family.py`、`TEdit-main/data/__init__.py`、`TEdit-main/models/conditional_generator.py`、`TEdit-main/run_finetune.py`、`TEdit-main/configs/synthetic/finetune_strength_trend_family.yaml`、`TEdit-main/configs/synthetic/model_multi_weaver.yaml`、`test_scripts/build_tedit_strength_trend_family_dataset.py`、`docs/pure_editing_how_much_protocol.md`、`docs/experiment_preparation.md`、`PIPELINE.md`

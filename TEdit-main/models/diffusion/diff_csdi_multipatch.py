@@ -1,4 +1,5 @@
 import copy
+import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -7,6 +8,10 @@ from linear_attention_transformer import LinearAttentionTransformer
 import numpy as np
 
 from models.conditioning import StrengthProjector
+
+
+def _format_scalar_key(value):
+    return f"{float(value):.4f}"
 
 def get_torch_trans(heads=8, layers=1, channels=64):
     encoder_layer = nn.TransformerEncoderLayer(
@@ -63,21 +68,36 @@ class ResidualBlock(nn.Module):
     _diag_enabled = False
     _diag_records = []
     _diag_max_records = 64
+    _diag_stage_records = []
+    _diag_stage_max_records = 1024
+    _flip_beta_sign_inference = False
 
     @classmethod
-    def enable_diagnostics(cls, enabled: bool = True, max_records: int = 64) -> None:
+    def enable_diagnostics(
+        cls,
+        enabled: bool = True,
+        max_records: int = 64,
+        stage_max_records: int = 1024,
+    ) -> None:
         cls._diag_enabled = bool(enabled)
         cls._diag_max_records = max(1, int(max_records))
+        cls._diag_stage_max_records = max(1, int(stage_max_records))
         cls._diag_records = []
+        cls._diag_stage_records = []
 
     @classmethod
     def disable_diagnostics(cls) -> None:
         cls._diag_enabled = False
 
     @classmethod
+    def set_flip_beta_sign_inference(cls, enabled: bool = False) -> None:
+        cls._flip_beta_sign_inference = bool(enabled)
+
+    @classmethod
     def consume_diagnostics(cls):
-        records = copy.deepcopy(cls._diag_records)
+        records = copy.deepcopy(cls._diag_records) + copy.deepcopy(cls._diag_stage_records)
         cls._diag_records = []
+        cls._diag_stage_records = []
         return records
 
     def __init__(
@@ -91,6 +111,7 @@ class ResidualBlock(nn.Module):
         is_attr_proj=False,
         strength_cond_dim=0,
         strength_mode="modulation_residual",
+        strength_gain_multiplier=4.0,
     ):
         super().__init__()
         self.diffusion_projection = nn.Linear(diffusion_embedding_dim, channels)
@@ -106,6 +127,7 @@ class ResidualBlock(nn.Module):
         nn.init.zeros_(self.base_modulation[-1].weight)
         nn.init.zeros_(self.base_modulation[-1].bias)
         self.strength_mode = strength_mode
+        self.strength_gain_multiplier = float(strength_gain_multiplier)
         self.strength_modulation = None
         if strength_cond_dim > 0:
             self.strength_modulation = nn.Sequential(
@@ -113,8 +135,8 @@ class ResidualBlock(nn.Module):
                 nn.SiLU(),
                 nn.Linear(channels, 2 * channels),
             )
-            nn.init.zeros_(self.strength_modulation[-1].weight)
-            nn.init.zeros_(self.strength_modulation[-1].bias)
+            nn.init.normal_(self.strength_modulation[-1].weight, mean=0.0, std=1.0e-3)
+            nn.init.normal_(self.strength_modulation[-1].bias, mean=0.0, std=1.0e-3)
         self.side_projection = Conv1d_with_init(side_dim, 2 * channels, 1)
         self.mid_projection = Conv1d_with_init(channels, 2 * channels, 1)
         self.output_projection = Conv1d_with_init(channels, 2 * channels, 1)
@@ -152,7 +174,20 @@ class ResidualBlock(nn.Module):
         y = y.reshape(B, L, channel, K).permute(0, 2, 3, 1).reshape(B, channel, K * L)
         return y
 
-    def _record_modulation_diagnostics(self, gamma_orig, beta_orig, delta_gamma, delta_beta, strength_cond):
+    def _record_modulation_diagnostics(
+        self,
+        gamma_orig,
+        beta_orig,
+        delta_gamma,
+        delta_beta,
+        strength_cond,
+        strength_label=None,
+        strength_scalar=None,
+        gamma_final=None,
+        beta_final=None,
+        gamma_scale=None,
+        beta_scale=None,
+    ):
         if not self.__class__._diag_enabled:
             return
         if len(self.__class__._diag_records) >= self.__class__._diag_max_records:
@@ -180,13 +215,45 @@ class ResidualBlock(nn.Module):
                 "delta_beta_over_base_mean": float((delta_beta_norm / torch.clamp(beta_orig_norm, min=eps)).mean().item()),
                 "strength_cond_norm_mean": float(strength_cond_cpu.norm(dim=-1).mean().item()),
             }
-            labels = None
-            if strength_cond_cpu.shape[0] >= 3 and strength_cond_cpu.shape[0] % 3 == 0:
-                labels = torch.arange(strength_cond_cpu.shape[0], dtype=torch.long) % 3
+            if gamma_scale is not None:
+                gamma_scale_cpu = gamma_scale.detach().cpu().float()
+                record["gamma_scale_mean"] = float(gamma_scale_cpu.mean().item())
+                record["gamma_scale_abs_mean"] = float(gamma_scale_cpu.abs().mean().item())
+            if beta_scale is not None:
+                beta_scale_cpu = beta_scale.detach().cpu().float()
+                record["beta_scale_mean"] = float(beta_scale_cpu.mean().item())
+                record["beta_scale_abs_mean"] = float(beta_scale_cpu.abs().mean().item())
+            if gamma_final is not None:
+                gamma_final_cpu = gamma_final.detach().cpu().float()
+                record["gamma_final_norm_mean"] = float(gamma_final_cpu.norm(dim=-1).mean().item())
+                record["gamma_final_abs_mean"] = float(gamma_final_cpu.abs().mean().item())
+            if beta_final is not None:
+                beta_final_cpu = beta_final.detach().cpu().float()
+                record["beta_final_norm_mean"] = float(beta_final_cpu.norm(dim=-1).mean().item())
+                record["beta_final_abs_mean"] = float(beta_final_cpu.abs().mean().item())
+            stage_tensors = {
+                "strength_cond": strength_cond_cpu,
+                "gamma_orig": gamma_orig_cpu,
+                "beta_orig": beta_orig_cpu,
+                "delta_gamma": delta_gamma_cpu,
+                "delta_beta": delta_beta_cpu,
+            }
+            if gamma_scale is not None:
+                stage_tensors["gamma_scale"] = gamma_scale_cpu
+            if beta_scale is not None:
+                stage_tensors["beta_scale"] = beta_scale_cpu
+            if gamma_final is not None:
+                stage_tensors["gamma_final"] = gamma_final_cpu
+            if beta_final is not None:
+                stage_tensors["beta_final"] = beta_final_cpu
+            for stage_name, tensor in stage_tensors.items():
+                record[f"{stage_name}_norm_mean"] = float(tensor.norm(dim=-1).mean().item())
+                record[f"{stage_name}_abs_mean"] = float(tensor.abs().mean().item())
+            labels = None if strength_label is None else strength_label.detach().cpu().long().view(-1)
             if labels is not None:
                 for name, tensor in (("delta_gamma", delta_gamma_cpu), ("delta_beta", delta_beta_cpu)):
                     means = {}
-                    for label in [0, 1, 2]:
+                    for label in sorted(set(labels.tolist())):
                         mask = labels == label
                         if int(mask.sum().item()) == 0:
                             continue
@@ -197,8 +264,9 @@ class ResidualBlock(nn.Module):
                             "mean_abs": float(mean_vec.abs().mean().item()),
                         }
                     pairwise = {}
-                    for left in [0, 1, 2]:
-                        for right in range(left + 1, 3):
+                    unique_labels = sorted(set(labels.tolist()))
+                    for idx, left in enumerate(unique_labels):
+                        for right in unique_labels[idx + 1:]:
                             if str(left) not in means or str(right) not in means:
                                 continue
                             left_mean = tensor[labels == left].mean(dim=0)
@@ -208,19 +276,284 @@ class ResidualBlock(nn.Module):
                             pairwise[f"{left}_{right}_mean_abs"] = float(diff.abs().mean().item())
                     record[f"{name}_mean_by_strength"] = means
                     record[f"{name}_pairwise_l2"] = pairwise
+            scalar_values = None if strength_scalar is None else strength_scalar.detach().cpu().float().view(-1)
+            if scalar_values is not None:
+                for name, tensor in (("delta_gamma", delta_gamma_cpu), ("delta_beta", delta_beta_cpu), ("gamma_orig", gamma_orig_cpu), ("beta_orig", beta_orig_cpu)):
+                    means = {}
+                    pairwise = {}
+                    unique_scalars = sorted({float(value) for value in scalar_values.tolist()})
+                    for scalar_value in unique_scalars:
+                        mask = torch.isclose(scalar_values, scalar_values.new_tensor(float(scalar_value)), atol=1.0e-6, rtol=0.0)
+                        if int(mask.sum().item()) == 0:
+                            continue
+                        mean_vec = tensor[mask].mean(dim=0)
+                        scalar_key = _format_scalar_key(scalar_value)
+                        means[scalar_key] = {
+                            "count": int(mask.sum().item()),
+                            "norm": float(mean_vec.norm().item()),
+                            "mean_abs": float(mean_vec.abs().mean().item()),
+                            "mean": float(mean_vec.mean().item()),
+                            "positive_frac": float((mean_vec > 0).float().mean().item()),
+                            "negative_frac": float((mean_vec < 0).float().mean().item()),
+                        }
+                    for idx, left in enumerate(unique_scalars):
+                        for right in unique_scalars[idx + 1:]:
+                            left_mask = torch.isclose(scalar_values, scalar_values.new_tensor(float(left)), atol=1.0e-6, rtol=0.0)
+                            right_mask = torch.isclose(scalar_values, scalar_values.new_tensor(float(right)), atol=1.0e-6, rtol=0.0)
+                            if int(left_mask.sum().item()) == 0 or int(right_mask.sum().item()) == 0:
+                                continue
+                            left_mean = tensor[left_mask].mean(dim=0)
+                            right_mean = tensor[right_mask].mean(dim=0)
+                            diff = left_mean - right_mean
+                            pair_key = f"{_format_scalar_key(left)}_{_format_scalar_key(right)}"
+                            pairwise[pair_key] = float(diff.norm().item())
+                            pairwise[f"{pair_key}_mean_abs"] = float(diff.abs().mean().item())
+                            pairwise[f"{pair_key}_mean"] = float(diff.mean().item())
+                    record[f"{name}_mean_by_scalar"] = means
+                    record[f"{name}_pairwise_l2_by_scalar"] = pairwise
+                for name, tensor in (("gamma_final", gamma_final_cpu), ("beta_final", beta_final_cpu)):
+                    means = {}
+                    pairwise = {}
+                    unique_scalars = sorted({float(value) for value in scalar_values.tolist()})
+                    for scalar_value in unique_scalars:
+                        mask = torch.isclose(scalar_values, scalar_values.new_tensor(float(scalar_value)), atol=1.0e-6, rtol=0.0)
+                        if int(mask.sum().item()) == 0:
+                            continue
+                        mean_vec = tensor[mask].mean(dim=0)
+                        scalar_key = _format_scalar_key(scalar_value)
+                        means[scalar_key] = {
+                            "count": int(mask.sum().item()),
+                            "norm": float(mean_vec.norm().item()),
+                            "mean_abs": float(mean_vec.abs().mean().item()),
+                            "mean": float(mean_vec.mean().item()),
+                            "positive_frac": float((mean_vec > 0).float().mean().item()),
+                            "negative_frac": float((mean_vec < 0).float().mean().item()),
+                        }
+                    for idx, left in enumerate(unique_scalars):
+                        for right in unique_scalars[idx + 1:]:
+                            left_mask = torch.isclose(scalar_values, scalar_values.new_tensor(float(left)), atol=1.0e-6, rtol=0.0)
+                            right_mask = torch.isclose(scalar_values, scalar_values.new_tensor(float(right)), atol=1.0e-6, rtol=0.0)
+                            if int(left_mask.sum().item()) == 0 or int(right_mask.sum().item()) == 0:
+                                continue
+                            diff = tensor[left_mask].mean(dim=0) - tensor[right_mask].mean(dim=0)
+                            pair_key = f"{_format_scalar_key(left)}_{_format_scalar_key(right)}"
+                            pairwise[pair_key] = float(diff.norm().item())
+                            pairwise[f"{pair_key}_mean_abs"] = float(diff.abs().mean().item())
+                            pairwise[f"{pair_key}_mean"] = float(diff.mean().item())
+                    record[f"{name}_mean_by_scalar"] = means
+                    record[f"{name}_pairwise_l2_by_scalar"] = pairwise
             self.__class__._diag_records.append(record)
 
-    def _compute_modulation(self, attr_emb, diffusion_cond, strength_cond):
+    def _record_response_diagnostics(self, stage_name, tensor, strength_label=None, strength_scalar=None):
+        if not self.__class__._diag_enabled:
+            return
+        if len(self.__class__._diag_stage_records) >= self.__class__._diag_stage_max_records:
+            return
+        with torch.no_grad():
+            tensor_cpu = tensor.detach().cpu().float().reshape(tensor.shape[0], -1)
+            record = {
+                "stage_name": stage_name,
+                "stage_norm_mean": float(tensor_cpu.norm(dim=-1).mean().item()),
+                "stage_abs_mean": float(tensor_cpu.abs().mean().item()),
+                "stage_feature_std_mean": float(tensor_cpu.std(dim=-1).mean().item()),
+            }
+            labels = None if strength_label is None else strength_label.detach().cpu().long().view(-1)
+            if labels is not None:
+                means = {}
+                pairwise = {}
+                unique_labels = sorted(set(labels.tolist()))
+                for label in unique_labels:
+                    mask = labels == label
+                    if int(mask.sum().item()) == 0:
+                        continue
+                    mean_vec = tensor_cpu[mask].mean(dim=0)
+                    means[str(label)] = {
+                        "count": int(mask.sum().item()),
+                        "norm": float(mean_vec.norm().item()),
+                        "mean_abs": float(mean_vec.abs().mean().item()),
+                    }
+                for idx, left in enumerate(unique_labels):
+                    for right in unique_labels[idx + 1:]:
+                        if str(left) not in means or str(right) not in means:
+                            continue
+                        diff = tensor_cpu[labels == left].mean(dim=0) - tensor_cpu[labels == right].mean(dim=0)
+                        pairwise[f"{left}_{right}"] = float(diff.norm().item())
+                        pairwise[f"{left}_{right}_mean_abs"] = float(diff.abs().mean().item())
+                record["stage_mean_by_strength"] = means
+                record["stage_pairwise_l2"] = pairwise
+            scalar_values = None if strength_scalar is None else strength_scalar.detach().cpu().float().view(-1)
+            if scalar_values is not None:
+                means = {}
+                pairwise = {}
+                unique_scalars = sorted({float(value) for value in scalar_values.tolist()})
+                for scalar_value in unique_scalars:
+                    mask = torch.isclose(scalar_values, scalar_values.new_tensor(float(scalar_value)), atol=1.0e-6, rtol=0.0)
+                    if int(mask.sum().item()) == 0:
+                        continue
+                    mean_vec = tensor_cpu[mask].mean(dim=0)
+                    scalar_key = _format_scalar_key(scalar_value)
+                    means[scalar_key] = {
+                        "count": int(mask.sum().item()),
+                        "norm": float(mean_vec.norm().item()),
+                        "mean_abs": float(mean_vec.abs().mean().item()),
+                    }
+                for idx, left in enumerate(unique_scalars):
+                    for right in unique_scalars[idx + 1:]:
+                        left_mask = torch.isclose(scalar_values, scalar_values.new_tensor(float(left)), atol=1.0e-6, rtol=0.0)
+                        right_mask = torch.isclose(scalar_values, scalar_values.new_tensor(float(right)), atol=1.0e-6, rtol=0.0)
+                        if int(left_mask.sum().item()) == 0 or int(right_mask.sum().item()) == 0:
+                            continue
+                        diff = tensor_cpu[left_mask].mean(dim=0) - tensor_cpu[right_mask].mean(dim=0)
+                        pair_key = f"{_format_scalar_key(left)}_{_format_scalar_key(right)}"
+                        pairwise[pair_key] = float(diff.norm().item())
+                        pairwise[f"{pair_key}_mean_abs"] = float(diff.abs().mean().item())
+                record["stage_mean_by_scalar"] = means
+                record["stage_pairwise_l2_by_scalar"] = pairwise
+            self.__class__._diag_stage_records.append(record)
+
+    def _record_forward_response_diagnostics(self, stage_values, strength_label=None, strength_scalar=None):
+        for stage_name, tensor in stage_values.items():
+            if tensor is None:
+                continue
+            self._record_response_diagnostics(stage_name, tensor, strength_label=strength_label, strength_scalar=strength_scalar)
+
+    def _apply_mid_gate_filter(self, y, strength_label=None, strength_scalar=None):
+        gate, filter = torch.chunk(y, 2, dim=1)
+        gated = torch.sigmoid(gate) * torch.tanh(filter)
+        self._record_forward_response_diagnostics(
+            {
+                "pre_mid_gatefilter": y,
+                "mid_gate_logits": gate,
+                "mid_filter_logits": filter,
+                "mid_gate_activation": torch.sigmoid(gate),
+                "mid_filter_activation": torch.tanh(filter),
+                "mid_gated_output": gated,
+            },
+            strength_label=strength_label,
+            strength_scalar=strength_scalar,
+        )
+        return gated
+
+    def _run_post_modulation_stack(self, y, base_shape, attention_mask=None, strength_label=None, strength_scalar=None):
+        self._record_forward_response_diagnostics(
+            {"post_modulation": y},
+            strength_label=strength_label,
+            strength_scalar=strength_scalar,
+        )
+        y = self.forward_time(y, base_shape, attention_mask)
+        self._record_forward_response_diagnostics(
+            {"post_time": y},
+            strength_label=strength_label,
+            strength_scalar=strength_scalar,
+        )
+        y = self.forward_feature(y, base_shape, attention_mask)
+        self._record_forward_response_diagnostics(
+            {"post_feature": y},
+            strength_label=strength_label,
+            strength_scalar=strength_scalar,
+        )
+        return y
+
+    def _run_output_head(self, y, side_emb, base_shape, strength_label=None, strength_scalar=None):
+        B, channel, K, L = base_shape
+        y = y.reshape(B, channel, K * L)
+        y = self.mid_projection(y)
+        self._record_forward_response_diagnostics(
+            {"post_mid_projection": y},
+            strength_label=strength_label,
+            strength_scalar=strength_scalar,
+        )
+        _, side_dim, _, _ = side_emb.shape
+        side_emb = side_emb.reshape(B, side_dim, K * L)
+        side_emb = self.side_projection(side_emb)
+        combined = y + side_emb
+        self._record_forward_response_diagnostics(
+            {
+                "side_projection": side_emb,
+                "post_side_add": combined,
+            },
+            strength_label=strength_label,
+            strength_scalar=strength_scalar,
+        )
+        gated = self._apply_mid_gate_filter(combined, strength_label=strength_label, strength_scalar=strength_scalar)
+        y = self.output_projection(gated)
+        self._record_forward_response_diagnostics(
+            {"post_output_projection": y},
+            strength_label=strength_label,
+            strength_scalar=strength_scalar,
+        )
+        residual, skip = torch.chunk(y, 2, dim=1)
+        self._record_forward_response_diagnostics(
+            {
+                "residual_branch": residual,
+                "skip_branch": skip,
+            },
+            strength_label=strength_label,
+            strength_scalar=strength_scalar,
+        )
+        return residual.reshape(base_shape), skip.reshape(base_shape)
+
+    def _record_residual_merge(self, x, residual, strength_label=None, strength_scalar=None):
+        merged = (x + residual) / math.sqrt(2.0)
+        self._record_forward_response_diagnostics(
+            {"residual_merge": merged},
+            strength_label=strength_label,
+            strength_scalar=strength_scalar,
+        )
+        return merged
+
+    def _forward_with_strength_diagnostics(self, x, side_emb, base_shape, y, attention_mask=None, strength_label=None, strength_scalar=None):
+        y = self._run_post_modulation_stack(
+            y,
+            base_shape,
+            attention_mask=attention_mask,
+            strength_label=strength_label,
+            strength_scalar=strength_scalar,
+        )
+        residual, skip = self._run_output_head(
+            y,
+            side_emb,
+            base_shape,
+            strength_label=strength_label,
+            strength_scalar=strength_scalar,
+        )
+        return self._record_residual_merge(x, residual, strength_label=strength_label, strength_scalar=strength_scalar), skip
+
+    def _compute_modulation(self, attr_emb, diffusion_cond, strength_cond, strength_label=None, strength_scalar=None):
         pooled_attr = torch.mean(attr_emb, dim=1)
         base_input = torch.cat([diffusion_cond, pooled_attr], dim=-1)
         gamma_orig, beta_orig = torch.chunk(self.base_modulation(base_input), 2, dim=-1)
         if self.strength_modulation is None or strength_cond is None or self.strength_mode != "modulation_residual":
             return gamma_orig, beta_orig
         delta_gamma, delta_beta = torch.chunk(self.strength_modulation(strength_cond), 2, dim=-1)
-        self._record_modulation_diagnostics(gamma_orig, beta_orig, delta_gamma, delta_beta, strength_cond)
-        return gamma_orig + delta_gamma, beta_orig + delta_beta
+        delta_gamma = delta_gamma * self.strength_gain_multiplier
+        delta_beta = delta_beta * self.strength_gain_multiplier
+        strength_ablation_mode = os.environ.get("TEDIT_STRENGTH_ABLATION_MODE", "").strip().lower()
+        if strength_ablation_mode == "gamma_only":
+            delta_beta = torch.zeros_like(delta_beta)
+        elif strength_ablation_mode == "beta_only":
+            delta_gamma = torch.zeros_like(delta_gamma)
+        if strength_scalar is not None:
+            strength_scalar = strength_scalar.float().view(-1, 1)
+            delta_gamma = delta_gamma * strength_scalar
+            delta_beta = delta_beta * strength_scalar
+        flip_beta_sign = bool(self.__class__._flip_beta_sign_inference) and not self.training
+        gamma_final = gamma_orig + delta_gamma
+        beta_final = beta_orig - delta_beta if flip_beta_sign else beta_orig + delta_beta
+        self._record_modulation_diagnostics(
+            gamma_orig,
+            beta_orig,
+            delta_gamma,
+            delta_beta,
+            strength_cond,
+            strength_label=strength_label,
+            strength_scalar=strength_scalar,
+            gamma_final=gamma_final,
+            beta_final=beta_final,
+        )
+        return gamma_final, beta_final
 
-    def forward(self, x, side_emb, attr_emb, diffusion_emb, attention_mask=None, strength_cond=None):
+    def forward(self, x, side_emb, attr_emb, diffusion_emb, attention_mask=None, strength_cond=None, strength_label=None, strength_scalar=None):
         B, channel, K, L = x.shape
         base_shape = x.shape
         
@@ -234,34 +567,34 @@ class ResidualBlock(nn.Module):
         a_x = a_x.reshape(B, channel, -1)  # (B,channel,K*(N+L))
 
         diffusion_cond = self.diffusion_projection(diffusion_emb)
-        gamma, beta = self._compute_modulation(attr_emb, diffusion_cond, strength_cond)
+        gamma, beta = self._compute_modulation(
+            attr_emb,
+            diffusion_cond,
+            strength_cond,
+            strength_label=strength_label,
+            strength_scalar=strength_scalar,
+        )
         diffusion_emb = diffusion_cond.unsqueeze(-1)  # (B,channel,1)
         gamma = gamma.unsqueeze(-1)
         beta = beta.unsqueeze(-1)
         y = (a_x + diffusion_emb) * (1.0 + gamma) + beta
-
-        y = self.forward_time(y, base_shape_a, attention_mask)
-        y = self.forward_feature(y, base_shape_a, attention_mask)  # (B,channel,K*(N+L))
-
-        y = y.reshape(base_shape_a)[..., N:]  # discard attr_emb
-        y = y.reshape(B,channel,K*L)
-        y = self.mid_projection(y)  # (B,2*channel,K*L)
-
-        _, side_dim, _, _ = side_emb.shape
-        side_emb = side_emb.reshape(B, side_dim, K * L)
-        side_emb = self.side_projection(side_emb)  # (B,2*channel,K*L)
-        y = y + side_emb
-
-        gate, filter = torch.chunk(y, 2, dim=1)
-        y = torch.sigmoid(gate) * torch.tanh(filter)  # (B,channel,K*L)
-        y = self.output_projection(y)
-
-        residual, skip = torch.chunk(y, 2, dim=1)
+        y = self._run_post_modulation_stack(
+            y,
+            base_shape_a,
+            attention_mask=attention_mask,
+            strength_label=strength_label,
+            strength_scalar=strength_scalar,
+        )
+        y = y.reshape(base_shape_a)[..., N:]
+        residual, skip = self._run_output_head(
+            y,
+            side_emb,
+            base_shape,
+            strength_label=strength_label,
+            strength_scalar=strength_scalar,
+        )
         x = x.reshape(base_shape)
-        residual = residual.reshape(base_shape)
-        skip = skip.reshape(base_shape)
-
-        return (x + residual) / math.sqrt(2.0), skip
+        return self._record_residual_merge(x, residual, strength_label=strength_label, strength_scalar=strength_scalar), skip
 
 class TsPatchEmbedding(nn.Module):
     def __init__(self, L_patch_len, channels, d_model, dropout):
@@ -443,6 +776,7 @@ class Diff_CSDI_MultiPatch_Parallel(nn.Module):
         strength_cfg = dict(config.get("strength_control") or {})
         self.strength_enabled = bool(strength_cfg.get("enabled", False))
         self.strength_mode = str(strength_cfg.get("mode", "modulation_residual"))
+        self.strength_gain_multiplier = float(strength_cfg.get("gain_multiplier", 4.0))
         self.strength_cond_dim = int(strength_cfg.get("out_dim", self.channels))
         self.strength_projector = None
         self.strength_input_projection = None
@@ -488,20 +822,29 @@ class Diff_CSDI_MultiPatch_Parallel(nn.Module):
                     is_linear=config["is_linear"],
                     strength_cond_dim=self.strength_cond_dim if self.strength_enabled else 0,
                     strength_mode=self.strength_mode,
+                    strength_gain_multiplier=self.strength_gain_multiplier,
                 )
                 for _ in range(config["layers"])
             ]
         )
     
-    def _build_strength_condition(self, strength_label=None, task_id=None, text_context=None):
+    def _build_strength_condition(self, strength_label=None, task_id=None, text_context=None, strength_scalar=None):
         if not self.strength_enabled:
             return None
-        if strength_label is None:
+        has_text = text_context is not None
+        has_task = task_id is not None and self.strength_projector is not None and self.strength_projector.use_task_id
+        has_label = strength_label is not None
+        if not (has_label or has_task or has_text):
             return None
-        return self.strength_projector(strength_label, task_id, text_context=text_context)
+        return self.strength_projector(
+            strength_label=strength_label,
+            task_id=task_id,
+            text_context=text_context,
+            strength_scalar=None,
+        )
 
     def forward(self, x_raw, side_emb_raw, attr_emb_raw, diffusion_step,
-                strength_label=None, task_id=None, text_context=None):
+                strength_label=None, task_id=None, text_context=None, strength_scalar=None):
         B, inputdim, K, L = x_raw.shape
         diffusion_emb = self.diffusion_embedding(diffusion_step)
         x_list = []
@@ -523,6 +866,7 @@ class Diff_CSDI_MultiPatch_Parallel(nn.Module):
             strength_label=strength_label,
             task_id=task_id,
             text_context=text_context,
+            strength_scalar=strength_scalar,
         )
         if strength_cond is not None and self.strength_mode == "input_concat_baseline":
             strength_map = self.strength_input_projection(strength_cond).unsqueeze(-1).unsqueeze(-1)
@@ -537,6 +881,8 @@ class Diff_CSDI_MultiPatch_Parallel(nn.Module):
                 diffusion_emb,
                 attention_mask=attention_mask,
                 strength_cond=strength_cond,
+                strength_label=strength_label,
+                strength_scalar=strength_scalar,
             )
             skip.append(skip_connection)        
         

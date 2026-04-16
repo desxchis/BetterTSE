@@ -397,7 +397,7 @@ def build_real_benchmark(
             revision_operator_family=op["shape"],
             revision_operator_params={
                 "region": region,
-                "bucket": "early_horizon",
+                "bucket": "early",
                 "label_source": "weak_real_incident",
                 "anchor_metadata": anchor_metadata,
                 "injection_metadata": injection_metadata,

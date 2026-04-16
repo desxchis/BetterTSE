@@ -5,6 +5,13 @@ from forecasting.baselines.lstm_official import LSTMOfficialBaseline
 from forecasting.baselines.naive import NaiveLastBaseline
 from forecasting.baselines.patchtst_hf import PatchTSTHFBaseline
 from forecasting.baselines.seasonal_naive import SeasonalNaiveBaseline
+from forecasting.baselines.tslib_adapter import (
+    AutoformerTSLibBaseline,
+    DLinearTSLibBaseline,
+    ITransformerTSLibBaseline,
+    PatchTSTTSLibBaseline,
+    TimeMixerTSLibBaseline,
+)
 
 __all__ = [
     "NaiveLastBaseline",
@@ -14,4 +21,9 @@ __all__ = [
     "LSTMOfficialBaseline",
     "SeasonalNaiveBaseline",
     "PatchTSTHFBaseline",
+    "DLinearTSLibBaseline",
+    "PatchTSTTSLibBaseline",
+    "ITransformerTSLibBaseline",
+    "TimeMixerTSLibBaseline",
+    "AutoformerTSLibBaseline",
 ]

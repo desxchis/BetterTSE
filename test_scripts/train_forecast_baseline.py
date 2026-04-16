@@ -12,7 +12,9 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from forecasting.data_utils import load_univariate_series
+from forecasting.dataset_catalog import list_standard_datasets, resolve_standard_dataset
 from forecasting.registry import create_baseline
+from forecasting.tslib_bridge import build_tslib_training_manifest, write_tslib_training_manifest
 from modules.mtbench_data import load_mtbench_aligned_pairs
 from modules.timemmd_data import load_timemmd_domain
 from modules.xtraffic_data import XTRAFFIC_CHANNELS, extract_node_series, load_xtraffic_minimal
@@ -40,6 +42,28 @@ def _impute_series(values: np.ndarray) -> np.ndarray:
     idx = np.arange(len(arr))
     arr[~finite] = np.interp(idx[~finite], idx[finite], arr[finite])
     return arr
+
+
+def _resolve_standard_dataset_args(args: argparse.Namespace) -> dict[str, object] | None:
+    if not args.dataset_id:
+        return None
+    if args.dataset_kind != "csv":
+        raise ValueError("--dataset-id currently maps to standard csv forecasting datasets, so --dataset-kind must remain 'csv'.")
+    dataset = resolve_standard_dataset(args.dataset_id)
+    csv_path = args.csv_path or dataset["csv_path"]
+    target_col = args.target_col if args.target_col is not None else dataset["target_col"]
+    if not Path(str(csv_path)).exists():
+        raise FileNotFoundError(
+            f"standard forecasting dataset '{args.dataset_id}' expects csv_path='{csv_path}', but the file is missing. "
+            "Add the dataset file first or override --csv-path explicitly."
+        )
+    return {
+        "dataset_id": dataset["dataset_id"],
+        "dataset_family": dataset["dataset_family"],
+        "split_policy": dataset["split_policy"],
+        "csv_path": str(csv_path),
+        "target_col": None if target_col is None else str(target_col),
+    }
 
 
 def _load_training_series(
@@ -197,10 +221,14 @@ def _load_structured_training_windows(
 def main() -> None:
     parser = argparse.ArgumentParser(description="Train or materialize a forecast baseline for revision benchmarks.")
     parser.add_argument("--dataset-kind", choices=["csv", "xtraffic", "mtbench", "timemmd"], default="csv")
+    parser.add_argument("--dataset-id", default=None)
+    parser.add_argument("--list-standard-datasets", action="store_true")
     parser.add_argument("--csv-path", default=None)
-    parser.add_argument("--output-dir", required=True)
-    parser.add_argument("--baseline-name", required=True)
+    parser.add_argument("--output-dir", default=None)
+    parser.add_argument("--baseline-name", default=None)
     parser.add_argument("--target-col", default=None)
+    parser.add_argument("--split-policy", default=None)
+    parser.add_argument("--training-split-id", default="default")
     parser.add_argument("--xtraffic-data-dir", default=None)
     parser.add_argument("--xtraffic-shard-name", default="p01_done.npy")
     parser.add_argument("--xtraffic-node-index", type=int, default=0)
@@ -222,7 +250,24 @@ def main() -> None:
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--optimizer", default=None)
     parser.add_argument("--hidden-size", type=int, default=None)
+    parser.add_argument("--tslib-root", default=None)
     args = parser.parse_args()
+
+    if args.list_standard_datasets:
+        print(json.dumps(list_standard_datasets(), ensure_ascii=False, indent=2))
+        return
+
+    if not args.output_dir or not args.baseline_name:
+        raise ValueError("--output-dir and --baseline-name are required unless --list-standard-datasets is used.")
+
+    dataset_info = _resolve_standard_dataset_args(args)
+    if dataset_info is not None:
+        args.csv_path = str(dataset_info["csv_path"])
+        args.target_col = dataset_info["target_col"]
+
+    dataset_id = str(dataset_info["dataset_id"]) if dataset_info is not None else None
+    dataset_family = str(dataset_info["dataset_family"]) if dataset_info is not None else args.dataset_kind
+    split_policy = str(dataset_info["split_policy"]) if dataset_info is not None else (args.split_policy or "series_train_tail_holdout")
 
     series, feature = _load_training_series(
         dataset_kind=args.dataset_kind,
@@ -255,11 +300,38 @@ def main() -> None:
         "epochs": args.epochs,
         "batch_size": args.batch_size,
         "lr": args.lr,
+        "dataset_id": dataset_id,
+        "dataset_family": dataset_family,
+        "split_policy": split_policy,
+        "training_split_id": args.training_split_id,
+        "feature": feature,
     }
     if args.optimizer:
         baseline_kwargs["optimizer"] = args.optimizer
     if args.hidden_size is not None:
         baseline_kwargs["hidden_size"] = int(args.hidden_size)
+
+    materialized_without_training = args.baseline_name.endswith("_tslib")
+    manifest_paths = None
+    if materialized_without_training:
+        if not args.csv_path:
+            raise ValueError("TSLib paper baselines currently require a csv-backed standard dataset input.")
+        training_manifest = build_tslib_training_manifest(
+            baseline_name=args.baseline_name,
+            dataset_id=dataset_id,
+            csv_path=args.csv_path,
+            context_length=args.context_length,
+            prediction_length=args.prediction_length,
+            epochs=args.epochs,
+            batch_size=args.batch_size,
+            lr=args.lr,
+            output_dir=args.output_dir,
+            training_split_id=args.training_split_id,
+            split_policy=split_policy,
+            feature=feature,
+            tslib_root=args.tslib_root,
+        )
+        baseline_kwargs["tslib_artifact"] = training_manifest
 
     baseline = create_baseline(args.baseline_name, **baseline_kwargs)
     structured = _load_structured_training_windows(
@@ -278,23 +350,39 @@ def main() -> None:
         context_length=args.context_length,
         prediction_length=args.prediction_length,
     )
-    if structured is not None and args.baseline_name in {"lstm_official", "dlinear_official"}:
+
+    if materialized_without_training:
+        train_points = int(len(train_split))
+        val_points = int(len(val_split)) if val_split is not None else 0
+        training_status = "materialized_interface_only"
+    elif structured is not None and args.baseline_name in {"lstm_official", "dlinear_official"}:
         train_x, train_y, feature = structured
         baseline.fit_windows(train_x, train_y)
         train_points = int(train_x.shape[0])
         val_points = 0
+        training_status = "trained"
     else:
         baseline.fit(train_split, val_split)
         train_points = int(len(train_split))
         val_points = int(len(val_split)) if val_split is not None else 0
+        training_status = "trained"
     baseline.save(args.output_dir)
+    if materialized_without_training:
+        manifest_paths = write_tslib_training_manifest(args.output_dir, training_manifest)
 
     payload = {
         "baseline": baseline.describe(),
         "dataset_kind": args.dataset_kind,
+        "dataset_id": dataset_id,
+        "dataset_family": dataset_family,
+        "split_policy": split_policy,
+        "training_split_id": args.training_split_id,
         "feature": feature,
         "train_points": train_points,
         "val_points": val_points,
+        "training_status": training_status,
+        "materialized_without_training": materialized_without_training,
+        "tslib_training_manifest": manifest_paths,
         "output_dir": str(Path(args.output_dir).resolve()),
     }
     print(json.dumps(payload, ensure_ascii=False, indent=2))

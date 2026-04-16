@@ -29,7 +29,7 @@ diffusion:
 
   attr_proj_type: avg
   strength_control:
-    enabled: false
+    enabled: true
     mode: modulation_residual
     num_strength_bins: 3
     num_tasks: 8
@@ -41,10 +41,20 @@ diffusion:
     text_dim: 64
     text_num_buckets: 4096
     dropout: 0.0
-    edit_region_loss_weight: 1.0
+    diffusion_loss_weight: 0.2
+    edit_region_loss_weight: 0.5
     background_loss_weight: 0.2
     monotonic_loss_weight: 0.5
     monotonic_margin: 0.001
+    gain_match_loss_weight: 4.0
+    family_relative_gain_loss_weight: 3.0
+    family_relative_margin_scale: 1.5
+    constant_gain_penalty_weight: 2.0
+    minimum_family_gain_std: 0.05
+    numeric_only_loss_weight: 4.0
+    beta_direction_loss_weight: 0.0
+    beta_direction_margin: 0.0
+    beta_direction_target: family_signed_gain
   ##### attr projector: deprecated
   attr_heads: 8
   attr_layers: 2

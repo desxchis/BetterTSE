@@ -39,6 +39,7 @@ from modules.pure_editing_volatility import (
     resolve_volatility_subtype_route,
 )
 from modules.region_localizer import infer_shape_hint, localize_region
+from modules.strength_parser import parse_strength_text
 from tool.ts_editors import normalize_llm_plan
 
 
@@ -107,6 +108,12 @@ def _apply_explicit_prompt_hints(plan: Dict[str, Any], instruction_text: str, ts
     intent = normalized.setdefault("intent", {})
     execution = normalized.setdefault("execution", {})
     params = normalized.setdefault("parameters", {})
+
+    strength_parse = parse_strength_text(instruction_text)
+    normalized["strength_parse"] = strength_parse
+    if str(intent.get("strength", "")).lower() not in {"weak", "medium", "strong"}:
+        intent["strength"] = str(strength_parse["strength_text"])
+    params.setdefault("strength_label", int(strength_parse["strength_label"]))
 
     shape_hint = infer_shape_hint(instruction_text)
     direction_hint = _infer_direction_hint(instruction_text)

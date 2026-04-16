@@ -46,6 +46,7 @@ from modules.pure_editing_volatility import (
     volatility_global_scale,
     volatility_burst_local,
 )
+from modules.strength_parser import parse_strength_text
 from tool.tedit_wrapper import TEditWrapper, get_tedit_instance
 
 
@@ -290,6 +291,35 @@ def normalize_llm_plan(plan: Dict[str, Any], ts_length: Optional[int] = None) ->
             }
         normalized["execution"]["control_source"] = spec["control_source"]
 
+    instruction_text = (
+        parameters.get("instruction_text")
+        or normalized.get("instruction_text")
+        or execution.get("instruction_text")
+    )
+    strength_parse = None
+    if isinstance(instruction_text, str) and instruction_text.strip():
+        strength_parse = parse_strength_text(instruction_text)
+        normalized["strength_parse"] = strength_parse
+        normalized.setdefault("intent", {})
+        if str(normalized["intent"].get("strength", "")).lower() not in {"weak", "medium", "strong"}:
+            normalized["intent"]["strength"] = str(strength_parse["strength_text"])
+
+    strength = str((normalized.get("intent") or {}).get("strength", "medium")).lower()
+    parameters.setdefault("strength_label", {"weak": 0, "medium": 1, "strong": 2}.get(strength, 1))
+
+    intent = normalized.get("intent") or {}
+    effect_family = str(intent.get("effect_family", ""))
+    direction = str(intent.get("direction", "neutral"))
+    if effect_family == "trend":
+        task_id = 1 if direction == "down" else 0
+    elif effect_family == "seasonality":
+        task_id = 2
+    elif effect_family == "volatility":
+        task_id = 3
+    else:
+        task_id = 4
+    parameters.setdefault("task_id", task_id)
+
     region = normalized.get("parameters", {}).get("region")
     if ts_length is not None and isinstance(region, list) and len(region) == 2:
         start_idx = max(0, int(region[0]))
@@ -458,7 +488,18 @@ def _resolve_step_shift(
         return raw_amp
 
     region_std = float(np.std(ts[start_idx:end_idx]))
-    factor = abs(float(params.get("shift_factor", 2.5)))
+    strength_scale = {
+        "weak": 0.75,
+        "light": 0.8,
+        "mild": 0.85,
+        "medium": 1.0,
+        "moderate": 1.0,
+        "strong": 1.2,
+        "large": 1.25,
+        "sharp": 1.3,
+    }
+    strength = str((intent or {}).get("strength", "")).lower()
+    factor = abs(float(params.get("shift_factor", 2.5))) * strength_scale.get(strength, 1.0)
     direction = (intent or {}).get("direction", "")
     sign = -1.0 if direction == "down" else 1.0
     return sign * factor * max(region_std, 1e-3)

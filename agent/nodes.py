@@ -947,12 +947,22 @@ def _execute_tedit_tool(
     parameters = edit_task.get("parameters", {})
     n_samples = parameters.get("n_samples", 1)
     sampler = parameters.get("sampler", "ddim")
+    strength_label = parameters.get("strength_label")
+    task_id = parameters.get("task_id")
+    instruction_text = parameters.get("instruction_text")
 
     if tool_name == "tedit_edit":
         src_attrs = parameters.get("src_attrs", [0, 0])
         tgt_attrs = parameters.get("tgt_attrs", [1, 0])
         edited = tedit.edit_time_series(
-            values_arr, src_attrs, tgt_attrs, n_samples, sampler
+            values_arr,
+            src_attrs,
+            tgt_attrs,
+            strength_label=strength_label,
+            task_id=task_id,
+            instruction_text=instruction_text,
+            n_samples=n_samples,
+            sampler=sampler,
         )
         return edited[0]
 
@@ -960,7 +970,16 @@ def _execute_tedit_tool(
         src_attrs = parameters.get("src_attrs", [0, 0])
         tgt_attrs = parameters.get("tgt_attrs", [1, 0])
         edited = tedit.edit_region(
-            values_arr, start_idx, end_idx, src_attrs, tgt_attrs, n_samples, sampler
+            values_arr,
+            start_idx,
+            end_idx,
+            src_attrs,
+            tgt_attrs,
+            strength_label=strength_label,
+            task_id=task_id,
+            instruction_text=instruction_text,
+            n_samples=n_samples,
+            sampler=sampler,
         )
         return edited
 
@@ -969,7 +988,14 @@ def _execute_tedit_tool(
         src_attrs = [0, 0]
         tgt_attrs = [trend_type_idx, 0]
         edited = tedit.edit_time_series(
-            values_arr, src_attrs, tgt_attrs, n_samples, sampler
+            values_arr,
+            src_attrs,
+            tgt_attrs,
+            strength_label=strength_label,
+            task_id=task_id,
+            instruction_text=instruction_text,
+            n_samples=n_samples,
+            sampler=sampler,
         )
         return edited[0]
 
@@ -978,7 +1004,14 @@ def _execute_tedit_tool(
         src_attrs = [0, 0]
         tgt_attrs = [0, seasonality_type_idx]
         edited = tedit.edit_time_series(
-            values_arr, src_attrs, tgt_attrs, n_samples, sampler
+            values_arr,
+            src_attrs,
+            tgt_attrs,
+            strength_label=strength_label,
+            task_id=task_id,
+            instruction_text=instruction_text,
+            n_samples=n_samples,
+            sampler=sampler,
         )
         return edited[0]
 
@@ -987,7 +1020,14 @@ def _execute_tedit_tool(
         src_attrs = [0, 0]
         tgt_attrs = [0, volatility_type_idx]
         edited = tedit.edit_time_series(
-            values_arr, src_attrs, tgt_attrs, n_samples, sampler
+            values_arr,
+            src_attrs,
+            tgt_attrs,
+            strength_label=strength_label,
+            task_id=task_id,
+            instruction_text=instruction_text,
+            n_samples=n_samples,
+            sampler=sampler,
         )
         return edited[0]
 
@@ -1009,7 +1049,16 @@ def _execute_tedit_tool(
             region_end = end_idx
 
         edited = tedit.edit_region(
-            values_arr, region_start, region_end, src_attrs, tgt_attrs, n_samples, sampler
+            values_arr,
+            region_start,
+            region_end,
+            src_attrs,
+            tgt_attrs,
+            strength_label=strength_label,
+            task_id=task_id,
+            instruction_text=instruction_text,
+            n_samples=n_samples,
+            sampler=sampler,
         )
         return edited
 

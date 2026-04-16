@@ -27,7 +27,7 @@ from modules.forecast_revision import (
 
 
 OPERATORS = ("hump", "step", "flatline", "irregular_noise", "plateau")
-BUCKETS = ("early_horizon", "mid_horizon", "late_horizon")
+BUCKETS = ("early", "mid", "late")
 
 def _operator_spec(index: int, include_no_revision_every: int = 0) -> Dict[str, Any]:
     if include_no_revision_every > 0 and (index + 1) % include_no_revision_every == 0:
@@ -60,9 +60,9 @@ def _bucket_region(bucket: str, horizon: int, duration_bucket: str) -> List[int]
         width = max(4, horizon // 6)
     else:
         width = max(6, horizon // 4)
-    if bucket == "early_horizon":
+    if bucket == "early":
         start = 0
-    elif bucket == "late_horizon":
+    elif bucket == "late":
         start = max(0, horizon - width)
     else:
         start = max(0, (horizon - width) // 2)
@@ -73,9 +73,9 @@ def _generic_context_text(spec: Dict[str, Any]) -> str:
     if spec["operator"] == "none":
         return "当前没有新的外部信号会改变这段未来预测，整体可维持原预测。"
     bucket_phrase = {
-        "early_horizon": "在预测窗口前段",
-        "mid_horizon": "在预测窗口中段",
-        "late_horizon": "在预测窗口后段",
+        "early": "在预测窗口前段",
+        "mid": "在预测窗口中段",
+        "late": "在预测窗口后段",
     }[spec["bucket"]]
     if spec["operator"] == "step":
         return f"{bucket_phrase}，系统状态预计会突然切换到更低位并维持一段时间。"
@@ -93,9 +93,9 @@ def _traffic_incident_context_text(spec: Dict[str, Any]) -> str:
         return "目前没有新的事故、封闭或设备异常信号，未来路况可基本维持原预测。"
 
     bucket_phrase = {
-        "early_horizon": "在预测窗口前段",
-        "mid_horizon": "在预测窗口中段",
-        "late_horizon": "在预测窗口后段",
+        "early": "在预测窗口前段",
+        "mid": "在预测窗口中段",
+        "late": "在预测窗口后段",
     }[spec["bucket"]]
 
     if spec["operator"] == "step":
@@ -233,12 +233,14 @@ def build_benchmark(
     output_root = Path(output_dir)
     output_root.mkdir(parents=True, exist_ok=True)
     target_construction_method = "synthetic_physical_injection"
+    target_regime = "controlled_synthetic_revision"
     payload = {
         "dataset_name": dataset_name,
         "feature": feature,
         "task_family": "forecast_revision",
         "application_of": "bettertse_editing",
         "target_construction_method": target_construction_method,
+        "target_regime": target_regime,
         "baseline_name": baseline_name,
         "context_style": context_style,
         "schema_version": "forecast_revision_v1",
@@ -251,7 +253,7 @@ def build_benchmark(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Build synthetic forecast revision benchmark.")
+    parser = argparse.ArgumentParser(description="Build controlled synthetic forecast revision benchmark.")
     parser.add_argument("--csv-path", required=True)
     parser.add_argument("--dataset-name", required=True)
     parser.add_argument("--output-dir", required=True)

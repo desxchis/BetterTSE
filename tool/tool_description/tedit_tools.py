@@ -27,6 +27,18 @@ description = [
                 "type": "int",
                 "default": 50,
                 "description": "Number of diffusion steps for editing. More steps may improve quality but are slower."
+            },
+            {
+                "name": "strength_label",
+                "type": "int",
+                "default": None,
+                "description": "Optional discrete strength bucket: 0=weak, 1=medium, 2=strong."
+            },
+            {
+                "name": "task_id",
+                "type": "int",
+                "default": None,
+                "description": "Optional strength-control task slot id. This does not replace TEdit attrs."
             }
         ],
         "required_parameters": [
@@ -66,6 +78,18 @@ description = [
                 "type": "str",
                 "default": "ddim",
                 "description": "Sampling method: 'ddim' or 'ddpm'."
+            },
+            {
+                "name": "strength_label",
+                "type": "int",
+                "default": None,
+                "description": "Optional discrete strength bucket: 0=weak, 1=medium, 2=strong."
+            },
+            {
+                "name": "task_id",
+                "type": "int",
+                "default": None,
+                "description": "Optional strength-control task slot id."
             }
         ],
         "required_parameters": [
@@ -117,6 +141,18 @@ description = [
                 "type": "str",
                 "default": "ddim",
                 "description": "Sampling method."
+            },
+            {
+                "name": "strength_label",
+                "type": "int",
+                "default": None,
+                "description": "Optional discrete strength bucket for internal modulation."
+            },
+            {
+                "name": "task_id",
+                "type": "int",
+                "default": None,
+                "description": "Optional strength-control task slot id."
             }
         ],
         "required_parameters": [
@@ -150,6 +186,18 @@ description = [
                 "type": "str",
                 "default": "ddim",
                 "description": "Sampling method."
+            },
+            {
+                "name": "strength_label",
+                "type": "int",
+                "default": None,
+                "description": "Optional discrete strength bucket for internal modulation."
+            },
+            {
+                "name": "task_id",
+                "type": "int",
+                "default": None,
+                "description": "Optional strength-control task slot id."
             }
         ],
         "required_parameters": [
@@ -183,6 +231,18 @@ description = [
                 "type": "str",
                 "default": "ddim",
                 "description": "Sampling method."
+            },
+            {
+                "name": "strength_label",
+                "type": "int",
+                "default": None,
+                "description": "Optional discrete strength bucket for internal modulation."
+            },
+            {
+                "name": "task_id",
+                "type": "int",
+                "default": None,
+                "description": "Optional strength-control task slot id."
             }
         ],
         "required_parameters": [
@@ -267,6 +327,18 @@ description = [
                 "type": "str",
                 "default": "ddim",
                 "description": "Sampling method."
+            },
+            {
+                "name": "strength_label",
+                "type": "int",
+                "default": None,
+                "description": "Optional discrete strength bucket for internal modulation."
+            },
+            {
+                "name": "task_id",
+                "type": "int",
+                "default": None,
+                "description": "Optional strength-control task slot id."
             }
         ],
         "required_parameters": [

@@ -200,7 +200,7 @@ def build_mtbench_real_benchmark(
             revision_operator_family=shape,
             revision_operator_params={
                 "region": region,
-                "bucket": "full_horizon" if revision_applicable_gt else "none",
+                "bucket": "full" if revision_applicable_gt else "none",
                 "label_source": "mtbench_trend_heuristic_v2",
                 "finance_family": family if revision_applicable_gt else "none",
                 "params": oracle_params,

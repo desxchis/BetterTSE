@@ -8,6 +8,14 @@ from typing import Any, Dict, List
 import numpy as np
 
 
+LEGACY_STRENGTH_TO_SCALAR = {
+    "weak": 0.0,
+    "medium": 0.5,
+    "strong": 1.0,
+}
+FLOAT_TOL = 1.0e-6
+
+
 def _edit_gain(source_ts: np.ndarray, target_ts: np.ndarray, mask_gt: np.ndarray) -> float | None:
     edit_mask = mask_gt.astype(bool)
     if not np.any(edit_mask):
@@ -33,37 +41,63 @@ def _summarize(values: List[float | None]) -> Dict[str, float | None]:
     }
 
 
+def _resolve_strength_scalar(sample: Dict[str, Any]) -> float:
+    scalar = sample.get("strength_scalar")
+    if scalar is not None:
+        return float(scalar)
+    strength_text = str(sample.get("strength_text", ""))
+    if strength_text in LEGACY_STRENGTH_TO_SCALAR:
+        return float(LEGACY_STRENGTH_TO_SCALAR[strength_text])
+    raise ValueError(f"Sample missing strength_scalar and unknown strength_text={strength_text}")
+
+
+def _spearman_rho(x: List[float], y: List[float]) -> float | None:
+    if len(x) < 2 or len(y) < 2 or len(x) != len(y):
+        return None
+    x_arr = np.asarray(x, dtype=np.float64)
+    y_arr = np.asarray(y, dtype=np.float64)
+    x_rank = np.argsort(np.argsort(x_arr)).astype(np.float64)
+    y_rank = np.argsort(np.argsort(y_arr)).astype(np.float64)
+    x_rank -= x_rank.mean()
+    y_rank -= y_rank.mean()
+    denom = float(np.sqrt(np.sum(x_rank * x_rank) * np.sum(y_rank * y_rank)))
+    if denom <= 1.0e-12:
+        return None
+    return float(np.sum(x_rank * y_rank) / denom)
+
+
 def check_benchmark(path: Path) -> Dict[str, Any]:
     data = json.loads(path.read_text(encoding="utf-8"))
     families = list(data.get("families", []))
-    strengths_expected = ["weak", "medium", "strong"]
 
     family_rows: List[Dict[str, Any]] = []
     all_bg_leaks: List[float | None] = []
     tool_counts: Dict[str, int] = {}
     duration_counts: Dict[str, int] = {}
+    scalar_coverages: List[float] = []
+    family_rhos: List[float] = []
 
-    complete_strength_count = 0
+    scalar_order_valid_count = 0
     monotonic_target_count = 0
     zero_bg_leak_count = 0
+    family_valid_count = 0
 
     for family in families:
-        samples = list(family.get("samples", []))
-        strength_map = {str(sample.get("strength_text")): sample for sample in samples}
-        strengths = [s for s in strengths_expected if s in strength_map]
-        complete_strength = strengths == strengths_expected
-        if complete_strength:
-            complete_strength_count += 1
+        samples = [dict(sample) for sample in family.get("samples", [])]
+        for sample in samples:
+            sample["strength_scalar"] = _resolve_strength_scalar(sample)
+        samples.sort(key=lambda sample: float(sample["strength_scalar"]))
+        strengths = [float(sample["strength_scalar"]) for sample in samples]
+        scalar_order_valid = len(strengths) >= 2 and all((right - left) > FLOAT_TOL for left, right in zip(strengths[:-1], strengths[1:]))
+        if scalar_order_valid:
+            scalar_order_valid_count += 1
+        if strengths:
+            scalar_coverages.append(float(max(strengths) - min(strengths)))
 
         gains: List[float | None] = []
         bg_leaks: List[float | None] = []
         edit_region_fractions: List[float] = []
-        for strength_text in strengths_expected:
-            sample = strength_map.get(strength_text)
-            if sample is None:
-                gains.append(None)
-                bg_leaks.append(None)
-                continue
+        for sample in samples:
             source_ts = np.asarray(sample["source_ts"], dtype=np.float32)
             target_ts = np.asarray(sample["target_ts"], dtype=np.float32)
             mask_gt = np.asarray(sample["mask_gt"], dtype=np.int64)
@@ -73,12 +107,11 @@ def check_benchmark(path: Path) -> Dict[str, Any]:
             all_bg_leaks.append(bg_leak)
             edit_region_fractions.append(float(np.mean(mask_gt.astype(np.float32))))
 
+        valid_gain_pairs = [(s, g) for s, g in zip(strengths, gains) if g is not None]
         monotonic_target = bool(
-            complete_strength
-            and gains[0] is not None
-            and gains[1] is not None
-            and gains[2] is not None
-            and gains[0] < gains[1] < gains[2]
+            scalar_order_valid
+            and len(valid_gain_pairs) >= 2
+            and all((valid_gain_pairs[idx + 1][1] + FLOAT_TOL) >= valid_gain_pairs[idx][1] for idx in range(len(valid_gain_pairs) - 1))
         )
         if monotonic_target:
             monotonic_target_count += 1
@@ -86,6 +119,17 @@ def check_benchmark(path: Path) -> Dict[str, Any]:
         family_bg_leak = None if all(v is None for v in bg_leaks) else float(max(v for v in bg_leaks if v is not None))
         if family_bg_leak is not None and family_bg_leak <= 1e-6:
             zero_bg_leak_count += 1
+
+        rho = _spearman_rho(
+            [pair[0] for pair in valid_gain_pairs],
+            [pair[1] for pair in valid_gain_pairs],
+        )
+        if rho is not None:
+            family_rhos.append(rho)
+
+        family_valid = bool(scalar_order_valid and monotonic_target and family_bg_leak is not None and family_bg_leak <= 1e-6)
+        if family_valid:
+            family_valid_count += 1
 
         tool_name = str(family.get("tool_name", "unknown"))
         duration_bucket = str(family.get("duration_bucket", "unknown"))
@@ -97,16 +141,18 @@ def check_benchmark(path: Path) -> Dict[str, Any]:
                 "family_id": family.get("family_id"),
                 "tool_name": tool_name,
                 "duration_bucket": duration_bucket,
-                "strengths": strengths,
-                "complete_strength": complete_strength,
-                "target_edit_gain": {
-                    "weak": gains[0],
-                    "medium": gains[1],
-                    "strong": gains[2],
-                },
+                "strength_scalar": strengths,
+                "num_samples": len(samples),
+                "scalar_order_valid": scalar_order_valid,
+                "target_edit_gain_by_scalar": [
+                    {"strength_scalar": float(s), "edit_gain": None if g is None else float(g)}
+                    for s, g in zip(strengths, gains)
+                ],
                 "target_monotonic": monotonic_target,
                 "edit_region_fraction_mean": None if not edit_region_fractions else float(np.mean(edit_region_fractions)),
                 "background_leak_max": family_bg_leak,
+                "spearman_rho_strength_gain": rho,
+                "family_valid": family_valid,
             }
         )
 
@@ -114,17 +160,18 @@ def check_benchmark(path: Path) -> Dict[str, Any]:
         "benchmark_type": data.get("benchmark_type"),
         "num_families": len(families),
         "num_samples": int(data.get("num_samples", 0)),
-        "complete_strength_rate": float(complete_strength_count / max(1, len(families))),
+        "family_valid_rate": float(family_valid_count / max(1, len(families))),
+        "scalar_order_valid_rate": float(scalar_order_valid_count / max(1, len(families))),
         "target_monotonic_rate": float(monotonic_target_count / max(1, len(families))),
         "zero_background_leak_rate": float(zero_bg_leak_count / max(1, len(families))),
+        "scalar_coverage": _summarize(scalar_coverages),
         "background_leak": _summarize(all_bg_leaks),
+        "family_spearman_rho": _summarize(family_rhos),
         "tool_counts": tool_counts,
         "duration_counts": duration_counts,
         "health_pass": bool(
             len(families) > 0
-            and complete_strength_count == len(families)
-            and monotonic_target_count == len(families)
-            and all((v is None or v <= 1e-6) for v in all_bg_leaks)
+            and family_valid_count == len(families)
         ),
     }
     return {
@@ -135,7 +182,7 @@ def check_benchmark(path: Path) -> Dict[str, Any]:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Run health checks on a discrete weak/medium/strong benchmark.")
+    parser = argparse.ArgumentParser(description="Run health checks on scalar-ordered TEdit strength families.")
     parser.add_argument("--benchmark", required=True)
     parser.add_argument("--output", required=True)
     args = parser.parse_args()
@@ -152,10 +199,13 @@ def main() -> None:
         "",
         f"- benchmark: `{args.benchmark}`",
         f"- num_families: {s['num_families']}",
-        f"- complete_strength_rate: {s['complete_strength_rate']:.4f}",
+        f"- family_valid_rate: {s['family_valid_rate']:.4f}",
+        f"- scalar_order_valid_rate: {s['scalar_order_valid_rate']:.4f}",
         f"- target_monotonic_rate: {s['target_monotonic_rate']:.4f}",
         f"- zero_background_leak_rate: {s['zero_background_leak_rate']:.4f}",
+        f"- scalar_coverage_max: {s['scalar_coverage']['max']}",
         f"- background_leak_max: {s['background_leak']['max']}",
+        f"- family_spearman_rho_mean: {s['family_spearman_rho']['mean']}",
         f"- health_pass: {s['health_pass']}",
         "",
         "## Tool Counts",

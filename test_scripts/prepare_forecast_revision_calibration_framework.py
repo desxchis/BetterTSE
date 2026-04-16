@@ -49,6 +49,18 @@ def _resolve_model(source: str | None, explicit_path: str | None, train_model_pa
     raise ValueError(f"Unsupported calibration_model_source: {source}")
 
 
+
+
+def _validate_config(config: dict) -> None:
+    required = ["experiment_id", "benchmark_path", "output_root"]
+    missing = [key for key in required if not config.get(key)]
+    if missing:
+        raise ValueError(f"Missing required config fields: {missing}")
+    if not any([config.get("train_stage"), config.get("oracle_stage"), config.get("semi_oracle_stages")]):
+        raise ValueError("Config must define at least one stage")
+    if config.get("priority") is not None and int(config["priority"]) < 1:
+        raise ValueError("priority must be >= 1")
+
 def _train_stage(
     benchmark_path: str,
     output_root: Path,
@@ -217,6 +229,12 @@ def build_plan(config: dict, output_root_override: str | None = None) -> dict:
         )
 
     return {
+        "title": config.get("title", config["experiment_id"]),
+        "dataset_role": config.get("dataset_role", "unspecified"),
+        "priority": config.get("priority"),
+        "status": config.get("status", "planned"),
+        "purpose": config.get("purpose", ""),
+        "notes": _ensure_list(config.get("notes")),
         "experiment_id": config["experiment_id"],
         "benchmark_path": benchmark_path,
         "output_root": str(output_root),
@@ -232,13 +250,34 @@ def _render_readme(plan: dict) -> str:
     lines = [
         "# Forecast Revision Calibration Framework Plan",
         "",
+        f"- title: `{plan['title']}`",
         f"- experiment_id: `{plan['experiment_id']}`",
+        f"- dataset_role: `{plan['dataset_role']}`",
+        f"- priority: `{plan['priority']}`",
+        f"- status: `{plan['status']}`",
         f"- benchmark_path: `{plan['benchmark_path']}`",
         f"- output_root: `{plan['output_root']}`",
         "",
+    ]
+    if plan.get("purpose"):
+        lines.extend([
+            "## Purpose",
+            "",
+            plan["purpose"],
+            "",
+        ])
+    if plan.get("notes"):
+        lines.extend([
+            "## Notes",
+            "",
+        ])
+        for note in plan["notes"]:
+            lines.append(f"- {note}")
+        lines.append("")
+    lines.extend([
         "## Planned Stages",
         "",
-    ]
+    ])
     for idx, stage in enumerate(plan["stages"], start=1):
         lines.append(f"{idx}. `{stage['name']}`")
         lines.append(f"   - type: `{stage['type']}`")
@@ -304,6 +343,7 @@ def main() -> None:
     args = parser.parse_args()
 
     config = _load_config(args.config)
+    _validate_config(config)
     plan = build_plan(config, output_root_override=args.output_root)
     artifacts = write_plan_artifacts(plan)
     if args.execute:

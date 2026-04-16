@@ -17,9 +17,16 @@ DEFAULT_METHODS = [
     {"name": "text_direct_numeric", "mode": "oracle_intent", "calibration_strategy": "text_direct_numeric"},
     {"name": "discrete_strength_table", "mode": "oracle_intent", "calibration_strategy": "discrete_strength_table"},
     {"name": "rule_local_stats", "mode": "oracle_intent", "calibration_strategy": "rule_local_stats"},
-    {"name": "learned_linear", "mode": "oracle_intent", "calibration_strategy": "learned_linear"},
     {"name": "oracle_calibration", "mode": "oracle_calibration", "calibration_strategy": "rule_local_stats"},
 ]
+OPTIONAL_METHODS = [
+    {"name": "learned_linear", "mode": "oracle_intent", "calibration_strategy": "learned_linear"},
+    {"name": "learned_rule_guarded", "mode": "oracle_intent", "calibration_strategy": "learned_rule_guarded"},
+    {"name": "learned_rule_shrunk", "mode": "oracle_intent", "calibration_strategy": "learned_rule_shrunk"},
+    {"name": "learned_confidence_gated", "mode": "oracle_intent", "calibration_strategy": "learned_confidence_gated"},
+    {"name": "learned_reliability_gated", "mode": "oracle_intent", "calibration_strategy": "learned_reliability_gated"},
+]
+ALL_METHODS = DEFAULT_METHODS + OPTIONAL_METHODS
 
 
 def _method_row(method_name: str, payload: dict) -> dict:
@@ -62,11 +69,17 @@ def _render_markdown(rows: list[dict]) -> str:
 
 
 def run_calibration_benchmark(benchmark_path: str, output_dir: str, max_samples: int | None = None, methods: list[str] | None = None, calibration_model: str | None = None) -> dict:
-    selected = []
     requested = set(methods or [])
-    for spec in DEFAULT_METHODS:
-        if not requested or spec["name"] in requested:
-            selected.append(spec)
+    if requested:
+        selected = [spec for spec in ALL_METHODS if spec["name"] in requested]
+    else:
+        selected = list(DEFAULT_METHODS)
+    for spec in selected:
+        strategy = str(spec["calibration_strategy"])
+        if strategy.startswith("learned_") and not calibration_model:
+            raise ValueError(
+                f"Method '{spec['name']}' requires --calibration-model because strategy='{strategy}'."
+            )
     out_root = Path(output_dir)
     out_root.mkdir(parents=True, exist_ok=True)
 
@@ -114,7 +127,7 @@ def main() -> None:
     parser.add_argument(
         "--methods",
         nargs="*",
-        choices=[spec["name"] for spec in DEFAULT_METHODS],
+        choices=[spec["name"] for spec in ALL_METHODS],
         default=None,
     )
     parser.add_argument("--calibration-model", default=None)

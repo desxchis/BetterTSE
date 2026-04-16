@@ -1,5 +1,15 @@
 {
   "experiment_id": "weather_dlinear_v2",
+  "title": "Weather dlinear v2",
+  "dataset_role": "controlled calibration benchmark",
+  "priority": 1,
+  "status": "ready_for_gpu",
+  "purpose": "Primary clean benchmark for establishing the calibration degradation curve and semi-oracle robustness pattern.",
+  "notes": [
+    "Run this first once GPU is available.",
+    "Use this line to validate signed-area degradation under increasingly imperfect upstream signals.",
+    "Keep Weather as the main positive calibration example."
+  ],
   "benchmark_path": "results/forecast_revision/benchmarks/weather_dlinear_v2/forecast_revision_Weather_dlinear_like_30.json",
   "output_root": "results/forecast_revision/calibration/framework_plans/weather_dlinear_v2",
   "train_stage": {

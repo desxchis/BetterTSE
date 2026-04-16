@@ -6,13 +6,18 @@ from typing import Any, Dict, List
 
 from forecasting.base import ForecastBaseline
 from forecasting.baselines import (
+    AutoformerTSLibBaseline,
     DLinearOfficialBaseline,
     DLinearLikeBaseline,
+    DLinearTSLibBaseline,
     HoltLinearBaseline,
+    ITransformerTSLibBaseline,
     LSTMOfficialBaseline,
     NaiveLastBaseline,
     PatchTSTHFBaseline,
+    PatchTSTTSLibBaseline,
     SeasonalNaiveBaseline,
+    TimeMixerTSLibBaseline,
 )
 
 
@@ -24,6 +29,11 @@ _REGISTRY = {
     "lstm_official": LSTMOfficialBaseline,
     "seasonal_naive": SeasonalNaiveBaseline,
     "patchtst": PatchTSTHFBaseline,
+    "dlinear_tslib": DLinearTSLibBaseline,
+    "patchtst_tslib": PatchTSTTSLibBaseline,
+    "itransformer_tslib": ITransformerTSLibBaseline,
+    "timemixer_tslib": TimeMixerTSLibBaseline,
+    "autoformer_tslib": AutoformerTSLibBaseline,
 }
 
 
@@ -51,5 +61,12 @@ def load_baseline(name: str, model_dir: str | Path, **config: Any) -> ForecastBa
 def get_available_baselines() -> List[Dict[str, Any]]:
     items: List[Dict[str, Any]] = []
     for name, cls in _REGISTRY.items():
-        items.append({"name": name, "class": cls.__name__})
+        items.append(
+            {
+                "name": name,
+                "class": cls.__name__,
+                "paper_role": getattr(cls, "paper_role", "engineering"),
+                "baseline_source": "tslib" if name.endswith("_tslib") else "local",
+            }
+        )
     return items

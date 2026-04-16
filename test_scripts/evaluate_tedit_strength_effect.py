@@ -5,6 +5,9 @@ import json
 from pathlib import Path
 from typing import Any
 
+
+REQUIRED_STRENGTH_SCALARS = [0.0, 0.5, 1.0]
+
 import numpy as np
 import torch
 
@@ -21,6 +24,23 @@ from data.synthetic_finetune import STRENGTH_ID_TO_TEXT, SyntheticDataset
 from tool.tedit_wrapper import TEditWrapper
 
 
+
+def _resolve_runtime_config_path(model_path: str, config_path: str) -> str:
+    model_file = Path(model_path).resolve()
+    requested = Path(config_path).resolve()
+    candidate = model_file.parent.parent / "model_configs.yaml"
+    if candidate.exists():
+        return str(candidate)
+    return str(requested)
+
+
+DEFAULT_STRENGTH_CONTROLS = [
+    {"strength_label": 0, "strength_scalar": 0.0, "strength_text": "weak"},
+    {"strength_label": 1, "strength_scalar": 0.5, "strength_text": "medium"},
+    {"strength_label": 2, "strength_scalar": 1.0, "strength_text": "strong"},
+]
+
+
 def _load_eval_records(dataset_folder: str, split: str, max_samples: int) -> tuple[list[dict[str, Any]], list[str]]:
     root = Path(dataset_folder)
     meta_path = root / "meta.json"
@@ -32,25 +52,30 @@ def _load_eval_records(dataset_folder: str, split: str, max_samples: int) -> tup
         records: list[dict[str, Any]] = []
         for family_idx in range(min(len(split_ds), max_samples)):
             family = split_ds[family_idx]
-            per_strength = sorted(family["samples"], key=lambda row: int(row["strength_label"]))
+            per_strength = sorted(family["samples"], key=lambda row: float(row["strength_scalar"]))
             base = np.asarray(per_strength[0]["src_x"], dtype=np.float32).squeeze(-1)
-            target = np.asarray(per_strength[2]["tgt_x"], dtype=np.float32).squeeze(-1)
             src_attrs = np.asarray(per_strength[0]["src_attrs"], dtype=np.int64)
             tgt_attrs = np.asarray(per_strength[0]["tgt_attrs"], dtype=np.int64)
-            instruction_by_strength = {
-                int(row["strength_label"]): str(row.get("instruction_text")) if row.get("instruction_text") is not None else None
-                for row in per_strength
-            }
             edit_mask = np.asarray(per_strength[0]["mask_gt"], dtype=np.float32).squeeze(-1) > 0.5
+            controls = []
+            for row in per_strength:
+                controls.append(
+                    {
+                        "strength_label": None if row.get("strength_label") is None else int(row["strength_label"]),
+                        "strength_scalar": float(row["strength_scalar"]),
+                        "strength_text": str(row.get("strength_text", STRENGTH_ID_TO_TEXT.get(int(row.get("strength_label", 1)), "medium"))),
+                        "instruction_text": str(row.get("instruction_text")) if row.get("instruction_text") is not None else None,
+                        "target": np.asarray(row["tgt_x"], dtype=np.float32).squeeze(-1),
+                    }
+                )
             records.append(
                 {
                     "sample_idx": int(family_idx),
                     "base": base,
-                    "target": target,
                     "src_attrs": src_attrs,
                     "tgt_attrs": tgt_attrs,
-                    "instruction_by_strength": instruction_by_strength,
                     "edit_mask": edit_mask,
+                    "controls": controls,
                 }
             )
         return records, list(dataset.attr_list)
@@ -66,15 +91,23 @@ def _load_eval_records(dataset_folder: str, split: str, max_samples: int) -> tup
             break
     records = []
     for idx in indices:
+        controls = []
+        for control in DEFAULT_STRENGTH_CONTROLS:
+            controls.append(
+                {
+                    **control,
+                    "instruction_text": None,
+                    "target": split_ds.ts[idx, 1].astype(np.float32),
+                }
+            )
         records.append(
             {
                 "sample_idx": int(idx),
                 "base": split_ds.ts[idx, 0].astype(np.float32),
-                "target": split_ds.ts[idx, 1].astype(np.float32),
                 "src_attrs": split_ds.attrs[idx, 0].astype(np.int64),
                 "tgt_attrs": split_ds.attrs[idx, 1].astype(np.int64),
-                "instruction_by_strength": {},
                 "edit_mask": np.abs(split_ds.ts[idx, 1].astype(np.float32) - split_ds.ts[idx, 0].astype(np.float32)) > 0,
+                "controls": controls,
             }
         )
     return records, list(dataset.attr_list)
@@ -152,28 +185,82 @@ def _safe_diff(high: float | None, low: float | None) -> float | None:
     return float(high - low)
 
 
-def _extract_projector_pairwise(diag: dict[str, Any]) -> dict[str, float]:
-    projector = diag.get("projector") or []
-    latest = projector[-1] if projector else {}
-    pairwise = latest.get("projector_output_pairwise_l2") or {}
+def _aggregate_nested_numeric_dict(records: list[dict[str, Any]], key_candidates: list[str]) -> dict[str, float]:
+    bucket: dict[str, list[float]] = {}
+    for record in records:
+        nested = None
+        for key in key_candidates:
+            value = record.get(key)
+            if isinstance(value, dict):
+                nested = value
+                break
+        if not isinstance(nested, dict):
+            continue
+        for sub_key, sub_value in nested.items():
+            if isinstance(sub_value, (int, float)):
+                bucket.setdefault(str(sub_key), []).append(float(sub_value))
     return {
-        str(key): float(value)
-        for key, value in pairwise.items()
-        if isinstance(value, (int, float))
+        key: float(np.mean(values))
+        for key, values in bucket.items() if values
     }
 
 
-def _extract_generator_metrics(diag: dict[str, Any]) -> dict[str, float | None]:
-    generator = diag.get("generator") or []
-    latest = generator[-1] if generator else {}
+def _aggregate_nested_metric_by_strength(records: list[dict[str, Any]], key_candidates: list[str]) -> dict[str, dict[str, float]]:
+    bucket: dict[str, dict[str, list[float]]] = {}
+    for record in records:
+        nested = None
+        for key in key_candidates:
+            value = record.get(key)
+            if isinstance(value, dict):
+                nested = value
+                break
+        if not isinstance(nested, dict):
+            continue
+        for strength_key, payload in nested.items():
+            if not isinstance(payload, dict):
+                continue
+            for metric_name, metric_value in payload.items():
+                if isinstance(metric_value, (int, float)):
+                    bucket.setdefault(str(strength_key), {}).setdefault(str(metric_name), []).append(float(metric_value))
     return {
-        "raw_edit_region_mean_abs_delta": latest.get("raw_edit_region_mean_abs_delta"),
-        "final_edit_region_mean_abs_delta": latest.get("final_edit_region_mean_abs_delta"),
-        "raw_background_mean_abs_delta": latest.get("raw_background_mean_abs_delta"),
-        "final_background_mean_abs_delta": latest.get("final_background_mean_abs_delta"),
-        "blend_gap_edit_region_mean_abs": latest.get("blend_gap_edit_region_mean_abs"),
-        "blend_gap_background_mean_abs": latest.get("blend_gap_background_mean_abs"),
+        strength_key: {
+            metric_name: float(np.mean(values))
+            for metric_name, values in metric_dict.items() if values
+        }
+        for strength_key, metric_dict in bucket.items()
     }
+
+
+def _average_tied_ranks(values: np.ndarray) -> np.ndarray:
+    order = np.argsort(values, kind="mergesort")
+    ranks = np.empty(len(values), dtype=np.float64)
+    sorted_values = values[order]
+    start = 0
+    while start < len(sorted_values):
+        end = start + 1
+        while end < len(sorted_values) and sorted_values[end] == sorted_values[start]:
+            end += 1
+        avg_rank = 0.5 * (start + end - 1)
+        ranks[order[start:end]] = avg_rank
+        start = end
+    return ranks
+
+
+def _spearman_rho(x_values: list[float], y_values: list[float]) -> float | None:
+    if len(x_values) < 2 or len(y_values) < 2 or len(x_values) != len(y_values):
+        return None
+    x = np.asarray(x_values, dtype=np.float64)
+    y = np.asarray(y_values, dtype=np.float64)
+    if np.allclose(x, x[0]) or np.allclose(y, y[0]):
+        return None
+    x_rank = _average_tied_ranks(x)
+    y_rank = _average_tied_ranks(y)
+    x_rank -= x_rank.mean()
+    y_rank -= y_rank.mean()
+    denom = float(np.sqrt(np.sum(x_rank * x_rank) * np.sum(y_rank * y_rank)))
+    if denom <= 1.0e-12:
+        return None
+    return float(np.sum(x_rank * y_rank) / denom)
 
 
 def main() -> None:
@@ -194,79 +281,133 @@ def main() -> None:
     parser.add_argument("--output", required=True)
     args = parser.parse_args()
 
+    runtime_config_path = _resolve_runtime_config_path(args.model_path, args.config_path)
     eval_records, attr_list = _load_eval_records(args.dataset_folder, args.split, args.max_samples)
     if not eval_records:
         raise ValueError("No evaluation records were found for the requested split.")
 
-    wrapper = TEditWrapper(model_path=args.model_path, config_path=args.config_path, device=args.device)
+    wrapper = TEditWrapper(model_path=args.model_path, config_path=runtime_config_path, device=args.device)
 
-    strengths = [0, 1, 2]
-    strength_rows: dict[int, list[dict[str, Any]]] = {s: [] for s in strengths}
+    strength_rows: dict[str, list[dict[str, Any]]] = {}
     pairwise_rows: list[dict[str, Any]] = []
     raw_final_rows: list[dict[str, Any]] = []
 
     for eval_idx, record in enumerate(eval_records):
         sample_idx = int(record["sample_idx"])
         base = np.asarray(record["base"], dtype=np.float32)
-        target = np.asarray(record["target"], dtype=np.float32)
         src_attrs = np.asarray(record["src_attrs"], dtype=np.int64)
         tgt_attrs = np.asarray(record["tgt_attrs"], dtype=np.int64)
-        instruction_by_strength = dict(record.get("instruction_by_strength") or {})
         edit_mask = np.asarray(record["edit_mask"], dtype=bool)
+        controls = list(record.get("controls") or [])
         if not np.any(edit_mask):
-            edit_mask = np.abs(target - base) > float(args.mask_threshold)
+            strongest_target = np.asarray(controls[-1]["target"], dtype=np.float32)
+            edit_mask = np.abs(strongest_target - base) > float(args.mask_threshold)
 
+        controls = sorted(controls, key=lambda row: float(row["strength_scalar"]))
+        if not controls:
+            raise ValueError(f"Evaluation record {sample_idx} does not contain controls.")
 
-        per_strength: dict[int, dict[str, Any]] = {}
-        for strength_label in strengths:
-            instruction_text = instruction_by_strength.get(int(strength_label)) or _build_instruction_text(
-                src_attrs=src_attrs,
-                tgt_attrs=tgt_attrs,
-                attr_list=attr_list,
-                strength_label=strength_label,
+        batch_size = len(controls)
+        numeric_strength_scalars = [float(control["strength_scalar"]) for control in controls]
+        numeric_strength_labels = [control.get("strength_label") for control in controls]
+        weakest_scalar = float(numeric_strength_scalars[0])
+        weakest_label = next((int(value) for value in numeric_strength_labels if value is not None), 0)
+        instruction_texts = []
+        for control in controls:
+            label_for_prompt = int(control["strength_label"]) if control.get("strength_label") is not None else int(round(float(control["strength_scalar"]) * 2))
+            instruction_texts.append(
+                control.get("instruction_text") or _build_instruction_text(
+                    src_attrs=src_attrs,
+                    tgt_attrs=tgt_attrs,
+                    attr_list=attr_list,
+                    strength_label=label_for_prompt,
+                )
             )
-            if args.condition_mode == "label_only":
-                instruction_text = None
-            run_strength_label = int(strength_label)
-            if args.condition_mode == "text_only":
-                run_strength_label = 0
-            torch.manual_seed(args.seed + eval_idx)
-            np.random.seed(args.seed + eval_idx)
-            edited, diagnostics = wrapper.edit_time_series(
-                ts=base,
+        if args.condition_mode == "label_only":
+            instruction_texts = None
+            run_strength_scalars = numeric_strength_scalars
+            run_strength_labels = None if any(value is None for value in numeric_strength_labels) else [int(value) for value in numeric_strength_labels]
+        elif args.condition_mode == "text_only":
+            run_strength_scalars = [weakest_scalar] * batch_size
+            run_strength_labels = [weakest_label] * batch_size
+        else:
+            run_strength_scalars = numeric_strength_scalars
+            run_strength_labels = None if any(value is None for value in numeric_strength_labels) else [int(value) for value in numeric_strength_labels]
+
+        torch.manual_seed(args.seed + eval_idx)
+        np.random.seed(args.seed + eval_idx)
+        try:
+            edited_batch, diagnostics = wrapper.edit_time_series(
+                ts=np.repeat(base.reshape(1, -1), batch_size, axis=0),
                 src_attrs=src_attrs,
                 tgt_attrs=tgt_attrs,
                 n_samples=1,
                 sampler="ddim",
                 edit_steps=args.edit_steps,
-                strength_label=run_strength_label,
-                task_id=None if args.task_id < 0 else args.task_id,
-                instruction_text=instruction_text,
+                strength_label=run_strength_labels,
+                strength_scalar=run_strength_scalars,
+                task_id=None if args.task_id < 0 else [int(args.task_id)] * batch_size,
+                instruction_text=instruction_texts,
                 return_diagnostics=True,
                 enable_strength_diagnostics=bool(args.enable_strength_diagnostics),
             )
-            edited = edited[0]
+        except Exception as exc:
+            raise RuntimeError(
+                f"Strength eval failed at sample_idx={sample_idx}, eval_idx={eval_idx}, condition_mode={args.condition_mode}, model_path={args.model_path}, config_path={runtime_config_path}"
+            ) from exc
+        model_diag = diagnostics["model"][0] if diagnostics.get("model") else {}
+        raw_batch = np.asarray(model_diag.get("raw_reverse_output"), dtype=np.float32).squeeze(1)
+        projector_pairwise = _aggregate_nested_numeric_dict(
+            diagnostics.get("projector") or [],
+            ["projector_output_pairwise_l2_by_scalar", "projector_output_pairwise_l2"],
+        )
+        projector_mean_norm_by_scalar = _aggregate_nested_metric_by_strength(
+            diagnostics.get("projector") or [],
+            ["projector_output_mean_norm_by_scalar", "projector_output_mean_norm_by_strength"],
+        )
+        modulation_gamma_pairwise = _aggregate_nested_numeric_dict(
+            (diagnostics.get("modulation_base") or []) + (diagnostics.get("modulation_weaver") or []),
+            ["delta_gamma_pairwise_l2_by_scalar", "delta_gamma_pairwise_l2"],
+        )
+        modulation_beta_pairwise = _aggregate_nested_numeric_dict(
+            (diagnostics.get("modulation_base") or []) + (diagnostics.get("modulation_weaver") or []),
+            ["delta_beta_pairwise_l2_by_scalar", "delta_beta_pairwise_l2"],
+        )
+
+        per_strength: dict[str, dict[str, Any]] = {}
+        for control_idx, control in enumerate(controls):
+            scalar_key = f"{float(control['strength_scalar']):.4f}"
+            strength_rows.setdefault(scalar_key, [])
+            edited = np.asarray(edited_batch[control_idx], dtype=np.float32)
+            raw_output = np.asarray(raw_batch[control_idx], dtype=np.float32)
+            target = np.asarray(control["target"], dtype=np.float32)
 
             metrics = _compute_region_metrics(base=base, target=target, edited=edited, mask=edit_mask)
-            generator_diag = _extract_generator_metrics(diagnostics)
-            projector_pairwise = _extract_projector_pairwise(diagnostics)
+            raw_metrics = _compute_region_metrics(base=base, target=target, edited=raw_output, mask=edit_mask)
             row = {
                 "sample_idx": int(sample_idx),
-                "strength_label": int(strength_label),
-                "runtime_strength_label": int(run_strength_label),
-                "strength_text": STRENGTH_ID_TO_TEXT[int(strength_label)],
-                "instruction_text": instruction_text,
+                "strength_label": None if control.get("strength_label") is None else int(control["strength_label"]),
+                "runtime_strength_label": None if run_strength_labels is None else int(run_strength_labels[control_idx]),
+                "strength_scalar": float(control["strength_scalar"]),
+                "runtime_strength_scalar": float(run_strength_scalars[control_idx]),
+                "strength_text": str(control["strength_text"]),
+                "instruction_text": None if instruction_texts is None else instruction_texts[control_idx],
                 "edit_region_fraction": float(np.mean(edit_mask.astype(np.float32))),
                 "edit_gain": metrics["edit_gain"],
                 "bg_mae": metrics["bg_mae"],
                 "target_mae_edit_region": metrics["target_mae_edit_region"],
-                "raw_edit_region_mean_abs_delta": generator_diag.get("raw_edit_region_mean_abs_delta"),
-                "final_edit_region_mean_abs_delta": generator_diag.get("final_edit_region_mean_abs_delta"),
-                "raw_background_mean_abs_delta": generator_diag.get("raw_background_mean_abs_delta"),
-                "final_background_mean_abs_delta": generator_diag.get("final_background_mean_abs_delta"),
-                "blend_gap_edit_region_mean_abs": generator_diag.get("blend_gap_edit_region_mean_abs"),
-                "blend_gap_background_mean_abs": generator_diag.get("blend_gap_background_mean_abs"),
+                "target_edit_gain": _compute_region_metrics(base=base, target=target, edited=target, mask=edit_mask)["edit_gain"],
+                "gain_gap_abs": None if metrics["edit_gain"] is None else float(abs(metrics["edit_gain"] - _compute_region_metrics(base=base, target=target, edited=target, mask=edit_mask)["edit_gain"])),
+                "raw_edit_region_mean_abs_delta": raw_metrics["edit_gain"],
+                "final_edit_region_mean_abs_delta": metrics["edit_gain"],
+                "raw_background_mean_abs_delta": raw_metrics["bg_mae"],
+                "final_background_mean_abs_delta": metrics["bg_mae"],
+                "blend_gap_edit_region_mean_abs": None if metrics["edit_gain"] is None or raw_metrics["edit_gain"] is None else float(abs(metrics["edit_gain"] - raw_metrics["edit_gain"])),
+                "blend_gap_background_mean_abs": None if metrics["bg_mae"] is None or raw_metrics["bg_mae"] is None else float(abs(metrics["bg_mae"] - raw_metrics["bg_mae"])),
                 "projector_pairwise_l2": projector_pairwise,
+                "projector_mean_norm_by_scalar": projector_mean_norm_by_scalar,
+                "modulation_delta_gamma_pairwise_l2": modulation_gamma_pairwise,
+                "modulation_delta_beta_pairwise_l2": modulation_beta_pairwise,
             }
             row["raw_final_gap_edit_region"] = _safe_diff(
                 row["raw_edit_region_mean_abs_delta"],
@@ -281,66 +422,64 @@ def main() -> None:
                 row["preservation_attenuation_ratio"] = float(
                     row["final_edit_region_mean_abs_delta"] / row["raw_edit_region_mean_abs_delta"]
                 )
-            row["projector_pairwise_0_1"] = projector_pairwise.get("0_1")
-            row["projector_pairwise_1_2"] = projector_pairwise.get("1_2")
-            row["projector_pairwise_0_2"] = projector_pairwise.get("0_2")
-            row["projector_pairwise_0_1_mean_abs"] = projector_pairwise.get("0_1_mean_abs")
-            row["projector_pairwise_1_2_mean_abs"] = projector_pairwise.get("1_2_mean_abs")
-            row["projector_pairwise_0_2_mean_abs"] = projector_pairwise.get("0_2_mean_abs")
             row["raw_monotonic_local"] = None
             row["final_monotonic_local"] = None
             row["attenuation_suspected"] = None
             raw_final_rows.append(
                 {
                     "sample_idx": int(sample_idx),
-                    "strength_label": int(strength_label),
-                    "strength_text": STRENGTH_ID_TO_TEXT[int(strength_label)],
-                    "raw_edit_region_mean_abs_delta": generator_diag.get("raw_edit_region_mean_abs_delta"),
-                    "final_edit_region_mean_abs_delta": generator_diag.get("final_edit_region_mean_abs_delta"),
-                    "raw_background_mean_abs_delta": generator_diag.get("raw_background_mean_abs_delta"),
-                    "final_background_mean_abs_delta": generator_diag.get("final_background_mean_abs_delta"),
-                    "blend_gap_edit_region_mean_abs": generator_diag.get("blend_gap_edit_region_mean_abs"),
-                    "blend_gap_background_mean_abs": generator_diag.get("blend_gap_background_mean_abs"),
+                    "strength_scalar": float(control["strength_scalar"]),
+                    "strength_text": str(control["strength_text"]),
+                    "raw_edit_region_mean_abs_delta": row["raw_edit_region_mean_abs_delta"],
+                    "final_edit_region_mean_abs_delta": row["final_edit_region_mean_abs_delta"],
+                    "raw_background_mean_abs_delta": row["raw_background_mean_abs_delta"],
+                    "final_background_mean_abs_delta": row["final_background_mean_abs_delta"],
+                    "blend_gap_edit_region_mean_abs": row["blend_gap_edit_region_mean_abs"],
+                    "blend_gap_background_mean_abs": row["blend_gap_background_mean_abs"],
                 }
             )
-            strength_rows[strength_label].append(row)
-            per_strength[strength_label] = row
+            strength_rows[scalar_key].append(row)
+            per_strength[scalar_key] = row
 
-        g0 = per_strength[0]["edit_gain"]
-        g1 = per_strength[1]["edit_gain"]
-        g2 = per_strength[2]["edit_gain"]
-        monotonic = bool(g0 is not None and g1 is not None and g2 is not None and g0 < g1 < g2)
-        raw0 = per_strength[0]["raw_edit_region_mean_abs_delta"]
-        raw1 = per_strength[1]["raw_edit_region_mean_abs_delta"]
-        raw2 = per_strength[2]["raw_edit_region_mean_abs_delta"]
-        final0 = per_strength[0]["final_edit_region_mean_abs_delta"]
-        final1 = per_strength[1]["final_edit_region_mean_abs_delta"]
-        final2 = per_strength[2]["final_edit_region_mean_abs_delta"]
-        raw_monotonic = bool(raw0 is not None and raw1 is not None and raw2 is not None and raw0 < raw1 < raw2)
-        final_monotonic = bool(final0 is not None and final1 is not None and final2 is not None and final0 < final1 < final2)
+        ordered_scalars = [f"{float(control['strength_scalar']):.4f}" for control in controls]
+        ordered_numeric_scalars = [float(control["strength_scalar"]) for control in controls]
+        edit_gains = [per_strength[key]["edit_gain"] for key in ordered_scalars]
+        raw_gains = [per_strength[key]["raw_edit_region_mean_abs_delta"] for key in ordered_scalars]
+        final_gains = [per_strength[key]["final_edit_region_mean_abs_delta"] for key in ordered_scalars]
+        monotonic = bool(all(edit_gains[idx] is not None and edit_gains[idx + 1] is not None and edit_gains[idx] < edit_gains[idx + 1] for idx in range(len(edit_gains) - 1)))
+        raw_monotonic = bool(all(raw_gains[idx] is not None and raw_gains[idx + 1] is not None and raw_gains[idx] < raw_gains[idx + 1] for idx in range(len(raw_gains) - 1)))
+        final_monotonic = bool(all(final_gains[idx] is not None and final_gains[idx + 1] is not None and final_gains[idx] < final_gains[idx + 1] for idx in range(len(final_gains) - 1)))
         attenuation_suspected = bool(raw_monotonic and not final_monotonic)
-        for label, local_value in zip([0, 1, 2], [raw_monotonic, raw_monotonic, raw_monotonic]):
-            per_strength[label]["raw_monotonic_local"] = raw_monotonic
-        for label, local_value in zip([0, 1, 2], [final_monotonic, final_monotonic, final_monotonic]):
-            per_strength[label]["final_monotonic_local"] = final_monotonic
-            per_strength[label]["attenuation_suspected"] = attenuation_suspected
+        for key in ordered_scalars:
+            per_strength[key]["raw_monotonic_local"] = raw_monotonic
+            per_strength[key]["final_monotonic_local"] = final_monotonic
+            per_strength[key]["attenuation_suspected"] = attenuation_suspected
+        family_spearman = _spearman_rho(
+            ordered_numeric_scalars,
+            [float(value) for value in edit_gains if value is not None],
+        ) if all(value is not None for value in edit_gains) else None
         pairwise_rows.append(
             {
                 "sample_idx": int(sample_idx),
                 "edit_region_fraction": float(np.mean(edit_mask.astype(np.float32))),
-                "weak_edit_gain": g0,
-                "medium_edit_gain": g1,
-                "strong_edit_gain": g2,
-                "weak_bg_mae": per_strength[0]["bg_mae"],
-                "medium_bg_mae": per_strength[1]["bg_mae"],
-                "strong_bg_mae": per_strength[2]["bg_mae"],
-                "weak_raw_edit_region_mean_abs_delta": raw0,
-                "medium_raw_edit_region_mean_abs_delta": raw1,
-                "strong_raw_edit_region_mean_abs_delta": raw2,
-                "weak_final_edit_region_mean_abs_delta": final0,
-                "medium_final_edit_region_mean_abs_delta": final1,
-                "strong_final_edit_region_mean_abs_delta": final2,
-                "strong_minus_weak_edit_gain": None if g0 is None or g2 is None else float(g2 - g0),
+                "min_strength_scalar": float(ordered_numeric_scalars[0]),
+                "max_strength_scalar": float(ordered_numeric_scalars[-1]),
+                "weak_edit_gain": edit_gains[0],
+                "medium_edit_gain": edit_gains[len(edit_gains) // 2],
+                "strong_edit_gain": edit_gains[-1],
+                "weak_bg_mae": per_strength[ordered_scalars[0]]["bg_mae"],
+                "medium_bg_mae": per_strength[ordered_scalars[len(ordered_scalars) // 2]]["bg_mae"],
+                "strong_bg_mae": per_strength[ordered_scalars[-1]]["bg_mae"],
+                "weak_raw_edit_region_mean_abs_delta": raw_gains[0],
+                "medium_raw_edit_region_mean_abs_delta": raw_gains[len(raw_gains) // 2],
+                "strong_raw_edit_region_mean_abs_delta": raw_gains[-1],
+                "weak_final_edit_region_mean_abs_delta": final_gains[0],
+                "medium_final_edit_region_mean_abs_delta": final_gains[len(final_gains) // 2],
+                "strong_final_edit_region_mean_abs_delta": final_gains[-1],
+                "strong_minus_weak_edit_gain": None if edit_gains[0] is None or edit_gains[-1] is None else float(edit_gains[-1] - edit_gains[0]),
+                "gain_range": None if edit_gains[0] is None or edit_gains[-1] is None else float(edit_gains[-1] - edit_gains[0]),
+                "family_spearman_rho_strength_gain": family_spearman,
+                "gain_calibration_mae": _aggregate_mean([row["gain_gap_abs"] for row in per_strength.values()]),
                 "raw_monotonic_hit": raw_monotonic,
                 "final_monotonic_hit": final_monotonic,
                 "attenuation_suspected": attenuation_suspected,
@@ -348,59 +487,75 @@ def main() -> None:
             }
         )
 
+    scalar_keys = sorted(strength_rows.keys(), key=float)
     summary = {
         "condition_mode": args.condition_mode,
         "n_samples": len(eval_records),
-        "strength_labels": {str(k): STRENGTH_ID_TO_TEXT[k] for k in strengths},
+        "strength_scalars": scalar_keys,
         "edit_gain_mean": {
-            STRENGTH_ID_TO_TEXT[k]: _aggregate_metric(strength_rows[k], "edit_gain")
-            for k in strengths
+            key: _aggregate_metric(strength_rows[key], "edit_gain")
+            for key in scalar_keys
         },
         "bg_mae_mean": {
-            STRENGTH_ID_TO_TEXT[k]: _aggregate_metric(strength_rows[k], "bg_mae")
-            for k in strengths
+            key: _aggregate_metric(strength_rows[key], "bg_mae")
+            for key in scalar_keys
         },
         "target_mae_edit_region_mean": {
-            STRENGTH_ID_TO_TEXT[k]: _aggregate_metric(strength_rows[k], "target_mae_edit_region")
-            for k in strengths
+            key: _aggregate_metric(strength_rows[key], "target_mae_edit_region")
+            for key in scalar_keys
+        },
+        "target_edit_gain_mean": {
+            key: _aggregate_metric(strength_rows[key], "target_edit_gain")
+            for key in scalar_keys
         },
         "raw_edit_region_mean_abs_delta": {
-            STRENGTH_ID_TO_TEXT[k]: _aggregate_metric(strength_rows[k], "raw_edit_region_mean_abs_delta")
-            for k in strengths
+            key: _aggregate_metric(strength_rows[key], "raw_edit_region_mean_abs_delta")
+            for key in scalar_keys
         },
         "final_edit_region_mean_abs_delta": {
-            STRENGTH_ID_TO_TEXT[k]: _aggregate_metric(strength_rows[k], "final_edit_region_mean_abs_delta")
-            for k in strengths
+            key: _aggregate_metric(strength_rows[key], "final_edit_region_mean_abs_delta")
+            for key in scalar_keys
         },
         "blend_gap_edit_region_mean_abs": {
-            STRENGTH_ID_TO_TEXT[k]: _aggregate_metric(strength_rows[k], "blend_gap_edit_region_mean_abs")
-            for k in strengths
+            key: _aggregate_metric(strength_rows[key], "blend_gap_edit_region_mean_abs")
+            for key in scalar_keys
         },
         "raw_background_mean_abs_delta": {
-            STRENGTH_ID_TO_TEXT[k]: _aggregate_metric(strength_rows[k], "raw_background_mean_abs_delta")
-            for k in strengths
+            key: _aggregate_metric(strength_rows[key], "raw_background_mean_abs_delta")
+            for key in scalar_keys
         },
         "final_background_mean_abs_delta": {
-            STRENGTH_ID_TO_TEXT[k]: _aggregate_metric(strength_rows[k], "final_background_mean_abs_delta")
-            for k in strengths
+            key: _aggregate_metric(strength_rows[key], "final_background_mean_abs_delta")
+            for key in scalar_keys
         },
         "blend_gap_background_mean_abs": {
-            STRENGTH_ID_TO_TEXT[k]: _aggregate_metric(strength_rows[k], "blend_gap_background_mean_abs")
-            for k in strengths
+            key: _aggregate_metric(strength_rows[key], "blend_gap_background_mean_abs")
+            for key in scalar_keys
         },
         "raw_final_gap_edit_region_mean": {
-            STRENGTH_ID_TO_TEXT[k]: _aggregate_metric(strength_rows[k], "raw_final_gap_edit_region")
-            for k in strengths
+            key: _aggregate_metric(strength_rows[key], "raw_final_gap_edit_region")
+            for key in scalar_keys
         },
         "preservation_attenuation_ratio_mean": {
-            STRENGTH_ID_TO_TEXT[k]: _aggregate_metric(strength_rows[k], "preservation_attenuation_ratio")
-            for k in strengths
+            key: _aggregate_metric(strength_rows[key], "preservation_attenuation_ratio")
+            for key in scalar_keys
         },
-        "projector_pairwise_l2_mean": {
-            "0_1": _aggregate_mean([row.get("projector_pairwise_0_1") for rows in strength_rows.values() for row in rows]),
-            "1_2": _aggregate_mean([row.get("projector_pairwise_1_2") for rows in strength_rows.values() for row in rows]),
-            "0_2": _aggregate_mean([row.get("projector_pairwise_0_2") for rows in strength_rows.values() for row in rows]),
-        },
+        "projector_pairwise_l2_mean": _aggregate_nested_numeric_dict(
+            [row for rows in strength_rows.values() for row in rows],
+            ["projector_pairwise_l2"],
+        ),
+        "projector_mean_norm_by_scalar": _aggregate_nested_metric_by_strength(
+            [row for rows in strength_rows.values() for row in rows],
+            ["projector_mean_norm_by_scalar"],
+        ),
+        "modulation_delta_gamma_pairwise_l2_mean": _aggregate_nested_numeric_dict(
+            [row for rows in strength_rows.values() for row in rows],
+            ["modulation_delta_gamma_pairwise_l2"],
+        ),
+        "modulation_delta_beta_pairwise_l2_mean": _aggregate_nested_numeric_dict(
+            [row for rows in strength_rows.values() for row in rows],
+            ["modulation_delta_beta_pairwise_l2"],
+        ),
         "monotonic_hit_rate": float(np.mean([float(row["monotonic_hit"]) for row in pairwise_rows])),
         "raw_monotonic_hit_rate": float(np.mean([float(row["raw_monotonic_hit"]) for row in pairwise_rows])),
         "final_monotonic_hit_rate": float(np.mean([float(row["final_monotonic_hit"]) for row in pairwise_rows])),
@@ -408,6 +563,11 @@ def main() -> None:
         "strong_minus_weak_edit_gain_mean": _aggregate_mean(
             [row["strong_minus_weak_edit_gain"] for row in pairwise_rows]
         ),
+        "family_spearman_rho_strength_gain_mean": _aggregate_mean(
+            [row["family_spearman_rho_strength_gain"] for row in pairwise_rows]
+        ),
+        "gain_range_mean": _aggregate_mean([row["gain_range"] for row in pairwise_rows]),
+        "gain_calibration_mae_mean": _aggregate_mean([row["gain_calibration_mae"] for row in pairwise_rows]),
         "raw_strong_minus_weak_mean": _safe_diff(
             _aggregate_mean([row["strong_raw_edit_region_mean_abs_delta"] for row in pairwise_rows]),
             _aggregate_mean([row["weak_raw_edit_region_mean_abs_delta"] for row in pairwise_rows]),
@@ -436,9 +596,9 @@ def main() -> None:
         and summary["final_strong_minus_weak_mean"] > 0.0
     )
     summary["runtime_condition_interpretation"] = {
-        "both": "numeric label and instruction text both active" if args.condition_mode == "both" else False,
-        "label_only": "instruction text removed; numeric label active" if args.condition_mode == "label_only" else False,
-        "text_only": "numeric label fixed to weak slot; text varies by requested strength" if args.condition_mode == "text_only" else False,
+        "both": "numeric scalar control and instruction text both active" if args.condition_mode == "both" else False,
+        "label_only": "instruction text removed; numeric scalar control active" if args.condition_mode == "label_only" else False,
+        "text_only": "numeric control fixed to weakest anchor; text varies by requested strength" if args.condition_mode == "text_only" else False,
     }
     summary["output_path_diagnosis"] = {
         "raw_separable": bool(summary["raw_monotonic_hit_rate"] > 0.0),
@@ -446,8 +606,8 @@ def main() -> None:
         "attenuation_suspected": bool(summary["attenuation_suspected_rate"] > 0.0),
     }
     summary["projector_signal_present"] = bool(
-        summary["projector_pairwise_l2_mean"]["0_2"] is not None
-        and summary["projector_pairwise_l2_mean"]["0_2"] > 0.0
+        len(summary["projector_pairwise_l2_mean"]) > 0
+        and max(float(value) for value in summary["projector_pairwise_l2_mean"].values()) > 0.0
     )
     summary["modulation_or_preservation_priority"] = (
         "preservation" if summary["preservation_flattens_strength"] else "modulation_or_conditioning"
@@ -466,10 +626,30 @@ def main() -> None:
         "projector": summary["projector_pairwise_l2_mean"],
         "raw_final": summary["raw_vs_final_summary"],
     }
+    required_strength_keys = {f"{value:.4f}" for value in REQUIRED_STRENGTH_SCALARS}
+    if len(pairwise_rows) != len(eval_records):
+        raise RuntimeError(f"Expected {len(eval_records)} per-sample rows, got {len(pairwise_rows)}")
+    if summary["n_samples"] != len(eval_records):
+        raise RuntimeError(f"Summary n_samples={summary['n_samples']} expected {len(eval_records)}")
+    if not required_strength_keys.issubset(set(strength_rows.keys())):
+        raise RuntimeError(f"Missing strength rows for {sorted(required_strength_keys - set(strength_rows.keys()))}")
+    for key in required_strength_keys:
+        if len(strength_rows[key]) != len(eval_records):
+            raise RuntimeError(f"Strength row count mismatch for {key}: expected {len(eval_records)} got {len(strength_rows[key])}")
+    for metric_key in ("monotonic_hit_rate", "raw_monotonic_hit_rate", "final_monotonic_hit_rate"):
+        if summary.get(metric_key) is None:
+            raise RuntimeError(f"Missing summary metric {metric_key}")
+
     payload = {
+        "status": {
+            "ok": True,
+            "stage": "evaluate_tedit_strength_effect",
+            "condition_mode": args.condition_mode,
+        },
         "config": {
             "model_path": args.model_path,
-            "config_path": args.config_path,
+            "config_path": runtime_config_path,
+            "requested_config_path": args.config_path,
             "dataset_folder": args.dataset_folder,
             "split": args.split,
             "max_samples": int(args.max_samples),

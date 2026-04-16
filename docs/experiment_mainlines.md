@@ -36,6 +36,23 @@ This line is the method core. It should carry the main claim that BetterTSE can 
 
 This line should be presented as a downstream application of BetterTSE rather than a replacement for the editing task.
 
+## Schema Boundary
+
+Shared across pure editing and forecast revision:
+
+- `intent`
+- `localization`
+- `canonical_tool`
+- `tool_name`
+- `control_source`
+
+Task-specific:
+
+- pure editing projects shared semantics directly into editor parameters
+- forecast revision adds a revision-specific calibration bridge: `edit_spec -> params`
+
+This means the two tasks share one semantic ontology without being forced to share exactly the same executor or numeric parameter layer.
+
 ## Forecast Backbone Policy
 
 The forecast-revision line should treat forecasting models as **replaceable base predictors**, not as a fixed bundled set.
@@ -52,10 +69,20 @@ These are implementation examples and convenient starting points, not a locked p
 
 ## Target Construction Scope
 
-Current implemented forecast-revision benchmarks primarily use controlled synthetic target construction rooted in the base forecast:
+The target-construction policy should be read by task line rather than as one shared default.
 
-- physical / rule-based revision injection
-- future-aware projection in the corresponding benchmark utilities when needed
+Pure editing mainline:
+- primary target regime: controlled physical injection
+- purpose: keep operator family, region, magnitude, and duration explicit so the method can be evaluated on intent alignment, localization, editability, and outside-region preservation under a clean target
+
+Forecast revision mainline:
+- primary target regime: future-guided projected revision target
+- definition: start from `base_forecast`, keep the search space constrained by textual intent, and use `future_gt` only to select the best target inside that constrained edit family
+- purpose: evaluate whether BetterTSE-style revision is useful in a realistic downstream forecasting setting
+
+Forecast revision auxiliary regime:
+- controlled synthetic revision target remains in the repo as an auxiliary benchmark regime
+- purpose: support calibration analysis, ablations, and checks that the method is actually following the instruction rather than only moving toward `future_gt`
 
 Monte Carlo style target simulation is not yet the repository mainline and should be treated as future extension work unless a dedicated implementation lands.
 

@@ -3,6 +3,9 @@ import time
 import json
 import copy
 from collections import defaultdict
+from typing import Any, Dict
+
+import torch.nn as nn
 
 import torch
 from torch.optim import Adam
@@ -26,10 +29,13 @@ class Finetuner:
         self.tf_writer = SummaryWriter(log_dir=self.output_folder)
 
     def _init_eval(self, eval_configs, c_mean):
-        dataset = EditDataset(eval_configs["data"])
-        self.evaluator = BaseEvaluator(eval_configs["eval"], dataset, None)
         self.eval_configs = eval_configs
         self.c_mean = c_mean
+        self.evaluator = None
+        if not self.run_generation_eval:
+            return
+        dataset = EditDataset(eval_configs["data"])
+        self.evaluator = BaseEvaluator(eval_configs["eval"], dataset, None)
 
     def _init_cfgs(self, configs):
         self.configs = configs
@@ -45,7 +51,18 @@ class Finetuner:
         self.strength_diagnostics_enabled = bool(self.configs.get("strength_diagnostics_enabled", False))
         self.strength_diagnostics_interval = int(self.configs.get("strength_diagnostics_interval", 50))
         self.freeze_backbone_for_strength = bool(self.configs.get("freeze_backbone_for_strength", False))
+        self.beta_only_repair = bool(self.configs.get("beta_only_repair", False))
+        self.reset_beta_output_head = bool(self.configs.get("reset_beta_output_head", False))
+        self.conditioning_composition = dict(self.configs.get("conditioning_composition") or {})
+        if self.beta_only_repair and self.freeze_backbone_for_strength:
+            print("beta_only_repair enabled; overriding freeze_backbone_for_strength with stricter beta-only freeze")
+            self.freeze_backbone_for_strength = False
         self.instruction_text_dropout_prob = float(self.configs.get("instruction_text_dropout_prob", 0.0))
+        if "numeric_only_ratio" not in self.conditioning_composition and self.instruction_text_dropout_prob > 0.0:
+            self.conditioning_composition["numeric_only_ratio"] = self.instruction_text_dropout_prob
+        self.conditioning_composition_enabled = bool(self.conditioning_composition.get("enabled", False))
+        self.conditioning_composition_numeric_only_ratio = float(self.conditioning_composition.get("numeric_only_ratio", 0.0))
+        self.conditioning_composition_both_ratio = float(self.conditioning_composition.get("both_ratio", max(0.0, 1.0 - self.conditioning_composition_numeric_only_ratio)))
         self.run_generation_eval = bool(self.configs.get("run_generation_eval", True))
 
         self.include_self = self.configs["include_self"]
@@ -61,8 +78,91 @@ class Finetuner:
         if self.model_path != "":
             print("Laoding pretrained model from {}".format(self.model_path))
             self.model.load_state_dict(torch.load(self.model_path), strict=False)
-        if self.freeze_backbone_for_strength:
+        self._beta_only_repair_targets = []
+        self._beta_only_repair_masks = {}
+        if self.beta_only_repair:
+            self._configure_beta_only_repair()
+        elif self.freeze_backbone_for_strength:
             self._freeze_backbone_for_strength()
+        if self.beta_only_repair and self.reset_beta_output_head:
+            self._reset_beta_only_output_heads()
+        self._register_beta_only_repair_masks()
+        self._log_beta_only_repair_targets()
+
+    def _configure_beta_only_repair(self):
+        for _, param in self.model.named_parameters():
+            param.requires_grad = False
+        self._beta_only_repair_targets = self._collect_beta_only_repair_targets()
+        if not self._beta_only_repair_targets:
+            raise ValueError("beta_only_repair enabled but no strength_modulation[-1] targets were found")
+        for target in self._beta_only_repair_targets:
+            target["param"].requires_grad = True
+
+    def _collect_beta_only_repair_targets(self):
+        targets = []
+        for module_name, module in self.model.named_modules():
+            if not isinstance(module, nn.Sequential) or len(module) == 0:
+                continue
+            if not module_name.endswith("strength_modulation"):
+                continue
+            output_head = module[-1]
+            if not isinstance(output_head, nn.Linear):
+                continue
+            if output_head.out_features % 2 != 0:
+                raise ValueError(f"Expected even out_features for beta split at {module_name}, got {output_head.out_features}")
+            beta_start = output_head.out_features // 2
+            for param_name in ("weight", "bias"):
+                param = getattr(output_head, param_name, None)
+                if param is None:
+                    continue
+                targets.append(
+                    {
+                        "name": f"{module_name}[-1].{param_name}",
+                        "param": param,
+                        "beta_start": beta_start,
+                    }
+                )
+        return targets
+
+    def _reset_beta_only_output_heads(self):
+        for target in self._beta_only_repair_targets:
+            with torch.no_grad():
+                target["param"][target["beta_start"]:] = 0
+
+    def _register_beta_only_repair_masks(self):
+        self._beta_only_repair_masks = {}
+        if not self.beta_only_repair:
+            return
+        for target in self._beta_only_repair_targets:
+            mask = torch.zeros_like(target["param"].detach())
+            mask[target["beta_start"]:] = 1
+            self._beta_only_repair_masks[id(target["param"])] = mask
+
+    def _log_beta_only_repair_targets(self):
+        if not self.beta_only_repair:
+            return
+        print("Beta-only repair targets:")
+        for target in self._beta_only_repair_targets:
+            print(f"  - {target['name']} (beta rows: {target['beta_start']}:{target['param'].shape[0]})")
+
+    def _apply_beta_only_repair_grad_mask(self):
+        if not self.beta_only_repair:
+            return
+        for target in self._beta_only_repair_targets:
+            grad = target["param"].grad
+            if grad is None:
+                continue
+            grad.mul_(self._beta_only_repair_masks[id(target["param"])].to(device=grad.device, dtype=grad.dtype))
+
+    def _mask_grad_tensor(self, param, grad_norm):
+        mask = self._beta_only_repair_masks.get(id(param))
+        if mask is None:
+            return grad_norm
+        grad = param.grad
+        if grad is None:
+            return grad_norm
+        masked_grad = grad.detach() * mask.to(device=grad.device, dtype=grad.dtype)
+        return float(masked_grad.norm().item())
 
     def _init_guider(self, guider):
         self.guider = guider.to(self.model.device)
@@ -74,9 +174,12 @@ class Finetuner:
         strength_params = []
         backbone_params = []
         self._strength_param_meta = []
+        self._tracked_diag_param_meta = []
         for name, param in named_params:
             if not param.requires_grad:
                 continue
+            if self._is_strength_parameter(name) or self._is_modulation_neighbor_parameter(name):
+                self._tracked_diag_param_meta.append((name, param))
             if self._is_strength_parameter(name):
                 strength_params.append(param)
                 self._strength_param_meta.append((name, param))
@@ -84,14 +187,20 @@ class Finetuner:
                 backbone_params.append(param)
 
         param_groups = []
-        if backbone_params:
-            param_groups.append({"params": backbone_params, "lr": self.lr})
-        if strength_params:
-            param_groups.append({"params": strength_params, "lr": self.lr * self.strength_lr_scale})
+        if self.beta_only_repair:
+            if strength_params:
+                param_groups.append({"params": strength_params, "lr": self.lr * self.strength_lr_scale})
+        else:
+            if backbone_params:
+                param_groups.append({"params": backbone_params, "lr": self.lr})
+            if strength_params:
+                param_groups.append({"params": strength_params, "lr": self.lr * self.strength_lr_scale})
         self.opt = Adam(param_groups, lr=self.lr, weight_decay=1e-6)
+        if not param_groups:
+            raise ValueError("No trainable parameters were configured for finetuning")
         self._strength_param_init = {
             name: param.detach().cpu().clone()
-            for name, param in self._strength_param_meta
+            for name, param in self._tracked_diag_param_meta
         }
 
     def _init_data(self, dataset):
@@ -107,9 +216,11 @@ class Finetuner:
         if self.strength_diagnostics_enabled and os.path.exists(self.strength_diag_path):
             os.remove(self.strength_diag_path)
         if self.strength_diagnostics_enabled:
+            with open(self.strength_diag_path, "w", encoding="utf-8") as f:
+                f.write("")
             StrengthProjector.enable_diagnostics(True)
-            ResidualBlockBase.enable_diagnostics(True)
-            ResidualBlockWeaver.enable_diagnostics(True)
+            ResidualBlockBase.enable_diagnostics(True, max_records=512)
+            ResidualBlockWeaver.enable_diagnostics(True, max_records=512)
             ConditionalGenerator.enable_strength_diagnostics(True)
         else:
             StrengthProjector.disable_diagnostics()
@@ -162,39 +273,92 @@ class Finetuner:
             for strength, metric_dict in stats.items()
         }
 
+    def _format_scalar_key(self, value):
+        return f"{float(value):.4f}"
+
+    def _safe_spearman(self, x_values, y_values):
+        if len(x_values) < 2 or len(y_values) < 2 or len(x_values) != len(y_values):
+            return None
+        x = torch.as_tensor(x_values, dtype=torch.float32).view(-1)
+        y = torch.as_tensor(y_values, dtype=torch.float32).view(-1)
+        x_rank = torch.argsort(torch.argsort(x)).float()
+        y_rank = torch.argsort(torch.argsort(y)).float()
+        x_rank -= x_rank.mean()
+        y_rank -= y_rank.mean()
+        denom = torch.sqrt(torch.clamp(x_rank.square().sum() * y_rank.square().sum(), min=1.0e-12))
+        if float(denom.item()) <= 1.0e-12:
+            return None
+        return float((x_rank * y_rank).sum().item() / denom.item())
+
+    def _summarize_stage_records(self, records):
+        by_stage = defaultdict(list)
+        for record in records:
+            stage_name = record.get("stage_name")
+            if isinstance(stage_name, str) and stage_name:
+                by_stage[stage_name].append(record)
+        return {
+            stage_name: {
+                "count": int(len(stage_records)),
+                "scalars": self._summarize_numeric_dicts(stage_records),
+                "pairwise_l2": self._summarize_nested_metric(stage_records, "stage_pairwise_l2"),
+                "pairwise_l2_by_scalar": self._summarize_nested_metric(stage_records, "stage_pairwise_l2_by_scalar"),
+                "mean_by_strength": self._summarize_strength_means(stage_records, "stage_mean_by_strength"),
+                "mean_by_scalar": self._summarize_strength_means(stage_records, "stage_mean_by_scalar"),
+            }
+            for stage_name, stage_records in by_stage.items()
+        }
+
     def _summarize_condition_diagnostics(self):
         projector_records = StrengthProjector.consume_diagnostics()
         modulation_base_records = ResidualBlockBase.consume_diagnostics()
         modulation_weaver_records = ResidualBlockWeaver.consume_diagnostics()
         generator_records = ConditionalGenerator.consume_strength_diagnostics()
+        modulation_base_stage_records = [record for record in modulation_base_records if isinstance(record.get("stage_name"), str)]
+        modulation_weaver_stage_records = [record for record in modulation_weaver_records if isinstance(record.get("stage_name"), str)]
+        modulation_base_records = [record for record in modulation_base_records if not isinstance(record.get("stage_name"), str)]
+        modulation_weaver_records = [record for record in modulation_weaver_records if not isinstance(record.get("stage_name"), str)]
         return {
             "projector": {
                 "count": int(len(projector_records)),
                 "scalars": self._summarize_numeric_dicts(projector_records),
                 "pairwise_l2": self._summarize_nested_metric(projector_records, "projector_output_pairwise_l2"),
+                "pairwise_l2_by_scalar": self._summarize_nested_metric(projector_records, "projector_output_pairwise_l2_by_scalar"),
                 "mean_norm_by_strength": self._summarize_strength_means(projector_records, "projector_output_mean_norm_by_strength"),
+                "mean_norm_by_scalar": self._summarize_strength_means(projector_records, "projector_output_mean_norm_by_scalar"),
             },
             "modulation_base": {
                 "count": int(len(modulation_base_records)),
                 "scalars": self._summarize_numeric_dicts(modulation_base_records),
                 "delta_gamma_pairwise_l2": self._summarize_nested_metric(modulation_base_records, "delta_gamma_pairwise_l2"),
                 "delta_beta_pairwise_l2": self._summarize_nested_metric(modulation_base_records, "delta_beta_pairwise_l2"),
+                "delta_gamma_pairwise_l2_by_scalar": self._summarize_nested_metric(modulation_base_records, "delta_gamma_pairwise_l2_by_scalar"),
+                "delta_beta_pairwise_l2_by_scalar": self._summarize_nested_metric(modulation_base_records, "delta_beta_pairwise_l2_by_scalar"),
                 "delta_gamma_mean_by_strength": self._summarize_strength_means(modulation_base_records, "delta_gamma_mean_by_strength"),
                 "delta_beta_mean_by_strength": self._summarize_strength_means(modulation_base_records, "delta_beta_mean_by_strength"),
+                "delta_gamma_mean_by_scalar": self._summarize_strength_means(modulation_base_records, "delta_gamma_mean_by_scalar"),
+                "delta_beta_mean_by_scalar": self._summarize_strength_means(modulation_base_records, "delta_beta_mean_by_scalar"),
+                "downstream_stages": self._summarize_stage_records(modulation_base_stage_records),
             },
             "modulation_weaver": {
                 "count": int(len(modulation_weaver_records)),
                 "scalars": self._summarize_numeric_dicts(modulation_weaver_records),
                 "delta_gamma_pairwise_l2": self._summarize_nested_metric(modulation_weaver_records, "delta_gamma_pairwise_l2"),
                 "delta_beta_pairwise_l2": self._summarize_nested_metric(modulation_weaver_records, "delta_beta_pairwise_l2"),
+                "delta_gamma_pairwise_l2_by_scalar": self._summarize_nested_metric(modulation_weaver_records, "delta_gamma_pairwise_l2_by_scalar"),
+                "delta_beta_pairwise_l2_by_scalar": self._summarize_nested_metric(modulation_weaver_records, "delta_beta_pairwise_l2_by_scalar"),
                 "delta_gamma_mean_by_strength": self._summarize_strength_means(modulation_weaver_records, "delta_gamma_mean_by_strength"),
                 "delta_beta_mean_by_strength": self._summarize_strength_means(modulation_weaver_records, "delta_beta_mean_by_strength"),
+                "delta_gamma_mean_by_scalar": self._summarize_strength_means(modulation_weaver_records, "delta_gamma_mean_by_scalar"),
+                "delta_beta_mean_by_scalar": self._summarize_strength_means(modulation_weaver_records, "delta_beta_mean_by_scalar"),
+                "downstream_stages": self._summarize_stage_records(modulation_weaver_stage_records),
             },
             "generator": {
                 "count": int(len(generator_records)),
                 "scalars": self._summarize_numeric_dicts(generator_records),
                 "train_edit_gain_by_strength": self._summarize_nested_metric(generator_records, "train_edit_gain_by_strength"),
                 "train_target_gain_by_strength": self._summarize_nested_metric(generator_records, "train_target_gain_by_strength"),
+                "train_edit_gain_by_scalar": self._summarize_nested_metric(generator_records, "train_edit_gain_by_scalar"),
+                "train_target_gain_by_scalar": self._summarize_nested_metric(generator_records, "train_target_gain_by_scalar"),
             },
         }
 
@@ -204,36 +368,65 @@ class Finetuner:
         mask_gt = batch.get("mask_gt")
         family_sizes = batch.get("family_sizes")
         strength_label = batch.get("strength_label")
-        if not all(isinstance(item, torch.Tensor) for item in (src_x, tgt_x, mask_gt, family_sizes, strength_label)):
+        strength_scalar = batch.get("strength_scalar")
+        required = (src_x, tgt_x, mask_gt, family_sizes)
+        if not all(isinstance(item, torch.Tensor) for item in required):
             return {}
         src = src_x.detach().cpu().float()
         tgt = tgt_x.detach().cpu().float()
         mask = mask_gt.detach().cpu().float()
-        if mask.dim() == 3:
+        if mask.dim() == 3 and mask.shape != src.shape:
             mask = mask.permute(0, 2, 1)
         if mask.dim() == 2:
             mask = mask.unsqueeze(1)
         denom = torch.clamp(mask.sum(dim=(1, 2)), min=1.0)
         gains = (torch.abs(tgt - src) * mask).sum(dim=(1, 2)) / denom
-        labels = strength_label.detach().cpu().long().view(-1)
-        summary = {
-            "target_gain_by_strength": {
+        summary = {"family_monotonic_target_hit_rate": 0.0}
+        if isinstance(strength_label, torch.Tensor):
+            labels = strength_label.detach().cpu().long().view(-1)
+            summary["target_gain_by_strength"] = {
                 str(label): float(gains[labels == label].mean().item())
-                for label in [0, 1, 2] if int((labels == label).sum().item()) > 0
-            },
-            "family_monotonic_target_hit_rate": 0.0,
-        }
+                for label in sorted(set(labels.tolist()))
+                if int((labels == label).sum().item()) > 0
+            }
+        scalar_values = None
+        if isinstance(strength_scalar, torch.Tensor):
+            scalar_values = strength_scalar.detach().cpu().float().view(-1)
+            summary["target_gain_by_scalar"] = {}
+            for scalar_value in sorted({float(value) for value in scalar_values.tolist()}):
+                scalar_mask = torch.isclose(scalar_values, torch.tensor(float(scalar_value), dtype=scalar_values.dtype), atol=1.0e-6, rtol=0.0)
+                if int(scalar_mask.sum().item()) == 0:
+                    continue
+                summary["target_gain_by_scalar"][self._format_scalar_key(scalar_value)] = float(gains[scalar_mask].mean().item())
+            overall_rho = self._safe_spearman(scalar_values.tolist(), gains.tolist())
+            if overall_rho is not None:
+                summary["overall_target_gain_scalar_spearman"] = float(overall_rho)
         hits = []
+        family_rhos = []
         start = 0
         for size in family_sizes.detach().cpu().tolist():
             size = int(size)
             family_gains = gains[start:start + size]
+            family_scalar = None if scalar_values is None else scalar_values[start:start + size]
             start += size
-            if family_gains.numel() < 3:
+            if family_gains.numel() < 2:
                 continue
-            hits.append(float(family_gains[0] <= family_gains[1] and family_gains[1] <= family_gains[2]))
+            if family_scalar is not None:
+                order = torch.argsort(family_scalar)
+                family_gains = family_gains[order]
+                family_scalar = family_scalar[order]
+            hits.append(float(all(
+                float(family_gains[idx + 1].item()) + 1.0e-6 >= float(family_gains[idx].item())
+                for idx in range(family_gains.numel() - 1)
+            )))
+            if family_scalar is not None:
+                rho = self._safe_spearman(family_scalar.tolist(), family_gains.tolist())
+                if rho is not None:
+                    family_rhos.append(float(rho))
         if hits:
             summary["family_monotonic_target_hit_rate"] = float(sum(hits) / len(hits))
+        if family_rhos:
+            summary["family_target_gain_spearman_mean"] = float(sum(family_rhos) / len(family_rhos))
         return summary
 
     def _family_flags(self, batch):
@@ -282,6 +475,14 @@ class Finetuner:
             "strength_hist": self._tensor_histogram(batch.get("strength_label")),
             "task_hist": self._tensor_histogram(batch.get("task_id")),
         }
+        strength_scalar = batch.get("strength_scalar")
+        if isinstance(strength_scalar, torch.Tensor):
+            scalar_cpu = strength_scalar.detach().cpu().float().view(-1)
+            stats["strength_scalar_range"] = {
+                "min": float(scalar_cpu.min().item()),
+                "max": float(scalar_cpu.max().item()),
+                "unique": int(torch.unique(scalar_cpu).numel()),
+            }
         tgt_x = batch.get("tgt_x")
         src_x = batch.get("src_x")
         strength_label = batch.get("strength_label")
@@ -318,7 +519,7 @@ class Finetuner:
     def _collect_strength_diagnostics(self, batch, loss):
         modules = []
         for name, param in self._strength_param_meta:
-            grad_norm = None if param.grad is None else float(param.grad.detach().norm().item())
+            grad_norm = None if param.grad is None else self._mask_grad_tensor(param, float(param.grad.detach().norm().item()))
             init_tensor = self._strength_param_init[name].to(param.device)
             delta_norm = float((param.detach() - init_tensor).norm().item())
             modules.append(
@@ -329,11 +530,16 @@ class Finetuner:
                     "delta_from_init_norm": delta_norm,
                 }
             )
+        tracked_param_summary = self._summarize_tracked_param_state()
         payload = {
             "step": int(self._global_batch_no),
             "loss": float(loss.item()),
             "strength_lr_scale": float(self.strength_lr_scale),
             "strength_modules": modules,
+            "grad_norm_by_param": tracked_param_summary["grad_norm_by_param"],
+            "param_norm_by_param": tracked_param_summary["param_norm_by_param"],
+            "param_update_l2_by_param": tracked_param_summary["param_update_l2_by_param"],
+            "param_update_ratio_by_param": tracked_param_summary["param_update_ratio_by_param"],
             "batch_stats": self._batch_strength_stats(batch),
             "loss_breakdown": copy.deepcopy(getattr(self.model, "_latest_loss_breakdown", None)),
             "training_batch_diagnostics": self._training_batch_diagnostics(batch),
@@ -341,27 +547,75 @@ class Finetuner:
         with open(self.strength_diag_path, "a", encoding="utf-8") as f:
             f.write(json.dumps(payload, ensure_ascii=False) + "\n")
 
-    def _apply_instruction_text_dropout(self, batch):
-        if self.instruction_text_dropout_prob <= 0.0:
-            return batch
+    def _summarize_tracked_param_state(self):
+        grad_norm_by_param = {}
+        param_norm_by_param = {}
+        param_update_l2_by_param = {}
+        param_update_ratio_by_param = {}
+        eps = 1.0e-12
+        for name, param in getattr(self, "_tracked_diag_param_meta", []):
+            grad_norm = None if param.grad is None else self._mask_grad_tensor(param, float(param.grad.detach().norm().item()))
+            param_norm = float(param.detach().norm().item())
+            init_tensor = self._strength_param_init[name].to(param.device)
+            update_l2 = float((param.detach() - init_tensor).norm().item())
+            update_ratio = update_l2 / max(param_norm, eps)
+            grad_norm_by_param[name] = grad_norm
+            param_norm_by_param[name] = param_norm
+            param_update_l2_by_param[name] = update_l2
+            param_update_ratio_by_param[name] = float(update_ratio)
+        return {
+            "grad_norm_by_param": grad_norm_by_param,
+            "param_norm_by_param": param_norm_by_param,
+            "param_update_l2_by_param": param_update_l2_by_param,
+            "param_update_ratio_by_param": param_update_ratio_by_param,
+        }
+
+    def _apply_conditioning_composition(self, batch):
         instruction_text = batch.get("instruction_text")
         if instruction_text is None:
             return batch
+        if not self.conditioning_composition_enabled and self.instruction_text_dropout_prob <= 0.0:
+            return batch
 
-        dropped_batch = dict(batch)
+        numeric_only_ratio = self.conditioning_composition_numeric_only_ratio
+        both_ratio = self.conditioning_composition_both_ratio
+        if not self.conditioning_composition_enabled:
+            numeric_only_ratio = self.instruction_text_dropout_prob
+            both_ratio = max(0.0, 1.0 - float(numeric_only_ratio))
+        numeric_only_ratio = min(max(float(numeric_only_ratio), 0.0), 1.0)
+        both_ratio = min(max(float(both_ratio), 0.0), 1.0)
+        total = numeric_only_ratio + both_ratio
+        if total <= 0.0:
+            return batch
+        numeric_only_prob = numeric_only_ratio / total
+
+        composed_batch = dict(batch)
         if isinstance(instruction_text, torch.Tensor):
-            mask = torch.rand(instruction_text.shape[0]) < self.instruction_text_dropout_prob
+            mask = torch.rand(instruction_text.shape[0], device=instruction_text.device) < numeric_only_prob
             dropped = instruction_text.clone()
             if dropped.dim() >= 2:
                 dropped[mask] = 0
-            dropped_batch["instruction_text"] = dropped
+            else:
+                dropped[mask] = 0
+            composed_batch["instruction_text"] = dropped
+            composed_batch["conditioning_mode"] = torch.where(
+                mask,
+                torch.ones_like(mask, dtype=torch.long),
+                torch.zeros_like(mask, dtype=torch.long),
+            )
         elif isinstance(instruction_text, (list, tuple)):
             dropped = list(instruction_text)
+            conditioning_mode = []
             for idx in range(len(dropped)):
-                if torch.rand(1).item() < self.instruction_text_dropout_prob:
+                is_numeric_only = torch.rand(1).item() < numeric_only_prob
+                if is_numeric_only:
                     dropped[idx] = ""
-            dropped_batch["instruction_text"] = dropped
-        return dropped_batch
+                    conditioning_mode.append(1)
+                else:
+                    conditioning_mode.append(0)
+            composed_batch["instruction_text"] = dropped
+            composed_batch["conditioning_mode"] = torch.tensor(conditioning_mode, dtype=torch.long)
+        return composed_batch
 
     """
     Train.
@@ -406,18 +660,18 @@ class Finetuner:
             self.model.train()
             for batch_no, train_batch in enumerate(self.train_loader):
                 self._global_batch_no += 1
-                train_batch = self._apply_instruction_text_dropout(train_batch)
+                train_batch = self._apply_conditioning_composition(train_batch)
 
                 self.opt.zero_grad()
                 loss = self.model(train_batch, is_train=True, mode="finetune")
                 loss.backward()
+                self._apply_beta_only_repair_grad_mask()
+                self.opt.step()
                 if (
                     self.strength_diagnostics_enabled
-                    and self._strength_param_meta
                     and self._global_batch_no % max(1, self.strength_diagnostics_interval) == 0
                 ):
                     self._collect_strength_diagnostics(train_batch, loss)
-                self.opt.step()
                 avg_loss += loss.item()
                 self.tf_writer.add_scalar("Finetune/Train/batch_loss", loss.item(), self._global_batch_no)
 

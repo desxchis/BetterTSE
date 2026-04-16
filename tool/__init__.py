@@ -1,7 +1,7 @@
-# Tool package for time series composers and describers
+# Tool package marker.
+#
+# Keep package import side-effect free so lightweight entrypoints can import
+# specific tool modules without pulling optional dependencies from unrelated
+# composer/describer paths.
 
-from . import ts_composers
-from . import ts_describers
-from . import ts_processor
-
-__all__ = ['ts_composers', 'ts_describers', 'ts_processor']
+__all__ = []

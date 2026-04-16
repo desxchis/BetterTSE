@@ -1,4 +1,5 @@
 import copy
+import math
 import torch
 import torch.nn as nn
 
@@ -37,11 +38,20 @@ class ConditionalGenerator(nn.Module):
         super().__init__()
         self.device = configs["device"]
         strength_cfg = dict(configs.get("diffusion", {}).get("strength_control") or {})
+        self.diffusion_loss_weight = float(strength_cfg.get("diffusion_loss_weight", 1.0))
         self.edit_region_loss_weight = float(strength_cfg.get("edit_region_loss_weight", 0.0))
         self.background_loss_weight = float(strength_cfg.get("background_loss_weight", 0.0))
         self.monotonic_loss_weight = float(strength_cfg.get("monotonic_loss_weight", 0.0))
         self.monotonic_margin = float(strength_cfg.get("monotonic_margin", 1.0e-3))
         self.gain_match_loss_weight = float(strength_cfg.get("gain_match_loss_weight", 0.0))
+        self.family_relative_gain_loss_weight = float(strength_cfg.get("family_relative_gain_loss_weight", 0.0))
+        self.family_relative_margin_scale = float(strength_cfg.get("family_relative_margin_scale", 1.0))
+        self.constant_gain_penalty_weight = float(strength_cfg.get("constant_gain_penalty_weight", 0.0))
+        self.minimum_family_gain_std = float(strength_cfg.get("minimum_family_gain_std", 0.0))
+        self.numeric_only_loss_weight = float(strength_cfg.get("numeric_only_loss_weight", 0.0))
+        self.beta_direction_loss_weight = float(strength_cfg.get("beta_direction_loss_weight", 0.0))
+        self.beta_direction_margin = float(strength_cfg.get("beta_direction_margin", 0.0))
+        self.beta_direction_target = str(strength_cfg.get("beta_direction_target", "family_signed_gain"))
         self._latest_loss_breakdown = None
 
         self._init_condition_encoders(configs["attrs"], configs["side"])
@@ -93,6 +103,7 @@ class ConditionalGenerator(nn.Module):
         strength_label=None,
         task_id=None,
         text_context=None,
+        strength_scalar=None,
         soft_mask=None,
         keys_null=None,
         values_null=None,
@@ -123,11 +134,13 @@ class ConditionalGenerator(nn.Module):
             model_kwargs["task_id"] = task_id
         if text_context is not None:
             model_kwargs["text_context"] = text_context
+        if strength_scalar is not None:
+            model_kwargs["strength_scalar"] = strength_scalar
 
         pred_noise = self.diff_model(noisy_x, side_emb, src_attr_emb, t, **model_kwargs)  # (B,K,L)
         return pred_noise
 
-    def _noise_estimation_loss(self, x, side_emb, attr_emb, t, strength_label=None, task_id=None, text_context=None):
+    def _noise_estimation_loss(self, x, side_emb, attr_emb, t, strength_label=None, task_id=None, text_context=None, strength_scalar=None):
         noise = torch.randn_like(x)
         noisy_x = self.ddpm.forward(x, t, noise)
         pred_noise = self.predict_noise(
@@ -138,6 +151,7 @@ class ConditionalGenerator(nn.Module):
             strength_label=strength_label,
             task_id=task_id,
             text_context=text_context,
+            strength_scalar=strength_scalar,
         )
         
         residual = noise - pred_noise
@@ -187,7 +201,7 @@ class ConditionalGenerator(nn.Module):
     """
 
     def fintune(self, batch, is_train):
-        src_x, tp, src_attrs, tgt_attrs, tgt_x, strength_label, task_id, instruction_text = self._unpack_data_edit(batch)
+        src_x, tp, src_attrs, tgt_attrs, tgt_x, strength_label, strength_scalar, task_id, instruction_text = self._unpack_data_edit(batch)
 
         side_emb = self.side_en(tp)
         src_attr_emb = self.attr_en(src_attrs)
@@ -201,6 +215,7 @@ class ConditionalGenerator(nn.Module):
             tgt_attr_emb,
             sampler="ddim",
             strength_label=strength_label,
+            strength_scalar=strength_scalar,
             task_id=task_id,
             text_context=instruction_text,
         )  # (B,V,L)
@@ -219,6 +234,7 @@ class ConditionalGenerator(nn.Module):
                     tgt_attr_emb[bs_ids],
                     t,
                     strength_label=None if strength_label is None else strength_label[bs_ids],
+                    strength_scalar=None if strength_scalar is None else strength_scalar[bs_ids],
                     task_id=None if task_id is None else task_id[bs_ids],
                     text_context=(
                         None
@@ -242,21 +258,34 @@ class ConditionalGenerator(nn.Module):
                         tgt_attr_emb,
                         t,
                         strength_label=strength_label,
+                        strength_scalar=strength_scalar,
                         task_id=task_id,
                         text_context=instruction_text,
                     )
             loss_tgt = loss_tgt/self.num_steps
-        total_loss = loss_tgt
+        weighted_loss_tgt = self.diffusion_loss_weight * loss_tgt
+        total_loss = weighted_loss_tgt
         loss_breakdown = {
             "loss_tgt": float(loss_tgt.detach().item()) if isinstance(loss_tgt, torch.Tensor) else float(loss_tgt),
+            "diffusion_realism_loss": float(loss_tgt.detach().item()) if isinstance(loss_tgt, torch.Tensor) else float(loss_tgt),
+            "weighted_diffusion_realism_loss": float(weighted_loss_tgt.detach().item()) if isinstance(weighted_loss_tgt, torch.Tensor) else float(weighted_loss_tgt),
+            "diffusion_loss_weight": float(self.diffusion_loss_weight),
             "edit_region_loss": 0.0,
             "background_loss": 0.0,
             "monotonic_loss": 0.0,
             "gain_match_loss": 0.0,
+            "amplitude_control_loss": 0.0,
+            "local_fidelity_loss": 0.0,
+            "preservation_loss": 0.0,
+            "order_regularization_loss": 0.0,
             "weighted_edit_region_loss": 0.0,
             "weighted_background_loss": 0.0,
             "weighted_monotonic_loss": 0.0,
             "weighted_gain_match_loss": 0.0,
+            "weighted_amplitude_control_loss": 0.0,
+            "weighted_local_fidelity_loss": 0.0,
+            "weighted_preservation_loss": 0.0,
+            "weighted_order_regularization_loss": 0.0,
             "total_loss": float(total_loss.detach().item()) if isinstance(total_loss, torch.Tensor) else float(total_loss),
             "bootstrap_selected": None if bs_ids is None else int(len(bs_ids)),
             "batch_size": int(tgt_x_pred.shape[0]),
@@ -276,11 +305,20 @@ class ConditionalGenerator(nn.Module):
                 mask_gt=mask_gt,
                 family_sizes=family_sizes,
                 strength_label=strength_label,
+                strength_scalar=strength_scalar,
+                instruction_text=instruction_text,
                 return_breakdown=True,
             )
             total_loss = total_loss + strength_loss
             loss_breakdown.update(strength_breakdown)
             loss_breakdown["total_loss"] = float(total_loss.detach().item())
+        loss_breakdown["objective_groups"] = {
+            "amplitude_control": float(loss_breakdown.get("weighted_amplitude_control_loss", 0.0)),
+            "local_fidelity": float(loss_breakdown.get("weighted_local_fidelity_loss", 0.0)),
+            "preservation": float(loss_breakdown.get("weighted_preservation_loss", 0.0)),
+            "order_regularization": float(loss_breakdown.get("weighted_order_regularization_loss", 0.0)),
+            "diffusion_realism": float(loss_breakdown.get("weighted_diffusion_realism_loss", 0.0)),
+        }
         self._latest_loss_breakdown = loss_breakdown
         return total_loss
 
@@ -290,7 +328,24 @@ class ConditionalGenerator(nn.Module):
         numer = (values * mask).sum(dim=(1, 2))
         return numer / denom
 
-    def _strength_supervision_loss(self, src_x, tgt_x, tgt_x_pred, mask_gt, family_sizes=None, strength_label=None, return_breakdown=False):
+    def _format_scalar_key(self, value):
+        return f"{float(value):.4f}"
+
+    def _safe_spearman(self, x, y):
+        if x.numel() < 2 or y.numel() < 2 or x.numel() != y.numel():
+            return None
+        x = x.detach().float().view(-1)
+        y = y.detach().float().view(-1)
+        x_rank = torch.argsort(torch.argsort(x)).float()
+        y_rank = torch.argsort(torch.argsort(y)).float()
+        x_rank = x_rank - x_rank.mean()
+        y_rank = y_rank - y_rank.mean()
+        denom = torch.sqrt(torch.clamp((x_rank.square().sum() * y_rank.square().sum()), min=1.0e-12))
+        if float(denom.item()) <= 1.0e-12:
+            return None
+        return float((x_rank * y_rank).sum().item() / denom.item())
+
+    def _strength_supervision_loss(self, src_x, tgt_x, tgt_x_pred, mask_gt, family_sizes=None, strength_label=None, strength_scalar=None, instruction_text=None, return_breakdown=False):
         abs_pred_target = torch.abs(tgt_x_pred - tgt_x)
         abs_pred_source = torch.abs(tgt_x_pred - src_x)
         edit_mask = mask_gt
@@ -300,7 +355,14 @@ class ConditionalGenerator(nn.Module):
         background_l1 = src_x.new_tensor(0.0)
         monotonic_loss = src_x.new_tensor(0.0)
         gain_match_loss = src_x.new_tensor(0.0)
+        family_relative_gain_loss = src_x.new_tensor(0.0)
+        constant_gain_penalty = src_x.new_tensor(0.0)
+        numeric_only_gain_match_loss = src_x.new_tensor(0.0)
+        beta_direction_loss = src_x.new_tensor(0.0)
         weighted_losses = []
+
+        gains = self._masked_mean(abs_pred_source, edit_mask)
+        target_gains = self._masked_mean(torch.abs(tgt_x - src_x), edit_mask)
 
         if self.edit_region_loss_weight > 0.0:
             edit_region_l1 = self._masked_mean(abs_pred_target, edit_mask).mean()
@@ -308,47 +370,136 @@ class ConditionalGenerator(nn.Module):
         if self.background_loss_weight > 0.0:
             background_l1 = self._masked_mean(abs_pred_source, bg_mask).mean()
             weighted_losses.append(self.background_loss_weight * background_l1)
-
-        gains = self._masked_mean(abs_pred_source, edit_mask)
-        target_gains = self._masked_mean(torch.abs(tgt_x - src_x), edit_mask)
-
-        if self.monotonic_loss_weight > 0.0 and family_sizes is not None:
-            monotonic_losses = []
-            start_idx = 0
-            for family_size in family_sizes.detach().cpu().tolist():
-                family_size = int(family_size)
-                family_gains = gains[start_idx:start_idx + family_size]
-                family_target_gains = target_gains[start_idx:start_idx + family_size]
-                start_idx += family_size
-                if family_gains.numel() < 3:
-                    continue
-                weak_gain = family_gains[0]
-                medium_gain = family_gains[1]
-                strong_gain = family_gains[2]
-                weak_target = family_target_gains[0]
-                medium_target = family_target_gains[1]
-                strong_target = family_target_gains[2]
-                target_gap_wm = torch.clamp(medium_target - weak_target, min=self.monotonic_margin)
-                target_gap_ms = torch.clamp(strong_target - medium_target, min=self.monotonic_margin)
-                target_gap_ws = torch.clamp(strong_target - weak_target, min=self.monotonic_margin)
-                monotonic_losses.append(
-                    torch.relu(target_gap_wm - (medium_gain - weak_gain))
-                    + torch.relu(target_gap_ms - (strong_gain - medium_gain))
-                    + 0.5 * torch.relu(target_gap_ws - (strong_gain - weak_gain))
-                )
-            if monotonic_losses:
-                monotonic_loss = torch.stack(monotonic_losses).mean()
-                weighted_losses.append(self.monotonic_loss_weight * monotonic_loss)
-
         if self.gain_match_loss_weight > 0.0:
             gain_match_loss = torch.mean(torch.abs(gains - target_gains))
             weighted_losses.append(self.gain_match_loss_weight * gain_match_loss)
+
+        family_monotonic_losses = []
+        family_relative_losses = []
+        family_constant_penalties = []
+        family_beta_direction_losses = []
+        family_hits = []
+        family_rhos = []
+        numeric_only_mask = None
+        if isinstance(instruction_text, list):
+            numeric_only_mask = torch.tensor(
+                [len(str(text).strip()) == 0 for text in instruction_text],
+                device=src_x.device,
+                dtype=torch.bool,
+            )
+        elif isinstance(instruction_text, str):
+            numeric_only_mask = torch.tensor(
+                [len(str(instruction_text).strip()) == 0] * gains.shape[0],
+                device=src_x.device,
+                dtype=torch.bool,
+            )
+
+        if family_sizes is not None and strength_scalar is not None:
+            start_idx = 0
+            for family_size in family_sizes.detach().cpu().tolist():
+                family_size = int(family_size)
+                family_slice = slice(start_idx, start_idx + family_size)
+                family_scalar = strength_scalar[family_slice].view(-1)
+                family_gains = gains[family_slice]
+                family_target_gains = target_gains[family_slice]
+                family_numeric_only = None if numeric_only_mask is None else numeric_only_mask[family_slice]
+                start_idx += family_size
+                if family_scalar.numel() < 2:
+                    continue
+                order = torch.argsort(family_scalar)
+                family_scalar = family_scalar[order]
+                family_gains = family_gains[order]
+                family_target_gains = family_target_gains[order]
+                if family_numeric_only is not None:
+                    family_numeric_only = family_numeric_only[order]
+
+                family_hits.append(float(all(
+                    float(family_gains[idx + 1].item()) + 1.0e-6 >= float(family_gains[idx].item())
+                    for idx in range(family_gains.numel() - 1)
+                )))
+                rho = self._safe_spearman(family_scalar, family_gains)
+                if rho is not None:
+                    family_rhos.append(float(rho))
+
+                for idx in range(family_gains.numel() - 1):
+                    pred_gap = family_gains[idx + 1] - family_gains[idx]
+                    target_gap = family_target_gains[idx + 1] - family_target_gains[idx]
+                    required_gap = torch.clamp(target_gap * self.family_relative_margin_scale, min=self.monotonic_margin)
+                    if self.monotonic_loss_weight > 0.0:
+                        family_monotonic_losses.append(torch.relu(required_gap - pred_gap))
+                    if self.family_relative_gain_loss_weight > 0.0:
+                        norm_gap = required_gap / torch.clamp(family_target_gains[idx + 1] + family_target_gains[idx], min=1.0e-6)
+                        pred_norm_gap = pred_gap / torch.clamp(family_gains[idx + 1].detach() + family_gains[idx].detach(), min=1.0e-6)
+                        family_relative_losses.append(torch.abs(pred_norm_gap - norm_gap))
+                    if self.beta_direction_loss_weight > 0.0 and self.beta_direction_target == "family_signed_gain":
+                        direction_target = torch.sign(target_gap.detach())
+                        if float(direction_target.abs().item()) > 0.0:
+                            direction_margin = torch.clamp(target_gap.detach().abs(), min=self.beta_direction_margin)
+                            family_beta_direction_losses.append(torch.relu(direction_margin - (direction_target * pred_gap)))
+
+                if self.constant_gain_penalty_weight > 0.0 and family_gains.numel() > 1:
+                    family_gain_std = torch.std(family_gains, unbiased=False)
+                    family_constant_penalties.append(torch.relu(self.minimum_family_gain_std - family_gain_std))
+
+                if (
+                    self.numeric_only_loss_weight > 0.0
+                    and family_numeric_only is not None
+                    and bool(torch.any(family_numeric_only).item())
+                ):
+                    numeric_family_gains = family_gains[family_numeric_only]
+                    numeric_family_targets = family_target_gains[family_numeric_only]
+                    if numeric_family_gains.numel() > 0:
+                        family_loss = torch.mean(torch.abs(numeric_family_gains - numeric_family_targets))
+                        weighted_losses.append(self.numeric_only_loss_weight * family_loss)
+                        numeric_only_gain_match_loss = numeric_only_gain_match_loss + family_loss
+
+        if family_monotonic_losses:
+            monotonic_loss = torch.stack(family_monotonic_losses).mean()
+            weighted_losses.append(self.monotonic_loss_weight * monotonic_loss)
+        if family_relative_losses:
+            family_relative_gain_loss = torch.stack(family_relative_losses).mean()
+            weighted_losses.append(self.family_relative_gain_loss_weight * family_relative_gain_loss)
+        if family_constant_penalties:
+            constant_gain_penalty = torch.stack(family_constant_penalties).mean()
+            weighted_losses.append(self.constant_gain_penalty_weight * constant_gain_penalty)
+        if family_beta_direction_losses:
+            beta_direction_loss = torch.stack(family_beta_direction_losses).mean()
+            weighted_losses.append(self.beta_direction_loss_weight * beta_direction_loss)
 
         diag_payload = {
             'train_edit_gain_mean': float(gains.detach().mean().item()),
             'train_target_gain_mean': float(target_gains.detach().mean().item()),
             'train_gain_gap_abs_mean': float(torch.abs(gains - target_gains).detach().mean().item()),
+            'train_family_relative_gain_loss': float(family_relative_gain_loss.detach().item()),
+            'train_constant_gain_penalty': float(constant_gain_penalty.detach().item()),
+            'train_numeric_only_gain_match_loss': float(numeric_only_gain_match_loss.detach().item()),
+            'train_beta_direction_loss': float(beta_direction_loss.detach().item()),
         }
+        if strength_scalar is not None:
+            scalar_diag = {}
+            target_scalar_diag = {}
+            scalar_view = strength_scalar.detach().float().view(-1)
+            unique_scalars = sorted({float(value) for value in scalar_view.detach().cpu().tolist()})
+            for scalar_value in unique_scalars:
+                scalar_mask = torch.isclose(strength_scalar.view(-1), strength_scalar.new_tensor(float(scalar_value)), atol=1.0e-6, rtol=0.0)
+                if int(scalar_mask.sum().item()) == 0:
+                    continue
+                scalar_key = self._format_scalar_key(scalar_value)
+                scalar_diag[scalar_key] = float(gains[scalar_mask].detach().mean().item())
+                target_scalar_diag[scalar_key] = float(target_gains[scalar_mask].detach().mean().item())
+            diag_payload['train_edit_gain_by_scalar'] = scalar_diag
+            diag_payload['train_target_gain_by_scalar'] = target_scalar_diag
+            diag_payload['train_strength_scalar_mean'] = float(strength_scalar.detach().float().mean().item())
+            if strength_scalar.numel() > 1:
+                scalar_vec = strength_scalar.detach().float().view(-1)
+                gain_vec = gains.detach().float().view(-1)
+                scalar_centered = scalar_vec - scalar_vec.mean()
+                gain_centered = gain_vec - gain_vec.mean()
+                denom = torch.sqrt(torch.clamp((scalar_centered.square().sum() * gain_centered.square().sum()), min=1.0e-12))
+                diag_payload['train_edit_gain_scalar_corr'] = float((scalar_centered * gain_centered).sum().item() / denom.item())
+                spearman = self._safe_spearman(scalar_vec, gain_vec)
+                if spearman is not None:
+                    diag_payload['train_edit_gain_scalar_spearman'] = spearman
         if strength_label is not None:
             strength_diag = {}
             target_strength_diag = {}
@@ -361,6 +512,12 @@ class ConditionalGenerator(nn.Module):
                 target_strength_diag[str(label)] = float(target_gains[label_mask].detach().mean().item())
             diag_payload['train_edit_gain_by_strength'] = strength_diag
             diag_payload['train_target_gain_by_strength'] = target_strength_diag
+        if family_hits:
+            diag_payload['train_family_monotonic_hit_rate'] = float(sum(family_hits) / len(family_hits))
+        if family_rhos:
+            diag_payload['train_family_gain_scalar_spearman_mean'] = float(sum(family_rhos) / len(family_rhos))
+        if numeric_only_mask is not None:
+            diag_payload['train_numeric_only_batch_fraction'] = float(numeric_only_mask.float().mean().item())
         if self.__class__._strength_diag_enabled:
             self._record_strength_diagnostics(diag_payload)
 
@@ -370,15 +527,47 @@ class ConditionalGenerator(nn.Module):
             total_loss = src_x.new_tensor(0.0)
         if not return_breakdown:
             return total_loss
+        weighted_gain_match_loss = float((self.gain_match_loss_weight * gain_match_loss).detach().item()) if self.gain_match_loss_weight > 0.0 else 0.0
+        weighted_family_relative_gain_loss = float((self.family_relative_gain_loss_weight * family_relative_gain_loss).detach().item()) if self.family_relative_gain_loss_weight > 0.0 else 0.0
+        weighted_constant_gain_penalty = float((self.constant_gain_penalty_weight * constant_gain_penalty).detach().item()) if self.constant_gain_penalty_weight > 0.0 else 0.0
+        weighted_numeric_only_gain_match_loss = float((self.numeric_only_loss_weight * numeric_only_gain_match_loss).detach().item()) if self.numeric_only_loss_weight > 0.0 else 0.0
+        weighted_beta_direction_loss = float((self.beta_direction_loss_weight * beta_direction_loss).detach().item()) if self.beta_direction_loss_weight > 0.0 else 0.0
+        weighted_amplitude_control_loss = (
+            weighted_gain_match_loss
+            + weighted_family_relative_gain_loss
+            + weighted_constant_gain_penalty
+            + weighted_numeric_only_gain_match_loss
+            + weighted_beta_direction_loss
+        )
         breakdown = {
             'edit_region_loss': float(edit_region_l1.detach().item()),
             'background_loss': float(background_l1.detach().item()),
             'monotonic_loss': float(monotonic_loss.detach().item()),
             'gain_match_loss': float(gain_match_loss.detach().item()),
+            'family_relative_gain_loss': float(family_relative_gain_loss.detach().item()),
+            'constant_gain_penalty': float(constant_gain_penalty.detach().item()),
+            'numeric_only_gain_match_loss': float(numeric_only_gain_match_loss.detach().item()),
+            'beta_direction_loss': float(beta_direction_loss.detach().item()),
+            'amplitude_control_loss': float((gain_match_loss + family_relative_gain_loss + constant_gain_penalty + numeric_only_gain_match_loss + beta_direction_loss).detach().item()),
+            'local_fidelity_loss': float(edit_region_l1.detach().item()),
+            'preservation_loss': float(background_l1.detach().item()),
+            'order_regularization_loss': float(monotonic_loss.detach().item()),
             'weighted_edit_region_loss': float((self.edit_region_loss_weight * edit_region_l1).detach().item()) if self.edit_region_loss_weight > 0.0 else 0.0,
             'weighted_background_loss': float((self.background_loss_weight * background_l1).detach().item()) if self.background_loss_weight > 0.0 else 0.0,
             'weighted_monotonic_loss': float((self.monotonic_loss_weight * monotonic_loss).detach().item()) if self.monotonic_loss_weight > 0.0 else 0.0,
-            'weighted_gain_match_loss': float((self.gain_match_loss_weight * gain_match_loss).detach().item()) if self.gain_match_loss_weight > 0.0 else 0.0,
+            'weighted_gain_match_loss': weighted_gain_match_loss,
+            'weighted_family_relative_gain_loss': weighted_family_relative_gain_loss,
+            'weighted_constant_gain_penalty': weighted_constant_gain_penalty,
+            'weighted_numeric_only_gain_match_loss': weighted_numeric_only_gain_match_loss,
+            'weighted_beta_direction_loss': weighted_beta_direction_loss,
+            'weighted_amplitude_control_loss': weighted_amplitude_control_loss,
+            'weighted_local_fidelity_loss': float((self.edit_region_loss_weight * edit_region_l1).detach().item()) if self.edit_region_loss_weight > 0.0 else 0.0,
+            'weighted_preservation_loss': float((self.background_loss_weight * background_l1).detach().item()) if self.background_loss_weight > 0.0 else 0.0,
+            'weighted_order_regularization_loss': float((self.monotonic_loss_weight * monotonic_loss).detach().item()) if self.monotonic_loss_weight > 0.0 else 0.0,
+            'family_relative_gain_loss_weight': float(self.family_relative_gain_loss_weight),
+            'constant_gain_penalty_weight': float(self.constant_gain_penalty_weight),
+            'numeric_only_loss_weight': float(self.numeric_only_loss_weight),
+            'beta_direction_loss_weight': float(self.beta_direction_loss_weight),
             'strength_total_loss': float(total_loss.detach().item()),
         }
         return total_loss, breakdown
@@ -422,6 +611,9 @@ class ConditionalGenerator(nn.Module):
         strength_label = batch.get("strength_label")
         if strength_label is not None:
             strength_label = strength_label.to(self.device).long()
+        strength_scalar = batch.get("strength_scalar")
+        if strength_scalar is not None:
+            strength_scalar = strength_scalar.to(self.device).float().view(-1)
         task_id = batch.get("task_id")
         if task_id is not None:
             task_id = task_id.to(self.device).long()
@@ -434,7 +626,7 @@ class ConditionalGenerator(nn.Module):
             instruction_text = [str(item) for item in instruction_text]
         else:
             instruction_text = None
-        return src_x, tp, src_attrs, tgt_attrs, tgt_x, strength_label, task_id, instruction_text
+        return src_x, tp, src_attrs, tgt_attrs, tgt_x, strength_label, strength_scalar, task_id, instruction_text
 
     """
     Generation.
@@ -456,7 +648,7 @@ class ConditionalGenerator(nn.Module):
         return torch.stack(sample_tensors), diagnostics
 
     def cond_gen(self, batch, n_samples, sampler="ddpm", return_diagnostics=False):
-        src_x, tp, src_attrs, tgt_attrs, tgt_x, strength_label, task_id, instruction_text = self._unpack_data_edit(batch)
+        src_x, tp, src_attrs, tgt_attrs, tgt_x, strength_label, strength_scalar, task_id, instruction_text = self._unpack_data_edit(batch)
 
         side_emb = self.side_en(tp)
         attr_emb = self.attr_en(tgt_attrs)
@@ -467,20 +659,20 @@ class ConditionalGenerator(nn.Module):
             x = torch.randn_like(src_x)
             for t in range(self.num_steps-1, -1, -1):
                 noise = torch.randn_like(x)  # noise for std
+                t_tensor = torch.full((B,), t, device=self.device, dtype=torch.long)
                 pred_noise = self.predict_noise(
                     x,
                     side_emb,
                     attr_emb,
-                    t,
+                    t_tensor,
                     strength_label=strength_label,
                     task_id=task_id,
                     text_context=instruction_text,
                 )
-                t = (torch.ones(B, device=self.device) * t).long()
                 if sampler == "ddpm":
-                    x = self.ddpm.reverse(x, pred_noise, t, noise)
+                    x = self.ddpm.reverse(x, pred_noise, t_tensor, noise)
                 else:
-                    x = self.ddim.reverse(x, pred_noise, t, noise, is_determin=True)
+                    x = self.ddim.reverse(x, pred_noise, t_tensor, noise, is_determin=True)
             samples.append(x)
         return torch.stack(samples)
     
@@ -489,7 +681,7 @@ class ConditionalGenerator(nn.Module):
         Args:
            sampler: forward-backward: ddim-ddim or ddim.
         """
-        src_x, tp, src_attrs, tgt_attrs, tgt_x, strength_label, task_id, instruction_text = self._unpack_data_edit(batch)
+        src_x, tp, src_attrs, tgt_attrs, tgt_x, strength_label, strength_scalar, task_id, instruction_text = self._unpack_data_edit(batch)
 
         side_emb = self.side_en(tp)
         src_attr_emb = self.attr_en(src_attrs)
@@ -504,6 +696,7 @@ class ConditionalGenerator(nn.Module):
                 tgt_attr_emb,
                 sampler,
                 strength_label=strength_label,
+                strength_scalar=strength_scalar,
                 task_id=task_id,
                 text_context=instruction_text,
                 return_diagnostics=return_diagnostics,
@@ -515,7 +708,7 @@ class ConditionalGenerator(nn.Module):
                 samples.append({"sample": tgt_x_pred, "diagnostics": None})
         return self._stack_sample_outputs(samples, return_diagnostics=return_diagnostics)
 
-    def _edit(self, src_x, side_emb, src_attr_emb, tgt_attr_emb, sampler, strength_label=None, task_id=None, text_context=None, return_diagnostics=False):
+    def _edit(self, src_x, side_emb, src_attr_emb, tgt_attr_emb, sampler, strength_label=None, strength_scalar=None, task_id=None, text_context=None, return_diagnostics=False):
         B = src_x.shape[0]
 
         # forward
@@ -544,6 +737,7 @@ class ConditionalGenerator(nn.Module):
                 tgt_attr_emb,
                 t,
                 strength_label=strength_label,
+                strength_scalar=strength_scalar,
                 task_id=task_id,
                 text_context=text_context,
             )
@@ -624,7 +818,7 @@ class ConditionalGenerator(nn.Module):
         Returns:
             torch.Tensor: Edited samples (n_samples, B, K, L)
         """
-        src_x, tp, src_attrs, tgt_attrs, tgt_x, strength_label, task_id, instruction_text = self._unpack_data_edit(batch)
+        src_x, tp, src_attrs, tgt_attrs, tgt_x, strength_label, strength_scalar, task_id, instruction_text = self._unpack_data_edit(batch)
 
         side_emb = self.side_en(tp)
         src_attr_emb = self.attr_en(src_attrs)
@@ -644,6 +838,7 @@ class ConditionalGenerator(nn.Module):
                 sampler,
                 soft_mask,
                 strength_label=strength_label,
+                strength_scalar=strength_scalar,
                 task_id=task_id,
                 text_context=instruction_text,
                 return_diagnostics=return_diagnostics,
@@ -657,7 +852,7 @@ class ConditionalGenerator(nn.Module):
         return self._stack_sample_outputs(samples, return_diagnostics=return_diagnostics)
 
     @torch.no_grad()
-    def _edit_soft(self, src_x, side_emb, src_attr_emb, tgt_attr_emb, sampler, soft_mask, strength_label=None, task_id=None, text_context=None, return_diagnostics=False):
+    def _edit_soft(self, src_x, side_emb, src_attr_emb, tgt_attr_emb, sampler, soft_mask, strength_label=None, strength_scalar=None, task_id=None, text_context=None, return_diagnostics=False):
         """
         Core Innovation: Latent Blending (State-Space Mixing) for Ground-Truth Preservation.
 
@@ -731,6 +926,7 @@ class ConditionalGenerator(nn.Module):
             pred_noise_tgt = self.predict_noise(
                 xt, side_emb, tgt_attr_emb, t_tensor,
                 strength_label=strength_label,
+                strength_scalar=strength_scalar,
                 task_id=task_id,
                 text_context=text_context,
                 soft_mask=soft_mask_attn,

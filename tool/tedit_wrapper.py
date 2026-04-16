@@ -163,6 +163,49 @@ class TEditWrapper:
         except Exception as e:
             raise RuntimeError(f"Failed to load TEdit model: {e}")
 
+    def _normalize_numeric_control(self, value: Optional[int | float | List[int] | List[float] | np.ndarray], batch_size: int, *, dtype: torch.dtype, name: str) -> Optional[torch.Tensor]:
+        if value is None:
+            return None
+        if np.isscalar(value):
+            return torch.full((batch_size,), value, device=self.device, dtype=dtype)
+        values = np.asarray(value)
+        if values.ndim == 0:
+            return torch.full((batch_size,), values.item(), device=self.device, dtype=dtype)
+        values = values.reshape(-1)
+        if values.shape[0] != batch_size:
+            raise ValueError(f"{name} length must match batch size {batch_size}, got {values.shape[0]}")
+        return torch.as_tensor(values, device=self.device, dtype=dtype)
+
+    def _normalize_text_control(self, instruction_text: Optional[np.ndarray | str | List[str] | Tuple[str, ...]], batch_size: int):
+        if instruction_text is None:
+            return None
+        if isinstance(instruction_text, str):
+            return [instruction_text] * batch_size
+        if isinstance(instruction_text, (list, tuple)):
+            text_list = [str(item) for item in instruction_text]
+            if len(text_list) == 1 and batch_size > 1:
+                return text_list * batch_size
+            if len(text_list) != batch_size:
+                raise ValueError(f"instruction_text length must match batch size {batch_size}, got {len(text_list)}")
+            return text_list
+        text_tensor = torch.as_tensor(instruction_text, device=self.device)
+        if text_tensor.dim() == 0:
+            raise ValueError("instruction_text tensor must have a batch dimension")
+        if text_tensor.shape[0] != batch_size:
+            raise ValueError(f"instruction_text batch size must match {batch_size}, got {text_tensor.shape[0]}")
+        return text_tensor
+
+    def _format_sample_output(self, sample_tensor: torch.Tensor, *, input_was_vector: bool):
+        output = sample_tensor.detach().cpu().numpy()
+        if output.ndim != 4:
+            raise ValueError(f"Unexpected generated sample shape: {output.shape}")
+        output = np.squeeze(output, axis=2)  # [n_samples, B, L]
+        if output.shape[0] == 1:
+            output = output[0]
+        if input_was_vector and output.ndim == 3 and output.shape[1] == 1:
+            output = output[:, 0, :]
+        return output
+
     def edit_time_series(
         self,
         ts: np.ndarray,
@@ -172,10 +215,12 @@ class TEditWrapper:
         sampler: str = "ddim",
         edit_steps: Optional[int] = None,
         strength_label: Optional[int] = None,
+        strength_scalar: Optional[float] = None,
         task_id: Optional[int] = None,
         instruction_text: Optional[np.ndarray] = None,
         return_diagnostics: bool = False,
         enable_strength_diagnostics: bool = False,
+        flip_beta_sign_inference: bool = False,
     ) -> np.ndarray:
         """Edit time series using TEdit model.
 
@@ -197,6 +242,7 @@ class TEditWrapper:
             raise RuntimeError("TEdit model is not loaded. Call load_model() first.")
 
         ts_array = np.asarray(ts, dtype=np.float32)
+        input_was_vector = ts_array.ndim == 1
         if ts_array.ndim == 1:
             ts_array = ts_array.reshape(1, -1)
 
@@ -236,41 +282,72 @@ class TEditWrapper:
                 "tgt_x": x.permute(0, 2, 1),
                 "tp": tp,
             }
-            if strength_label is not None:
-                batch["strength_label"] = torch.full((B,), int(strength_label), device=self.device, dtype=torch.long)
-            if task_id is not None:
-                batch["task_id"] = torch.full((B,), int(task_id), device=self.device, dtype=torch.long)
-            if instruction_text is not None:
-                if isinstance(instruction_text, (str, list, tuple)):
-                    batch["instruction_text"] = instruction_text
-                else:
-                    batch["instruction_text"] = torch.as_tensor(instruction_text, device=self.device)
+            strength_label_tensor = self._normalize_numeric_control(strength_label, B, dtype=torch.long, name="strength_label")
+            strength_scalar_tensor = self._normalize_numeric_control(strength_scalar, B, dtype=torch.float32, name="strength_scalar")
+            task_id_tensor = self._normalize_numeric_control(task_id, B, dtype=torch.long, name="task_id")
+            instruction_payload = self._normalize_text_control(instruction_text, B)
+            if strength_label_tensor is not None:
+                batch["strength_label"] = strength_label_tensor
+            if strength_scalar_tensor is not None:
+                batch["strength_scalar"] = strength_scalar_tensor
+            if task_id_tensor is not None:
+                batch["task_id"] = task_id_tensor
+            if instruction_payload is not None:
+                batch["instruction_text"] = instruction_payload
 
             if edit_steps is not None:
                 self.model.edit_steps = edit_steps
 
-            if enable_strength_diagnostics:
-                if StrengthProjector is not None:
-                    StrengthProjector.enable_diagnostics(True)
-                if ResidualBlockBase is not None:
+            if StrengthProjector is not None and enable_strength_diagnostics:
+                StrengthProjector.enable_diagnostics(True)
+            if ResidualBlockBase is not None:
+                if enable_strength_diagnostics:
                     ResidualBlockBase.enable_diagnostics(True)
-                if ResidualBlockWeaver is not None:
+                ResidualBlockBase.set_flip_beta_sign_inference(flip_beta_sign_inference)
+            if ResidualBlockWeaver is not None:
+                if enable_strength_diagnostics:
                     ResidualBlockWeaver.enable_diagnostics(True)
-                if ConditionalGenerator is not None:
-                    ConditionalGenerator.enable_strength_diagnostics(True)
+                ResidualBlockWeaver.set_flip_beta_sign_inference(flip_beta_sign_inference)
+            if ConditionalGenerator is not None and enable_strength_diagnostics:
+                ConditionalGenerator.enable_strength_diagnostics(True)
 
-            samples = self.model.generate(
-                batch,
-                n_samples=n_samples,
-                mode="edit",
-                sampler=sampler,
-                return_diagnostics=return_diagnostics,
-            )
+            try:
+                samples = self.model.generate(
+                    batch,
+                    n_samples=n_samples,
+                    mode="edit",
+                    sampler=sampler,
+                    return_diagnostics=return_diagnostics,
+                )
+            finally:
+                if ResidualBlockBase is not None:
+                    ResidualBlockBase.set_flip_beta_sign_inference(False)
+                if ResidualBlockWeaver is not None:
+                    ResidualBlockWeaver.set_flip_beta_sign_inference(False)
+                if not enable_strength_diagnostics:
+                    if StrengthProjector is not None:
+                        StrengthProjector.consume_diagnostics()
+                    if ConditionalGenerator is not None:
+                        ConditionalGenerator.consume_strength_diagnostics()
+                    if ResidualBlockBase is not None:
+                        ResidualBlockBase.consume_diagnostics()
+                    if ResidualBlockWeaver is not None:
+                        ResidualBlockWeaver.consume_diagnostics()
+                else:
+                    if StrengthProjector is not None:
+                        StrengthProjector.disable_diagnostics()
+                    if ResidualBlockBase is not None:
+                        ResidualBlockBase.disable_diagnostics()
+                    if ResidualBlockWeaver is not None:
+                        ResidualBlockWeaver.disable_diagnostics()
+                    if ConditionalGenerator is not None:
+                        ConditionalGenerator.enable_strength_diagnostics(False)
+
 
         diagnostics = None
         if return_diagnostics:
             sample_tensor, model_diagnostics = samples
-            edited_ts = sample_tensor.cpu().numpy().squeeze(1)
+            edited_ts = self._format_sample_output(sample_tensor, input_was_vector=input_was_vector)
             diagnostics = {
                 "model": model_diagnostics,
                 "projector": [] if StrengthProjector is None else StrengthProjector.consume_diagnostics(),
@@ -291,7 +368,7 @@ class TEditWrapper:
             if ConditionalGenerator is not None:
                 ConditionalGenerator.consume_strength_diagnostics()
 
-        return edited_ts
+        return self._format_sample_output(samples, input_was_vector=input_was_vector)
 
     def edit_region(
         self,
@@ -303,6 +380,7 @@ class TEditWrapper:
         n_samples: int = 1,
         sampler: str = "ddim",
         strength_label: Optional[int] = None,
+        strength_scalar: Optional[float] = None,
         task_id: Optional[int] = None,
         instruction_text: Optional[np.ndarray] = None,
     ) -> np.ndarray:
@@ -332,6 +410,7 @@ class TEditWrapper:
             src_attrs,
             tgt_attrs,
             strength_label=strength_label,
+            strength_scalar=strength_scalar,
             task_id=task_id,
             instruction_text=instruction_text,
             n_samples=n_samples,
@@ -412,6 +491,7 @@ class TEditWrapper:
         sampler: str = "ddim",
         smooth_radius: float = 3.0,
         strength_label: Optional[int] = None,
+        strength_scalar: Optional[float] = None,
         task_id: Optional[int] = None,
         instruction_text: Optional[np.ndarray] = None,
     ) -> np.ndarray:
@@ -449,6 +529,7 @@ class TEditWrapper:
             raise RuntimeError("TEdit model is not loaded. Call load_model() first.")
 
         ts_array = np.asarray(ts, dtype=np.float32)
+        input_was_vector = ts_array.ndim == 1
         if ts_array.ndim == 1:
             ts_array = ts_array.reshape(1, -1)
 
@@ -480,15 +561,18 @@ class TEditWrapper:
                 "tgt_x": x.permute(0, 2, 1),
                 "tp": tp,
             }
-            if strength_label is not None:
-                batch["strength_label"] = torch.full((B,), int(strength_label), device=self.device, dtype=torch.long)
-            if task_id is not None:
-                batch["task_id"] = torch.full((B,), int(task_id), device=self.device, dtype=torch.long)
-            if instruction_text is not None:
-                if isinstance(instruction_text, (str, list, tuple)):
-                    batch["instruction_text"] = instruction_text
-                else:
-                    batch["instruction_text"] = torch.as_tensor(instruction_text, device=self.device)
+            strength_label_tensor = self._normalize_numeric_control(strength_label, B, dtype=torch.long, name="strength_label")
+            strength_scalar_tensor = self._normalize_numeric_control(strength_scalar, B, dtype=torch.float32, name="strength_scalar")
+            task_id_tensor = self._normalize_numeric_control(task_id, B, dtype=torch.long, name="task_id")
+            instruction_payload = self._normalize_text_control(instruction_text, B)
+            if strength_label_tensor is not None:
+                batch["strength_label"] = strength_label_tensor
+            if strength_scalar_tensor is not None:
+                batch["strength_scalar"] = strength_scalar_tensor
+            if task_id_tensor is not None:
+                batch["task_id"] = task_id_tensor
+            if instruction_payload is not None:
+                batch["instruction_text"] = instruction_payload
 
             samples = self.model.edit_soft(
                 batch,
@@ -497,9 +581,8 @@ class TEditWrapper:
                 soft_mask=soft_mask
             )
 
-        edited_ts = samples.cpu().numpy().squeeze(1)
-        
-        if np.asarray(ts).ndim == 1:
+        edited_ts = self._format_sample_output(samples, input_was_vector=input_was_vector)
+        if input_was_vector and isinstance(edited_ts, np.ndarray) and edited_ts.ndim == 2 and edited_ts.shape[0] == 1:
             return edited_ts[0]
         return edited_ts
 

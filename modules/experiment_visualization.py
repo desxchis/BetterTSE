@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from pathlib import Path
+import textwrap
 from typing import Any, Dict, Optional
 
 import matplotlib
@@ -133,11 +134,11 @@ def save_forecast_revision_visualization(
     context_text: str,
     metrics: Dict[str, Any],
     save_path: Path,
+    display_text: str | None = None,
 ) -> None:
-    fig, axes = plt.subplots(3, 1, figsize=(14, 11), sharex=False)
+    fig, axes = plt.subplots(2, 1, figsize=(14, 10.5), sharex=False)
     fig.suptitle(
-        f"Forecast Revision | Sample {sample_id}\n"
-        f"Context: {context_text[:140]}{'...' if len(context_text) > 140 else ''}",
+        f"Forecast Revision | Sample {sample_id}",
         fontsize=10,
     )
 
@@ -161,34 +162,16 @@ def save_forecast_revision_visualization(
     ax.plot(edit_x, edit_y, color="seagreen", lw=1.6, label="Edited forecast")
     ax.plot(target_x, target_y, color="crimson", lw=1.6, ls="--", label="Revision target")
     ax.axvspan(len(history_ts) + gt_region[0], len(history_ts) + gt_region[1], color="gold", alpha=0.18, label="GT edit")
-    ax.axvspan(len(history_ts) + pred_region[0], len(history_ts) + pred_region[1], color="mediumpurple", alpha=0.12, label="Pred edit")
     ax.set_title("History and forecast horizon")
     ax.grid(True, alpha=0.3)
     ax.legend(fontsize=8, loc="upper right")
 
     ax = axes[1]
-    base_delta = revision_target - base_forecast
-    pred_delta = edited_forecast - base_forecast
-    ax.plot(np.arange(len(base_delta)), base_delta, color="crimson", lw=1.6, ls="--", label="GT delta")
-    ax.plot(np.arange(len(pred_delta)), pred_delta, color="seagreen", lw=1.6, label="Pred delta")
-    ax.axhline(0, color="black", lw=0.8)
-    ax.axvspan(gt_region[0], gt_region[1], color="gold", alpha=0.18)
-    ax.axvspan(pred_region[0], pred_region[1], color="mediumpurple", alpha=0.12)
-    ax.set_title("Revision delta")
-    ax.grid(True, alpha=0.3)
-    ax.legend(fontsize=8, loc="upper right")
-
-    ax = axes[2]
-    metric_text = (
-        f"MAE(base,target)={metrics.get('base_mae_vs_revision_target', 0.0):.3f}\n"
-        f"MAE(edit,target)={metrics.get('edited_mae_vs_revision_target', 0.0):.3f}\n"
-        f"Revision Gain={metrics.get('revision_gain', 0.0):.3f}\n"
-        f"future t-IoU={metrics.get('future_t_iou', 0.0):.3f}\n"
-        f"Mag Err={metrics.get('magnitude_calibration_error', 0.0):.3f}\n"
-        f"Over-edit={metrics.get('over_edit_rate', 0.0):.3f}"
-    )
+    raw_display = display_text if display_text is not None else context_text
+    wrapped_context = "\n".join(textwrap.wrap(str(raw_display or ""), width=115, break_long_words=False, break_on_hyphens=False))
     ax.axis("off")
-    ax.text(0.01, 0.98, metric_text, va="top", ha="left", fontsize=11)
+    ax.text(0.01, 0.98, "Prompt Text", va="top", ha="left", fontsize=11, fontweight="bold")
+    ax.text(0.01, 0.90, wrapped_context, va="top", ha="left", fontsize=9.5)
 
     plt.tight_layout()
     fig.savefig(save_path, dpi=130, bbox_inches="tight")

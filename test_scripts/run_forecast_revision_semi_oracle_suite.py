@@ -104,7 +104,7 @@ def main() -> None:
     parser.add_argument(
         "--calibration-strategy",
         default="rule_local_stats",
-        choices=["text_direct_numeric", "discrete_strength_table", "rule_local_stats", "learned_linear"],
+        choices=["text_direct_numeric", "discrete_strength_table", "rule_local_stats", "learned_linear", "learned_rule_guarded", "learned_rule_shrunk", "learned_confidence_gated", "learned_reliability_gated"],
     )
     parser.add_argument("--calibration-model", default=None)
     args = parser.parse_args()

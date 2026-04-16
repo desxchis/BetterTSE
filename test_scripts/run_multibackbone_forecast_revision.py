@@ -14,10 +14,17 @@ if str(ROOT) not in sys.path:
 
 from run_forecast_revision import run_revision
 from test_scripts.build_forecast_revision_benchmark import build_benchmark
+from test_scripts.build_timemmd_projected_revision_benchmark import build_timemmd_projected_benchmark
 
 
-EXAMPLE_BACKBONES = ["patchtst", "dlinear_official", "lstm_official"]
-DEFAULT_MODES = ["base_only", "localized_full_revision"]
+EXAMPLE_BACKBONES = ["dlinear_official", "patchtst"]
+DEFAULT_MODES = [
+    "base_only",
+    "heuristic_revision",
+    "direct_delta_regression",
+    "wo_parameter_calibration",
+    "localized_full_revision",
+]
 
 
 def _parse_key_value_pairs(items: Iterable[str]) -> Dict[str, str]:
@@ -169,6 +176,12 @@ def _summary_row(
     }
 
 
+def _benchmark_metadata_for_kind(dataset_kind: str) -> tuple[str, str]:
+    if dataset_kind == "timemmd":
+        return "future_guided_projection", "future_guided_projected_revision"
+    return "synthetic_physical_injection", "controlled_synthetic_revision"
+
+
 def _format_value(value: Any) -> str:
     if value is None:
         return "NA"
@@ -214,7 +227,8 @@ def _write_markdown_report(
             "- Pure editing remains the method core; this report only covers the downstream forecast-revision line.",
             "- The listed backbones are only the ones selected for this run; they are not a locked global backbone set.",
             "- Newer forecasting models can be integrated as long as they produce a compatible `base_forecast`.",
-            "- The current benchmark builder uses controlled synthetic physical injection for revision targets.",
+            "- This report currently covers the controlled synthetic revision regime built from physical injection on top of `base_forecast`.",
+            "- The future-guided projected revision regime should be reported separately when using projected benchmark builders.",
             "",
         ]
     )
@@ -240,6 +254,7 @@ def run_multibackbone_experiment(
     mtbench_limit: int | None,
     timemmd_root: str,
     timemmd_domain: str,
+    timemmd_text_source: str,
     seq_len: int,
     pred_len: int,
     num_samples: int,
@@ -270,7 +285,7 @@ def run_multibackbone_experiment(
     comparison_rows: List[Dict[str, Any]] = []
     task_family = "forecast_revision"
     application_of = "bettertse_editing"
-    target_construction_method = "synthetic_physical_injection"
+    target_construction_method, target_regime = _benchmark_metadata_for_kind(dataset_kind)
 
     for baseline_name in baseline_names:
         model_dir = baseline_model_dirs.get(baseline_name)
@@ -305,19 +320,32 @@ def run_multibackbone_experiment(
             )
             model_dir = str(prepared_dir)
 
-        benchmark_summary = build_benchmark(
-            csv_path=csv_path or "",
-            dataset_name=dataset_name,
-            output_dir=str(benchmark_root / baseline_name),
-            baseline_name=baseline_name,
-            baseline_model_dir=model_dir,
-            seq_len=seq_len,
-            pred_len=pred_len,
-            num_samples=num_samples,
-            target_col=target_col,
-            include_no_revision_every=include_no_revision_every,
-            context_style=context_style,
-        )
+        if dataset_kind == "timemmd":
+            benchmark_summary = build_timemmd_projected_benchmark(
+                timemmd_root=timemmd_root,
+                domain=timemmd_domain,
+                output_dir=str(benchmark_root / baseline_name),
+                baseline_name=baseline_name,
+                baseline_model_dir=model_dir,
+                seq_len=seq_len,
+                pred_len=pred_len,
+                max_samples=num_samples,
+                text_source=timemmd_text_source,
+            )
+        else:
+            benchmark_summary = build_benchmark(
+                csv_path=csv_path or "",
+                dataset_name=dataset_name,
+                output_dir=str(benchmark_root / baseline_name),
+                baseline_name=baseline_name,
+                baseline_model_dir=model_dir,
+                seq_len=seq_len,
+                pred_len=pred_len,
+                num_samples=num_samples,
+                target_col=target_col,
+                include_no_revision_every=include_no_revision_every,
+                context_style=context_style,
+            )
         benchmark_path = benchmark_summary["output_path"]
 
         mode_payloads: Dict[str, Any] = {}
@@ -359,6 +387,7 @@ def run_multibackbone_experiment(
             "task_family": task_family,
             "application_of": application_of,
             "target_construction_method": target_construction_method,
+            "target_regime": target_regime,
             "modes": mode_payloads,
         }
 
@@ -372,6 +401,7 @@ def run_multibackbone_experiment(
         "task_family": task_family,
         "application_of": application_of,
         "target_construction_method": target_construction_method,
+        "target_regime": target_regime,
         "modes": modes,
         "baseline_names": baseline_names,
         "comparison_rows": comparison_rows,
@@ -403,6 +433,7 @@ def main() -> None:
     parser.add_argument("--mtbench-limit", type=int, default=None)
     parser.add_argument("--timemmd-root", default="data/Time-MMD")
     parser.add_argument("--timemmd-domain", default="Energy")
+    parser.add_argument("--timemmd-text-source", choices=["report", "search", "all"], default="report")
     parser.add_argument("--baseline-names", nargs="+", default=list(EXAMPLE_BACKBONES), help="Backbones to include in this run. Defaults to example repo-supported backbones, not a locked project-wide set.")
     parser.add_argument("--baseline-model-dir", action="append", default=[], help="Repeat NAME=PATH for pre-trained baselines.")
     parser.add_argument("--prepare-missing-baselines", action="store_true")
@@ -429,10 +460,6 @@ def main() -> None:
 
     if args.dataset_kind == "csv" and not args.csv_path:
         raise ValueError("--csv-path is required when --dataset-kind=csv")
-    if args.dataset_kind != "csv":
-        raise ValueError(
-            "run_multibackbone_forecast_revision.py currently supports benchmark construction only for --dataset-kind=csv."
-        )
     if args.dataset_kind == "xtraffic" and not args.xtraffic_data_dir:
         raise ValueError("--xtraffic-data-dir is required when --dataset-kind=xtraffic")
     if args.dataset_kind == "mtbench" and not args.mtbench_path:
@@ -456,6 +483,7 @@ def main() -> None:
         mtbench_limit=args.mtbench_limit,
         timemmd_root=args.timemmd_root,
         timemmd_domain=args.timemmd_domain,
+        timemmd_text_source=args.timemmd_text_source,
         seq_len=args.seq_len,
         pred_len=args.pred_len,
         num_samples=args.num_samples,

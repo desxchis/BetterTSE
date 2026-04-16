@@ -11,7 +11,7 @@ from torch.utils.data import DataLoader, Dataset
 
 
 STRENGTH_ORDER = {"weak": 0, "medium": 1, "strong": 2}
-STRENGTH_SEQUENCE = ["weak", "medium", "strong"]
+LEGACY_STRENGTH_TO_SCALAR = {"weak": 0.0, "medium": 0.5, "strong": 1.0}
 FLOAT_TOL = 1.0e-6
 
 
@@ -48,13 +48,24 @@ def _family_metadata_signature(sample: Dict[str, Any]) -> Tuple[Any, ...]:
 def _validate_family(family: Dict[str, Any]) -> List[Dict[str, Any]]:
     family_id = str(family.get("family_id"))
     samples = [dict(sample) for sample in family.get("samples", [])]
-    if len(samples) != 3:
-        raise ValueError(f"Family {family_id} must contain exactly 3 samples, got {len(samples)}")
+    if len(samples) < 2:
+        raise ValueError(f"Family {family_id} must contain at least 2 samples, got {len(samples)}")
 
-    samples = sorted(samples, key=lambda sample: STRENGTH_ORDER[str(sample["strength_text"])])
-    strength_texts = [str(sample["strength_text"]) for sample in samples]
-    if strength_texts != STRENGTH_SEQUENCE:
-        raise ValueError(f"Family {family_id} strengths must be ordered weak/medium/strong, got {strength_texts}")
+    for sample in samples:
+        strength_text = str(sample.get("strength_text", ""))
+        strength_scalar = sample.get("strength_scalar")
+        if strength_scalar is None:
+            strength_scalar = LEGACY_STRENGTH_TO_SCALAR.get(strength_text)
+        if strength_scalar is None:
+            raise ValueError(f"Family {family_id} sample is missing strength_scalar and has unknown strength_text={strength_text}")
+        sample["strength_scalar"] = float(strength_scalar)
+        if sample.get("strength_label") is None and strength_text in STRENGTH_ORDER:
+            sample["strength_label"] = int(STRENGTH_ORDER[strength_text])
+
+    samples = sorted(samples, key=lambda sample: float(sample["strength_scalar"]))
+    strength_scalars = [float(sample["strength_scalar"]) for sample in samples]
+    if any((right - left) <= FLOAT_TOL for left, right in zip(strength_scalars[:-1], strength_scalars[1:])):
+        raise ValueError(f"Family {family_id} strength_scalar must be strictly increasing, got {strength_scalars}")
 
     base_source = np.asarray(samples[0]["source_ts"], dtype=np.float32).reshape(-1)
     base_mask = np.asarray(samples[0]["mask_gt"], dtype=np.float32).reshape(-1)
@@ -63,16 +74,7 @@ def _validate_family(family: Dict[str, Any]) -> List[Dict[str, Any]]:
     base_signature = _family_metadata_signature(samples[0])
     target_gains: List[float] = []
 
-    for expected_label, sample in enumerate(samples):
-        strength_text = str(sample["strength_text"])
-        strength_label = int(sample["strength_label"])
-        if strength_label != expected_label:
-            raise ValueError(
-                f"Family {family_id} sample {strength_text} has strength_label={strength_label}, expected {expected_label}"
-            )
-        if STRENGTH_ORDER[strength_text] != strength_label:
-            raise ValueError(f"Family {family_id} has mismatched strength text/label for {strength_text}")
-
+    for sample in samples:
         source_ts = np.asarray(sample["source_ts"], dtype=np.float32).reshape(-1)
         target_ts = np.asarray(sample["target_ts"], dtype=np.float32).reshape(-1)
         mask_gt = np.asarray(sample["mask_gt"], dtype=np.float32).reshape(-1)
@@ -90,10 +92,8 @@ def _validate_family(family: Dict[str, Any]) -> List[Dict[str, Any]]:
             raise ValueError(f"Family {family_id} target background leakage exceeds tolerance")
         target_gains.append(_mean_abs_edit_gain(source_ts, target_ts, mask_gt))
 
-    if not (target_gains[0] <= target_gains[1] + FLOAT_TOL and target_gains[1] <= target_gains[2] + FLOAT_TOL):
-        raise ValueError(f"Family {family_id} target gains are not monotonic: {target_gains}")
-    if target_gains[0] > target_gains[1] + FLOAT_TOL or target_gains[1] > target_gains[2] + FLOAT_TOL:
-        raise ValueError(f"Family {family_id} target gains violate monotonic ordering beyond tolerance: {target_gains}")
+    if any((right + FLOAT_TOL) < left for left, right in zip(target_gains[:-1], target_gains[1:])):
+        raise ValueError(f"Family {family_id} target gains are not monotonic in strength_scalar order: {target_gains}")
     return samples
 
 
@@ -165,11 +165,13 @@ class DiscreteStrengthFamilySplit(Dataset):
 
         records: List[Dict[str, Any]] = []
         for sample in samples:
+            strength_label = sample.get("strength_label")
             records.append(
                 {
                     "family_id": str(family["family_id"]),
                     "strength_text": str(sample["strength_text"]),
-                    "strength_label": int(sample["strength_label"]),
+                    "strength_label": -1 if strength_label is None else int(strength_label),
+                    "strength_scalar": float(sample["strength_scalar"]),
                     "instruction_text": str(sample["instruction_text"]),
                     "src_x": src_x[..., np.newaxis],
                     "tgt_x": np.asarray(sample["target_ts"], dtype=np.float32)[..., np.newaxis],
@@ -198,10 +200,14 @@ def collate_discrete_strength_families(batch: List[Dict[str, Any]]) -> Dict[str,
 
     instruction_text = [str(sample["instruction_text"]) for sample in flat_samples]
     strength_text = [str(sample["strength_text"]) for sample in flat_samples]
+    strength_scalar = [float(sample["strength_scalar"]) for sample in flat_samples]
 
-    family_valid = all(size == 3 for size in family_sizes)
+    family_valid = all(size >= 2 for size in family_sizes)
     family_order_valid = all(
-        strength_text[start:start + size] == STRENGTH_SEQUENCE
+        all(
+            (strength_scalar[start + idx + 1] - strength_scalar[start + idx]) > FLOAT_TOL
+            for idx in range(max(0, size - 1))
+        )
         for start, size in zip(np.cumsum([0] + family_sizes[:-1]).tolist(), family_sizes)
     )
 
@@ -213,6 +219,7 @@ def collate_discrete_strength_families(batch: List[Dict[str, Any]]) -> Dict[str,
         "src_attrs": _stack_array("src_attrs", torch.long),
         "tgt_attrs": _stack_array("tgt_attrs", torch.long),
         "strength_label": _stack_array("strength_label", torch.long),
+        "strength_scalar": torch.as_tensor(strength_scalar, dtype=torch.float32),
         "instruction_text": instruction_text,
         "strength_text": strength_text,
         "family_sizes": torch.as_tensor(family_sizes, dtype=torch.long),
