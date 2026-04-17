@@ -250,6 +250,22 @@ If a new dataset must be opened later, use this priority:
 
 But none of them should be started before the current breakpoint is fully stabilized.
 
+## Status Update 2026-04-18
+
+A small repo-level archival note is added here to freeze two pure-editing strength breakpoints without reopening the forecast-revision line itself.
+
+Frozen conclusions:
+
+1. beta-direction repair is validated:
+   - the beta path no longer drives edit gain in the inverted direction
+   - gain now follows the intended positive direction after the repair
+2. P2 downstream diagnostics restoration is validated:
+   - after the DDIM-forward conditioning fix, downstream stage diagnostics are populated again
+   - observability is restored, but control quality is still not fully solved
+
+This note is only a cross-line archival pointer.
+It does not change the forecast-revision breakpoint, dataset roles, or established evidence chain above.
+
 ## Primary Indexes
 
 - [Experiment summary](/root/autodl-tmp/BetterTSE-main/results/forecast_revision/EXPERIMENT_SUMMARY_20260317.md)

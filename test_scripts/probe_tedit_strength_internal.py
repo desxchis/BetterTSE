@@ -396,6 +396,20 @@ def main() -> None:
         scalar_diagnostics.get("stage_by_scalar") or {},
         scalar_keys,
     )
+    final_edit_delta_linf = {}
+    for left_idx in range(len(rows)):
+        for right_idx in range(left_idx + 1, len(rows)):
+            final_edit_delta_linf[f"{scalar_keys[left_idx]}_{scalar_keys[right_idx]}"] = _linf_diff(
+                rows[left_idx], rows[right_idx], "final_edit_region_mean_abs_delta"
+            )
+    raw_values = [row["raw_edit_region_mean_abs_delta"] for row in rows]
+    final_values = [row["final_edit_region_mean_abs_delta"] for row in rows]
+    raw_edit_monotonic = bool(
+        all(raw_values[idx] is not None and raw_values[idx + 1] is not None and raw_values[idx] < raw_values[idx + 1] for idx in range(len(raw_values) - 1))
+    )
+    final_edit_monotonic = bool(
+        all(final_values[idx] is not None and final_values[idx + 1] is not None and final_values[idx] < final_values[idx + 1] for idx in range(len(final_values) - 1))
+    )
     summary = {
         "condition_mode": args.condition_mode,
         "flip_beta_sign": bool(args.flip_beta_sign),
@@ -422,23 +436,9 @@ def main() -> None:
         "modulation_by_scalar": scalar_diagnostics.get("modulation_by_scalar"),
         "stage_by_scalar": scalar_diagnostics.get("stage_by_scalar"),
         "stage_transition_summary": stage_transition_summary,
-        "final_edit_delta_linf": {
-            "weak_medium": _linf_diff(rows[0], rows[1], "final_edit_region_mean_abs_delta"),
-            "medium_strong": _linf_diff(rows[1], rows[2], "final_edit_region_mean_abs_delta"),
-            "weak_strong": _linf_diff(rows[0], rows[2], "final_edit_region_mean_abs_delta"),
-        },
-        "raw_edit_monotonic": bool(
-            rows[0]["raw_edit_region_mean_abs_delta"] is not None
-            and rows[1]["raw_edit_region_mean_abs_delta"] is not None
-            and rows[2]["raw_edit_region_mean_abs_delta"] is not None
-            and rows[0]["raw_edit_region_mean_abs_delta"] < rows[1]["raw_edit_region_mean_abs_delta"] < rows[2]["raw_edit_region_mean_abs_delta"]
-        ),
-        "final_edit_monotonic": bool(
-            rows[0]["final_edit_region_mean_abs_delta"] is not None
-            and rows[1]["final_edit_region_mean_abs_delta"] is not None
-            and rows[2]["final_edit_region_mean_abs_delta"] is not None
-            and rows[0]["final_edit_region_mean_abs_delta"] < rows[1]["final_edit_region_mean_abs_delta"] < rows[2]["final_edit_region_mean_abs_delta"]
-        ),
+        "final_edit_delta_linf": final_edit_delta_linf,
+        "raw_edit_monotonic": raw_edit_monotonic,
+        "final_edit_monotonic": final_edit_monotonic,
     }
     payload = {
         "dataset_folder": str(dataset_root),
@@ -454,9 +454,11 @@ def main() -> None:
         "rows": rows,
         "summary": summary,
         "scalar_diagnostics": scalar_diagnostics,
-        "diff_0_1_linf": float(np.max(np.abs(outputs[0] - outputs[1]))),
-        "diff_1_2_linf": float(np.max(np.abs(outputs[1] - outputs[2]))),
-        "diff_0_2_linf": float(np.max(np.abs(outputs[0] - outputs[2]))),
+        "output_pairwise_linf": {
+            f"{scalar_keys[left_idx]}_{scalar_keys[right_idx]}": float(np.max(np.abs(outputs[left_idx] - outputs[right_idx])))
+            for left_idx in range(len(outputs))
+            for right_idx in range(left_idx + 1, len(outputs))
+        },
         "diagnostics": _to_jsonable(diagnostics),
     }
 

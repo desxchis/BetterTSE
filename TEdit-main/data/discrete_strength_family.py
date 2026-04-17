@@ -11,7 +11,7 @@ from torch.utils.data import DataLoader, Dataset
 
 
 STRENGTH_ORDER = {"weak": 0, "medium": 1, "strong": 2}
-LEGACY_STRENGTH_TO_SCALAR = {"weak": 0.0, "medium": 0.5, "strong": 1.0}
+LEGACY_STRENGTH_TO_SCALAR = {"weak": 0.0, "medium": 1.0, "strong": 2.0}
 FLOAT_TOL = 1.0e-6
 
 

@@ -2,6 +2,53 @@
 
 按时间倒序记录 pure-editing strength mainline 的关键推进，不混入 forecast-revision 主线。
 
+## [2026-04-18] - P2 最小 rerun 恢复下游 stage diagnostics，可观测性恢复但控制质量未解
+
+**修改文件**：`TEdit-main/models/conditional_generator.py`、`tool/tedit_wrapper.py`、`TEdit-main/models/conditioning/numeric_projector.py`、`TEdit-main/models/diffusion/diff_csdi_multipatch.py`、`TEdit-main/models/diffusion/diff_csdi_multipatch_weaver.py`、`TEdit-main/configs/synthetic/model_multi_weaver.yaml`、`test_scripts/probe_tedit_strength_internal.py`、`test_scripts/evaluate_tedit_strength_effect.py`、`results/p2_amplitude_head_probe.json`、`results/p2_amplitude_head_eval_both.json`、`results/p2_amplitude_head_eval_label_only.json`、`results/p2_amplitude_head_eval_text_only.json`
+
+**改动内容**：
+- 在 `conditional_generator` 的 DDIM forward 路径中补齐 `strength_label / strength_scalar / task_id / text_context` 传递，修复最小 rerun 中 forward 条件丢失
+- 在 `numeric_projector` 中把离散 strength embedding 与显式 scalar 投影并联拼接，恢复 P2 `amplitude_decomposition` 所需的联合条件输入
+- 在两套 diffusion residual block 中加入 amplitude head，并把输出阶段 diagnostics 拆成 `residual_content_branch / residual_amplitude_branch / amplitude_gamma / amplitude_beta`
+- 统一 beta 路径方向口径并开放 `beta_upweight` 诊断分支；同时让 wrapper 在缺省配置下补齐 `device`
+- 用最小 P2 rerun 重新跑 internal probe 与 downstream eval，检查下游 stage diagnostics 是否重新落盘
+
+**关键结论**：
+- DDIM forward conditioning 修复后，P2 rerun 已重新产出 downstream stage diagnostics，`stage_by_scalar`、stage transition summary 与输出阶段 amplitude diagnostics 都能回到 probe 结果中
+- 这次修复解决的是“看不见下游响应”的 observability 断点，而不是“强度控制已完全成立”
+- 当前可以确认：P2 线的 downstream diagnostics restoration 已验证，后续可以继续围绕 amplitude/output decomposition 判断问题发生在何层
+- 但控制质量本身仍未完全解决；恢复可观测性不等于已经恢复 `weak < medium < strong` 的稳定输出行为
+
+**关键决策**：
+- P2 后续继续保留 amplitude/output decomposition 作为唯一主线，不回退为再次发散的多小实验并行
+- 之后的判断应优先依赖恢复后的 downstream stage diagnostics，而不是只看最终 edit gain 单点现象
+- 对外归档时要把“可观测性恢复”与“控制质量未解”明确拆开表述，避免把本次最小 rerun 夸大成完整修复
+
+**状态**：下游诊断已恢复，控制质量仍待继续
+
+## [2026-04-17] - beta 路径方向修复确认 gain 已回到正向响应
+
+**修改文件**：`TEdit-main/data/discrete_strength_family.py`、`TEdit-main/configs/synthetic/finetune_strength_trend_family.yaml`、`TEdit-main/configs/synthetic/finetune_strength_trend_family_run1.yaml`、`TEdit-main/configs/synthetic/finetune_strength_trend_family_run2.yaml`、`TEdit-main/models/diffusion/diff_csdi_multipatch.py`、`TEdit-main/models/diffusion/diff_csdi_multipatch_weaver.py`、`test_scripts/probe_tedit_strength_internal.py`、`test_scripts/evaluate_tedit_strength_effect.py`、`results/beta_only_repair_short/*`、`results/beta_only_repair_longer/*`、`results/beta_direction_pass2/*`、`results/beta_direction_pass2_w1/*`
+
+**改动内容**：
+- 把 family strength scalar 口径从 `0.0 / 0.5 / 1.0` 改到 `0.0 / 1.0 / 2.0`，避免中档与强档间隔过窄
+- 调整 beta 路径最终注入方向，并补充 `beta_upweight` 诊断模式，用于确认 beta 支路符号/方向是否与目标 gain 一致
+- 将评测与 internal probe 从固定 `weak / medium / strong` 键名改成按实际 scalar 排序聚合，避免方向诊断仍被旧键名假设绑死
+- 结合 `beta_only_repair` 与 `beta_direction_pass2` rerun，对 beta 路径修复前后做短程与延长版复核
+
+**关键结论**：
+- beta 路径的符号/方向断点已修复，edit gain 不再沿反方向响应；修复后 gain 方向重新跟随预期的正向 strength 增长，而不是出现“strong 比 weak 改得更少”的倒置
+- 昨天这轮验证的核心结论不是“控制已经完全解决”，而是更窄且更重要的：beta path repaired to positive gain direction
+- 这意味着此前 `beta_flip` 只能在推理期临时翻正的现象，已经被收敛为源代码路径上的正式修复，不再是纯诊断技巧
+- 仍需继续检查方向修复之后，幅度 gap 是否足够大、是否能稳定传到更下游输出层
+
+**关键决策**：
+- 后续实验默认采用已修复的 beta 正向口径，不再把 beta-only 临时翻转当成主叙事
+- 后续主问题切回“正向后为什么 gap 仍不够稳”，而不是重新争论方向是否反了
+- 归档里明确保留这条 breakpoint：beta 方向问题已经被实证修复
+
+**状态**：方向修复已确认，幅度控制仍待继续
+
 ## [2026-04-08] - 新线正式 GPU 训练完成，但 held-out monotonic 主实验仍失败
 
 **修改文件**：`tmp/trend_strength_family_train_v1/*`、`tmp/strength_family_train_v2/0/trend_injection/ckpts/model_best.pth`、`tmp/strength_family_train_v2/0/trend_injection/strength_diagnostics.jsonl`、`tmp/strength_family_train_v2/test_benchmark_health.json`、`tmp/strength_family_train_v2/test_benchmark_health.md`、`tmp/strength_family_train_v2/test_trend_monotonic_eval.json`、`tmp/strength_family_train_v2/test_trend_monotonic_eval.md`、`TEdit-main/run_finetune.py`

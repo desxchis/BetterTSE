@@ -723,7 +723,16 @@ class ConditionalGenerator(nn.Module):
                     t = (torch.ones(B, device=self.device) * t).long()
                 else:
                     t = (torch.ones(B, device=self.device) * t).long()
-                    pred_noise = self.predict_noise(xt, side_emb, src_attr_emb, t)
+                    pred_noise = self.predict_noise(
+                        xt,
+                        side_emb,
+                        src_attr_emb,
+                        t,
+                        strength_label=strength_label,
+                        strength_scalar=strength_scalar,
+                        task_id=task_id,
+                        text_context=text_context,
+                    )
                 xt = self.ddim.forward(xt, pred_noise, t)
 
         # reverse

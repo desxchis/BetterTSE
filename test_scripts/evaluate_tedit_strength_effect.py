@@ -6,8 +6,6 @@ from pathlib import Path
 from typing import Any
 
 
-REQUIRED_STRENGTH_SCALARS = [0.0, 0.5, 1.0]
-
 import numpy as np
 import torch
 
@@ -463,19 +461,20 @@ def main() -> None:
                 "sample_idx": int(sample_idx),
                 "edit_region_fraction": float(np.mean(edit_mask.astype(np.float32))),
                 "min_strength_scalar": float(ordered_numeric_scalars[0]),
+                "mid_strength_scalar": float(ordered_numeric_scalars[len(ordered_numeric_scalars) // 2]),
                 "max_strength_scalar": float(ordered_numeric_scalars[-1]),
-                "weak_edit_gain": edit_gains[0],
-                "medium_edit_gain": edit_gains[len(edit_gains) // 2],
-                "strong_edit_gain": edit_gains[-1],
-                "weak_bg_mae": per_strength[ordered_scalars[0]]["bg_mae"],
-                "medium_bg_mae": per_strength[ordered_scalars[len(ordered_scalars) // 2]]["bg_mae"],
-                "strong_bg_mae": per_strength[ordered_scalars[-1]]["bg_mae"],
-                "weak_raw_edit_region_mean_abs_delta": raw_gains[0],
-                "medium_raw_edit_region_mean_abs_delta": raw_gains[len(raw_gains) // 2],
-                "strong_raw_edit_region_mean_abs_delta": raw_gains[-1],
-                "weak_final_edit_region_mean_abs_delta": final_gains[0],
-                "medium_final_edit_region_mean_abs_delta": final_gains[len(final_gains) // 2],
-                "strong_final_edit_region_mean_abs_delta": final_gains[-1],
+                "min_edit_gain": edit_gains[0],
+                "mid_edit_gain": edit_gains[len(edit_gains) // 2],
+                "max_edit_gain": edit_gains[-1],
+                "min_bg_mae": per_strength[ordered_scalars[0]]["bg_mae"],
+                "mid_bg_mae": per_strength[ordered_scalars[len(ordered_scalars) // 2]]["bg_mae"],
+                "max_bg_mae": per_strength[ordered_scalars[-1]]["bg_mae"],
+                "min_raw_edit_region_mean_abs_delta": raw_gains[0],
+                "mid_raw_edit_region_mean_abs_delta": raw_gains[len(raw_gains) // 2],
+                "max_raw_edit_region_mean_abs_delta": raw_gains[-1],
+                "min_final_edit_region_mean_abs_delta": final_gains[0],
+                "mid_final_edit_region_mean_abs_delta": final_gains[len(final_gains) // 2],
+                "max_final_edit_region_mean_abs_delta": final_gains[-1],
                 "strong_minus_weak_edit_gain": None if edit_gains[0] is None or edit_gains[-1] is None else float(edit_gains[-1] - edit_gains[0]),
                 "gain_range": None if edit_gains[0] is None or edit_gains[-1] is None else float(edit_gains[-1] - edit_gains[0]),
                 "family_spearman_rho_strength_gain": family_spearman,
@@ -569,16 +568,16 @@ def main() -> None:
         "gain_range_mean": _aggregate_mean([row["gain_range"] for row in pairwise_rows]),
         "gain_calibration_mae_mean": _aggregate_mean([row["gain_calibration_mae"] for row in pairwise_rows]),
         "raw_strong_minus_weak_mean": _safe_diff(
-            _aggregate_mean([row["strong_raw_edit_region_mean_abs_delta"] for row in pairwise_rows]),
-            _aggregate_mean([row["weak_raw_edit_region_mean_abs_delta"] for row in pairwise_rows]),
+            _aggregate_mean([row["max_raw_edit_region_mean_abs_delta"] for row in pairwise_rows]),
+            _aggregate_mean([row["min_raw_edit_region_mean_abs_delta"] for row in pairwise_rows]),
         ),
         "final_strong_minus_weak_mean": _safe_diff(
-            _aggregate_mean([row["strong_final_edit_region_mean_abs_delta"] for row in pairwise_rows]),
-            _aggregate_mean([row["weak_final_edit_region_mean_abs_delta"] for row in pairwise_rows]),
+            _aggregate_mean([row["max_final_edit_region_mean_abs_delta"] for row in pairwise_rows]),
+            _aggregate_mean([row["min_final_edit_region_mean_abs_delta"] for row in pairwise_rows]),
         ),
         "bg_mae_strong_minus_weak": _safe_diff(
-            _aggregate_mean([row["strong_bg_mae"] for row in pairwise_rows]),
-            _aggregate_mean([row["weak_bg_mae"] for row in pairwise_rows]),
+            _aggregate_mean([row["max_bg_mae"] for row in pairwise_rows]),
+            _aggregate_mean([row["min_bg_mae"] for row in pairwise_rows]),
         ),
     }
     summary["raw_to_final_monotonic_drop"] = _safe_diff(
@@ -626,7 +625,7 @@ def main() -> None:
         "projector": summary["projector_pairwise_l2_mean"],
         "raw_final": summary["raw_vs_final_summary"],
     }
-    required_strength_keys = {f"{value:.4f}" for value in REQUIRED_STRENGTH_SCALARS}
+    required_strength_keys = set(scalar_keys)
     if len(pairwise_rows) != len(eval_records):
         raise RuntimeError(f"Expected {len(eval_records)} per-sample rows, got {len(pairwise_rows)}")
     if summary["n_samples"] != len(eval_records):

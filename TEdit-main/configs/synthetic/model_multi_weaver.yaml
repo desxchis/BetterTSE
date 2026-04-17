@@ -30,7 +30,7 @@ diffusion:
   attr_proj_type: avg
   strength_control:
     enabled: true
-    mode: modulation_residual
+    mode: amplitude_decomposition
     num_strength_bins: 3
     num_tasks: 8
     emb_dim: 32

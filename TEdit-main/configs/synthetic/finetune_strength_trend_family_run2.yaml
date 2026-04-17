@@ -22,16 +22,16 @@ train:
   instruction_text_dropout_prob: 0.0
   strength_lr_scale: 5.0
   strength_diagnostics_enabled: true
-  strength_diagnostics_interval: 1
+  strength_diagnostics_interval: 20
   diffusion_loss_weight: 0.2
-  gain_match_loss_weight: 4.0
+  gain_match_loss_weight: 12.0
   edit_region_loss_weight: 0.5
   background_loss_weight: 0.2
-  monotonic_loss_weight: 0.5
-  family_relative_gain_loss_weight: 3.0
-  family_relative_margin_scale: 1.5
-  constant_gain_penalty_weight: 2.0
-  minimum_family_gain_std: 0.05
+  monotonic_loss_weight: 0.25
+  family_relative_gain_loss_weight: 10.0
+  family_relative_margin_scale: 2.5
+  constant_gain_penalty_weight: 4.0
+  minimum_family_gain_std: 0.12
   numeric_only_loss_weight: 4.0
   beta_direction_loss_weight: 0.0
   beta_direction_margin: 0.0

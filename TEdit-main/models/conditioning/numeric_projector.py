@@ -126,7 +126,7 @@ class StrengthProjector(nn.Module):
             else None
         )
 
-        in_dim = emb_dim
+        in_dim = emb_dim * 2
         if self.use_task_id:
             in_dim += emb_dim
         if self.use_text_context:
@@ -351,7 +351,17 @@ class StrengthProjector(nn.Module):
                 raise ValueError("Could not infer batch/device for semantic strength conditioning")
             strength_vec = torch.zeros(batch_size, self.strength_emb.embedding_dim, device=device, dtype=self.strength_emb.weight.dtype)
 
-        feats = [strength_vec]
+        if strength_scalar is None:
+            strength_scalar_vec = torch.zeros(batch_size, self.strength_emb.embedding_dim, device=device, dtype=self.strength_emb.weight.dtype)
+        else:
+            strength_scalar = strength_scalar.float().view(-1, 1).to(device)
+            if strength_scalar.shape[0] != batch_size:
+                raise ValueError(
+                    f"strength_scalar batch size mismatch: expected {batch_size}, got {strength_scalar.shape[0]}"
+                )
+            strength_scalar_vec = self.strength_scalar_proj(strength_scalar)
+
+        feats = [strength_vec, strength_scalar_vec]
 
         if self.use_task_id:
             if task_id is None:

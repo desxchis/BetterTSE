@@ -123,6 +123,9 @@ class TEditWrapper:
         with open(config_path, "r") as f:
             self.config = yaml.safe_load(f)
 
+        if "device" not in self.config:
+            self.config["device"] = self.device
+
         # Recursively update all device settings
         def update_device(config, device):
             if isinstance(config, dict):

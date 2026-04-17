@@ -211,6 +211,8 @@ class ResidualBlock(nn.Module):
         self.strength_mode = strength_mode
         self.strength_gain_multiplier = float(strength_gain_multiplier)
         self.strength_modulation = None
+        self.strength_amplitude_head = None
+        self.use_amplitude_head = strength_cond_dim > 0 and self.strength_mode == "amplitude_decomposition"
         if strength_cond_dim > 0:
             self.strength_modulation = nn.Sequential(
                 nn.Linear(strength_cond_dim, channels),
@@ -219,6 +221,14 @@ class ResidualBlock(nn.Module):
             )
             nn.init.normal_(self.strength_modulation[-1].weight, mean=0.0, std=1.0e-3)
             nn.init.normal_(self.strength_modulation[-1].bias, mean=0.0, std=1.0e-3)
+            if self.use_amplitude_head:
+                self.strength_amplitude_head = nn.Sequential(
+                    nn.Linear(strength_cond_dim, channels),
+                    nn.SiLU(),
+                    nn.Linear(channels, 2 * channels),
+                )
+                nn.init.normal_(self.strength_amplitude_head[-1].weight, mean=0.0, std=1.0e-3)
+                nn.init.normal_(self.strength_amplitude_head[-1].bias, mean=0.0, std=1.0e-3)
         self.side_projection = Conv1d_with_init(side_dim, 2 * channels, 1)
         self.mid_projection = Conv1d_with_init(channels, 2 * channels, 1)
         self.output_projection = Conv1d_with_init(channels, 2 * channels, 1)
@@ -536,7 +546,7 @@ class ResidualBlock(nn.Module):
         )
         return y
 
-    def _run_output_head(self, y, side_emb, base_shape, strength_label=None, strength_scalar=None):
+    def _run_output_head(self, y, side_emb, base_shape, strength_cond=None, strength_label=None, strength_scalar=None):
         B, channel, K, L = base_shape
         y = y.reshape(B, channel, K * L)
         y = self.mid_projection(y)
@@ -559,20 +569,36 @@ class ResidualBlock(nn.Module):
         )
         gated = self._apply_mid_gate_filter(combined, strength_label=strength_label, strength_scalar=strength_scalar)
         y = self.output_projection(gated)
-        self._record_forward_response_diagnostics(
-            {"post_output_projection": y},
-            strength_label=strength_label,
-            strength_scalar=strength_scalar,
-        )
         residual, skip = torch.chunk(y, 2, dim=1)
         self._record_forward_response_diagnostics(
             {
-                "residual_branch": residual,
+                "post_output_projection": y,
+                "residual_content_branch": residual,
                 "skip_branch": skip,
             },
             strength_label=strength_label,
             strength_scalar=strength_scalar,
         )
+        if self.use_amplitude_head and self.strength_amplitude_head is not None and strength_cond is not None:
+            amp_gamma, amp_beta = torch.chunk(self.strength_amplitude_head(strength_cond), 2, dim=-1)
+            amp_gamma = (1.0 + self.strength_gain_multiplier * amp_gamma).unsqueeze(-1)
+            amp_beta = (self.strength_gain_multiplier * amp_beta).unsqueeze(-1)
+            residual = residual * amp_gamma + amp_beta
+            self._record_forward_response_diagnostics(
+                {
+                    "amplitude_gamma": amp_gamma,
+                    "amplitude_beta": amp_beta,
+                    "residual_amplitude_branch": residual,
+                },
+                strength_label=strength_label,
+                strength_scalar=strength_scalar,
+            )
+        else:
+            self._record_forward_response_diagnostics(
+                {"residual_amplitude_branch": residual},
+                strength_label=strength_label,
+                strength_scalar=strength_scalar,
+            )
         return residual.reshape(base_shape), skip.reshape(base_shape)
 
     def _record_residual_merge(self, x, residual, strength_label=None, strength_scalar=None):
@@ -584,7 +610,7 @@ class ResidualBlock(nn.Module):
         )
         return merged
 
-    def _forward_with_strength_diagnostics(self, x, side_emb, base_shape, y, attention_mask=None, soft_mask=None, keys_null=None, values_null=None, strength_label=None, strength_scalar=None):
+    def _forward_with_strength_diagnostics(self, x, side_emb, base_shape, y, attention_mask=None, soft_mask=None, keys_null=None, values_null=None, strength_cond=None, strength_label=None, strength_scalar=None):
         y = self._run_post_modulation_stack(
             y,
             base_shape,
@@ -599,6 +625,7 @@ class ResidualBlock(nn.Module):
             y,
             side_emb,
             base_shape,
+            strength_cond=strength_cond,
             strength_label=strength_label,
             strength_scalar=strength_scalar,
         )
@@ -620,13 +647,13 @@ class ResidualBlock(nn.Module):
             delta_beta = torch.zeros_like(delta_beta)
         elif strength_ablation_mode == "beta_only":
             delta_gamma = torch.zeros_like(delta_gamma)
+        elif strength_ablation_mode == "beta_upweight":
+            delta_beta = delta_beta * 2.0
         if strength_scalar is not None:
             strength_scalar = strength_scalar.float().view(-1, 1)
-            delta_gamma = delta_gamma * strength_scalar
-            delta_beta = delta_beta * strength_scalar
         flip_beta_sign = bool(self.__class__._flip_beta_sign_inference) and not self.training
         gamma_final = gamma_orig + delta_gamma
-        beta_final = beta_orig - delta_beta if flip_beta_sign else beta_orig + delta_beta
+        beta_final = beta_orig + delta_beta if flip_beta_sign else beta_orig - delta_beta
         self._record_modulation_diagnostics(
             gamma_orig,
             beta_orig,
@@ -699,6 +726,7 @@ class ResidualBlock(nn.Module):
             soft_mask=soft_mask,
             keys_null=keys_null,
             values_null=values_null,
+            strength_cond=strength_cond,
             strength_label=strength_label,
             strength_scalar=strength_scalar,
         )
@@ -952,7 +980,7 @@ class Diff_CSDI_MultiPatch_Weaver_Parallel(nn.Module):
             strength_label=strength_label,
             task_id=task_id,
             text_context=text_context,
-            strength_scalar=None,
+            strength_scalar=strength_scalar,
         )
 
     def forward(self, x_raw, side_emb_raw, attr_emb_raw, diffusion_step,
