@@ -1,232 +1,367 @@
-这是一份为你量身定制的完整Python工程实现代码。这套代码严格遵循了我们讨论的**“三元组数据构造 -> LLM边界框定位(t-IoU) -> 掩码引导生成 -> 分区MSE/MAE评估”**的四阶段框架。
+# 基于编辑幅度控制的时序扩散编辑研究计划（Proposal 草案）
 
-为了保证代码能与你们现有的代码库完美对接，我采用了面向对象（OOP）的设计，加入了完整的类型提示（Type Hints）、标准的日志记录（Logging）以及完善的错误处理与结果保存机制（可直接输出为JSON分析报告）。你可以直接将这个类作为一个Module集成到你们的评估框架中。
+## 1. 问题定义
 
-### ETTm1 时序编辑测试与评估脚本 (`ts_edit_eval.py`)
+### 1.1 研究背景
+时间序列编辑（Time Series Editing, TSE）的目标，不再是从随机噪声中“生成一条合理的序列”，而是在给定原始序列的前提下，根据外部指令对局部属性进行修改，同时尽可能保持未被提及的区域与属性不变。相较于从头生成，编辑任务更强调局部可控性、结构保真性与语义一致性。
 
-```python
-import os
-import json
-import logging
-import numpy as np
-import pandas as pd
-from typing import Dict, Tuple, List, Optional
-from sklearn.metrics import mean_squared_error, mean_absolute_error
+现有扩散式时序编辑工作已经证明，扩散模型可以支持对趋势类型、季节性类别、局部事件形态等属性的修改。然而，大多数方法的控制仍停留在离散属性层面，即模型能够回答“改什么（what to edit）”和部分“改哪里（where to edit）”，却尚未真正回答“改多大（how much to edit）”。
 
-# 配置标准化日志输出
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - [%(levelname)s] - %(name)s - %(message)s'
-)
-logger = logging.getLogger("TSEdit_Evaluator")
+### 1.2 核心研究问题
+本研究关注的核心问题不是一般意义上的时序编辑，而是更具体、更聚焦的命题：
 
-class TSEditFramework:
-    """
-    时间序列编辑与评估框架（基于LLM定位与掩码控制）
-    """
-    def __init__(self, seq_len: int = 192):
-        self.seq_len = seq_len
-        self.features =
-        self.num_features = len(self.features)
-        self.feature_to_idx = {feat: idx for idx, feat in enumerate(self.features)}
+**能否让时序编辑模型具备明确、稳定、可验证的编辑幅度控制能力？**
 
-    def stage1_data_synthesis(self, df_source: Optional = None) -> Tuple:
-        """
-        阶段一：自动化“三元组”测试数据集构造
-        """
-        logger.info("开始阶段一：构造基础数据、注入物理突变并生成GT Mask...")
-        try:
-            # 如果没有提供数据，则随机生成模拟的ETTm1平稳数据以便测试
-            if df_source is None:
-                logger.warning("未检测到真实数据输入，将使用随机游走生成模拟ETTm1数据。")
-                data = np.cumsum(np.random.randn(self.seq_len, self.num_features) * 0.1, axis=0) + 20
-            else:
-                data = df_source[self.features].values[:self.seq_len]
+这里的“编辑幅度控制”指的是：在编辑类型与编辑区域固定的前提下，模型能够根据输入的强度描述或数值参数，单调、平滑、可校准地调节编辑结果的强弱程度。
 
-            base_ts = data.copy()
-            target_ts = data.copy()
-            mask_gt = np.zeros_like(base_ts)
+### 1.3 幅度控制的三种形式
+为了避免问题定义过宽，本研究将编辑幅度分为三个递进层次：
 
-            # 设定人工注入规则：在第14步到第25步之间，使油温(OT)飙升1.5倍
-            target_feature = 'OT'
-            feat_idx = self.feature_to_idx[target_feature]
-            start_step, end_step = 14, 25
+1. 文本级强弱控制
+输入为“轻微上升”“显著下降”“略微增强波动”等自然语言描述，目标是让模型满足有序强弱关系，例如 `weak < medium < strong`。
 
-            # 注入突变并记录二维掩码
-            target_ts[start_step:end_step+1, feat_idx] *= 1.5 
-            mask_gt[start_step:end_step+1, feat_idx] = 1.0
+2. 离散桶级控制
+输入为若干预定义幅度桶，例如 `level-1/2/3/4` 或 `25%/50%/75%`，目标是让模型对离散档位产生稳定可区分的响应。
 
-            # 对应的模糊指令和GT参数
-            fuzzy_prompt = "在观测中段，变压器负载保持正常波动，但油温（OT）出现了一次不明原因的异常飙升。"
-            gt_params = {
-                "target_feature": target_feature,
-                "start_step": start_step,
-                "end_step": end_step
-            }
+3. 连续数值控制
+输入为连续标量或参数向量，例如 `m=0.3`、`slope_ratio=1.4`、`vol_scale=2.0`，目标是让模型输出与这些数值之间形成近似单调且可校准的映射关系。
 
-            logger.info(f"三元组构造完成。注入区间: [{start_step}, {end_step}], 目标特征: {target_feature}")
-            return base_ts, target_ts, mask_gt, fuzzy_prompt, gt_params
+本研究的主线将优先聚焦于“文本强弱控制”和“离散桶控制”，并将“连续数值控制”作为进一步提升的目标版本。这样既能保证研究问题足够创新，又能控制工程复杂度与实验风险。
 
-        except Exception as e:
-            logger.error(f"数据构造阶段发生异常: {str(e)}")
-            raise
+### 1.4 研究目标
+围绕上述问题，本研究希望完成以下目标：
 
-    def stage2_llm_localization(self, fuzzy_prompt: str, gt_params: Dict) -> Tuple:
-        """
-        阶段二：评估LLM的编辑范围定位能力 (t-IoU)
-        """
-        logger.info("开始阶段二：模拟LLM解析模糊指令并计算 t-IoU...")
-        try:
-            # 真实环境中，这里是调用 GPT-4o / Qwen 的 API
-            # 我们在这里模拟LLM基于模糊Prompt输出的预测JSON (模拟LLM存在轻微定位偏差)
-            llm_prediction = {
-                "target_feature": "OT",
-                "start_step": 12, # LLM预测的略微提前
-                "end_step": 24    # LLM预测的略微提前
-            }
-            logger.info(f"LLM 预测出的边界框: {llm_prediction}")
+- 建立一个清晰的时序编辑幅度控制问题定义；
+- 设计能够接收幅度指令的扩散式编辑框架；
+- 证明模型对强度输入具备单调响应与可校准性；
+- 在保证非编辑区保真的前提下，实现局部幅度控制；
+- 将该能力验证到纯时序编辑与预测修正两个任务主线上。
 
-            # 计算一维时间交并比 (t-IoU)
-            pred_set = set(range(llm_prediction["start_step"], llm_prediction["end_step"] + 1))
-            gt_set = set(range(gt_params["start_step"], gt_params["end_step"] + 1))
-            
-            intersection = len(pred_set.intersection(gt_set))
-            union = len(pred_set.union(gt_set))
-            t_iou = intersection / union if union > 0 else 0.0
+## 2. 现有框架缺陷
 
-            # 检查特征分类是否正确
-            feature_acc = 1.0 if llm_prediction["target_feature"] == gt_params["target_feature"] else 0.0
+### 2.1 现有 BetterTSE 已解决的问题
+当前 BetterTSE 框架在高层语义解析方面已经具备一定基础。通过意图解析、区域定位、标准工具映射与执行计划构造，系统已经能够较好地回答以下问题：
 
-            logger.info(f"定位评估完成。t-IoU: {t_iou:.4f}, 特征分类准确率: {feature_acc}")
-            return llm_prediction, t_iou
+- 用户想修改哪一类属性；
+- 编辑应当发生在哪一段区间；
+- 哪个工具族更适合执行当前编辑语义。
 
-        except Exception as e:
-            logger.error(f"LLM定位评估发生异常: {str(e)}")
-            raise
+这说明 BetterTSE 在 `where` 与 `what` 两个维度上已经形成了初步可行的结构化路线。
 
-    def stage3_mask_guided_generation(self, base_ts: np.ndarray, target_ts: np.ndarray, llm_prediction: Dict) -> np.ndarray:
-        """
-        阶段三：基于掩码的模型生成控制 (Mock)
-        """
-        logger.info("开始阶段三：执行注意力掩码约束下的时序重绘...")
-        try:
-            # 1. 根据LLM预测的边界框生成输入掩码
-            pred_mask = np.zeros_like(base_ts)
-            feat_idx = self.feature_to_idx.get(llm_prediction["target_feature"], 0)
-            start, end = llm_prediction["start_step"], llm_prediction["end_step"]
-            pred_mask[start:end+1, feat_idx] = 1.0
+### 2.2 “How Much” 尚未真正打通
+尽管框架中已经显式提出了 `How Much` 层，但从理论设计和工程实现来看，该层尚未真正进入扩散编辑模型内部。当前问题主要体现在：
 
-            # 2. 模拟底层的条件扩散模型生成过程
-            # 假设模型在被掩码允许编辑的区域(pred_mask=1)，试图去逼近指令要求，但存在一定的生成噪声
-            generated_edit = target_ts + np.random.randn(*target_ts.shape) * 0.5
-            
-            # 3. 核心约束：方程 X_edit = M * Generate + (1 - M) * Base
-            # 在掩码为0的区域绝对锁死，直接复制Base_TS
-            final_generated_ts = pred_mask * generated_edit + (1 - pred_mask) * base_ts
-            
-            logger.info("掩码引导生成完成。非编辑区被硬性锁定。")
-            return final_generated_ts
+- 编辑强度参数主要在外部逻辑层面被计算；
+- 对于涉及 TEdit 的混合编辑工具，强度往往以 `math_anchor`、`math_shift` 或启发式参数形式在生成后附加；
+- 底层扩散模型实际接收到的仍是固定的离散属性切换，而不是连续或分级的幅度控制信号。
 
-        except Exception as e:
-            logger.error(f"掩码引导生成发生异常: {str(e)}")
-            raise
+这意味着当前系统中所谓的“幅度控制”，本质上仍然是外部后处理，而不是扩散模型内生的可控编辑能力。
 
-    def stage4_partitioned_evaluation(self, base_ts: np.ndarray, target_ts: np.ndarray, generated_ts: np.ndarray, mask_gt: np.ndarray) -> Dict:
-        """
-        阶段四：分区域的严苛误差评估
-        """
-        logger.info("开始阶段四：分区域计算 MAE / MSE...")
-        try:
-            mask_bool = mask_gt.astype(bool)
-            
-            # 提取编辑区（Editability评估）
-            if np.any(mask_bool):
-                target_edit_region = target_ts[mask_bool]
-                generated_edit_region = generated_ts[mask_bool]
-                mse_edit = mean_squared_error(target_edit_region, generated_edit_region)
-                mae_edit = mean_absolute_error(target_edit_region, generated_edit_region)
-            else:
-                mse_edit, mae_edit = 0.0, 0.0
+### 2.3 教师-学生蒸馏定位不清
+当前 `teacher-student` 路线的另一个根本问题在于教师定义不清。现有教师并非独立训练、具备外部知识来源的真正教师网络，而更接近于：
 
-            # 提取非编辑区（Preservability评估）
-            inverse_mask_bool = ~mask_bool
-            if np.any(inverse_mask_bool):
-                base_preserve_region = base_ts[inverse_mask_bool]
-                generated_preserve_region = generated_ts[inverse_mask_bool]
-                mse_preserve = mean_squared_error(base_preserve_region, generated_preserve_region)
-                mae_preserve = mean_absolute_error(base_preserve_region, generated_preserve_region)
-            else:
-                mse_preserve, mae_preserve = 0.0, 0.0
+- 根据目标序列做参数搜索；
+- 在候选编辑结果中筛选较优样本；
+- 再用这些伪标签训练轻量参数头。
 
-            metrics = {
-                "Editability": {
-                    "MSE_In_Mask": float(mse_edit),
-                    "MAE_In_Mask": float(mae_edit),
-                    "Interpretation": "反映模型对文本指令修改幅度的落实精度，越小越好。"
-                },
-                "Preservability": {
-                    "MSE_Out_Mask": float(mse_preserve),
-                    "MAE_Out_Mask": float(mae_preserve),
-                    "Interpretation": "反映模型对未被指令提及的物理周期和特征的保留度，理想情况应极度趋近于0。"
-                }
-            }
-            logger.info(f"分区评估完成: {json.dumps(metrics, indent=2, ensure_ascii=False)}")
-            return metrics
+这一路线带来的问题是：
 
-        except Exception as e:
-            logger.error(f"分区评估发生异常: {str(e)}")
-            raise
+- 蒸馏对象不明确，学生到底是在学扩散模型、学参数搜索，还是学启发式规则，并不清晰；
+- 学生优化目标主要是逼近 `teacher_params`，而不是直接逼近“可控编辑行为”；
+- 当教师本身来源于模型内部搜索时，蒸馏容易退化为自蒸馏（self-distillation），难以提供真正独立的外部约束。
 
-    def run_experiment(self, output_dir: str = "./results"):
-        """
-        执行完整的端到端实验流水线
-        """
-        if not os.path.exists(output_dir):
-            os.makedirs(output_dir)
+### 2.4 自蒸馏导致的偏差与方差问题
+如果教师来自模型自身生成与筛选，那么学生学习到的并不是“更真实的外部规律”，而是模型当前偏好的再编码。这会带来两个问题：
 
-        logger.info("========== 启动时序编辑端到端评估流水线 ==========")
-        
-        # Phase 1
-        base_ts, target_ts, mask_gt, prompt, gt_params = self.stage1_data_synthesis()
-        
-        # Phase 2
-        llm_pred, t_iou = self.stage2_llm_localization(prompt, gt_params)
-        
-        # Phase 3
-        generated_ts = self.stage3_mask_guided_generation(base_ts, target_ts, llm_pred)
-        
-        # Phase 4
-        eval_metrics = self.stage4_partitioned_evaluation(base_ts, target_ts, generated_ts, mask_gt)
+- 偏差放大：模型已有的方向性错误、幅度过激或保真不足，会通过伪标签不断被重复强化；
+- 方差失控：依赖采样筛选得到的局部最优结果，可能导致学生在不同样本上响应高度不稳定。
 
-        # 整理并保存报告
-        report = {
-            "Prompt": prompt,
-            "Ground_Truth_Params": gt_params,
-            "LLM_Localization_Performance": {
-                "Prediction": llm_pred,
-                "t-IoU": t_iou
-            },
-            "Final_Evaluation_Metrics": eval_metrics
-        }
-        
-        save_path = os.path.join(output_dir, "experiment_report.json")
-        with open(save_path, 'w', encoding='utf-8') as f:
-            json.dump(report, f, indent=4, ensure_ascii=False)
-            
-        logger.info(f"========== 实验结束，结果已保存至 {save_path} ==========")
-        return report
+这也是老师指出“自己教自己会让 bias 更高”的根本原因。
 
-# 运行示例
-if __name__ == "__main__":
-    evaluator = TSEditFramework(seq_len=192)
-    # 此处可以直接传入真实的 df (例如: df = pd.read_csv('ETTm1.csv'); evaluator.stage1_data_synthesis(df))
-    # 在不传入真实df的情况下，框架会生成模拟数据以供测试
-    report = evaluator.run_experiment()
+### 2.5 当前主张与真实能力不匹配
+因此，现阶段框架中最核心的错位是：
 
-```
+- 在叙述层面上，系统声称正在做 `how much`；
+- 在实现层面上，系统主要仍在做参数搜索、启发式缩放和运行时保护；
+- 在模型层面上，底层 diffusion 尚未学会响应真正的幅度信号。
 
-### 该脚本中的核心设计亮点：
+这表明当前实验体系与研究主张之间存在明显不匹配，必须重构。
 
-1. **容错性设计：** 我在每一个 Stage 中都加入了 `try...except` 机制，这在批量处理真实数据集（处理脏数据或LLM输出JSON解析失败）时非常关键，能确保流水线不会因为单一异常崩溃。
-2. **严格的分区度量（Stage 4）：** 利用布尔索引（Boolean Indexing）将底层多维数组严格切分为“目标编辑池”和“背景保留池”，这完全实现了我们组会上“回归最基础MSE但分区计算”的思路。
-3. **零溢出机制验证（Stage 3）：** 你可以在最终的JSON输出中看到，由于采用了 `final_generated_ts = pred_mask * generated_edit + (1 - pred_mask) * base_ts` 的掩码融合操作，`MSE_Out_Mask` 指标将会非常非常小（仅取决于LLM预测框和真实框之间的交错误差），这在向老师或评审做演示时，是对“我们解决了时序破坏问题”的最有力证明。
+## 3. 方法设计
+
+### 3.1 方法总览
+本研究建议将原框架重新组织为一个更聚焦的四层结构：
+
+1. 指令理解层
+负责从复杂自然语言中解析编辑类型、方向、形状、持续时间与强度描述。
+
+2. 区域定位层
+负责确定应当被编辑的时间区间，并输出可执行的局部区域表示。
+
+3. 幅度控制层
+负责将自然语言中的强弱描述或离散/连续强度变量编码为统一的 `magnitude representation`。
+
+4. 扩散编辑执行层
+负责将编辑语义、区域信息与幅度控制信号共同注入扩散模型，在生成过程中直接影响去噪轨迹。
+
+其中，前三层构成“结构化控制接口”，第四层是本研究最核心的创新落点。
+
+### 3.2 幅度表示设计
+为了让模型真正理解“改多大”，需要先把幅度表达标准化。我们将幅度表示分为两个接口：
+
+- 语义幅度接口：由 `weak / medium / strong / extreme` 等文本强度词构成；
+- 数值幅度接口：由 `m` 或参数向量 `S=[s_1, ..., s_k]` 构成。
+
+两类接口最终都映射到统一的连续幅度嵌入空间。也就是说，系统既可以响应“轻微增强”，也可以响应“幅度 0.4”或“斜率增大 1.2 倍”。
+
+### 3.3 幅度控制的两条技术路线
+为了兼顾可实现性与创新性，本研究计划设计两条路线：
+
+#### 路线 A：外部幅度控制层
+保留现有编辑器主体，将幅度变量通过区域权重、残差比例、anchor 强度或掩码混合系数作用于执行结果。
+
+该路线的优势是工程成本低、可以快速验证“控制是否存在”；但其局限也十分明确，即控制更接近后处理层，而不是扩散模型内部的原生能力。
+
+#### 路线 B：扩散内部幅度注入
+在扩散骨干网络中加入显式的幅度条件注入模块，让 `magnitude embedding` 直接进入每一步去噪过程。
+
+这条路线更符合论文主线要求，也是本研究真正希望建立的核心方法。外部控制层可作为强 baseline，而内部注入路线作为主方法。
+
+### 3.4 参数感知调制模块
+针对扩散内部注入路线，本研究建议在 denoiser 中加入“参数感知调制模块（Parameter-Aware Modulation Module）”。
+
+其基本思想是：
+
+- 将文本指令编码为语义向量；
+- 将区域信息编码为局部控制向量；
+- 将幅度变量编码为连续数值向量；
+- 在扩散模型的多层特征提取块中，用 adaLN、FiLM、Adapter 或轻量 MLP 生成动态缩放/偏移参数，对局部特征进行调制。
+
+通过这种设计，模型在训练和推理时都能够显式感知“强度是多少”，而不是只能根据文本语义隐式猜测。
+
+### 3.5 控制目标：单调、平滑、可校准
+本研究对“成功控制”不采用模糊表述，而采用三个明确要求：
+
+- 单调性：更大的幅度输入应产生更强的实际编辑响应；
+- 平滑性：相邻强度档位之间的编辑结果应渐进变化，而不是突跳；
+- 可校准性：目标强度与实际达成强度之间的偏差应尽可能小。
+
+这三个性质共同构成了本研究的方法目标，也构成了实验评价的核心标准。
+
+### 3.6 外部奖励与校准框架
+为了避免自蒸馏问题，本研究不再把“teacher search”当作最终方法，只保留其 oracle 上界的作用。同时，拟引入独立于生成模型的外部评价器，约束以下行为：
+
+- 非编辑区保真；
+- 编辑方向正确；
+- 编辑强度与输入幅度匹配；
+- 局部过渡平滑，不出现明显断裂或爆炸。
+
+这个外部模块不一定一开始就做完整的 RLHF 或 DPO，可以先从可微回归器/判别器形式做起，后续再扩展到更强的偏好优化框架。
+
+## 4. 训练目标
+
+### 4.1 总体训练思路
+训练目标需要从“拟合教师参数”转向“学习可控编辑行为”。
+
+也就是说，模型优化的重点不再是：
+
+- 给定样本，预测一个看起来像 `teacher_params` 的向量；
+
+而应转变为：
+
+- 给定原始序列、编辑区域、编辑语义和幅度条件，生成与目标强度一致且背景尽量保持不变的编辑结果。
+
+### 4.2 基础扩散损失
+作为生成骨干，扩散模型仍保留标准噪声预测损失或等价的重建式扩散目标。这一部分保证模型具备基本的时序编辑生成能力。
+
+其作用不是解决幅度控制，而是提供稳定的编辑先验与生成质量基础。
+
+### 4.3 幅度一致性损失
+为了让模型真正响应强度输入，需要单独设计幅度一致性目标。基本做法是：
+
+- 从编辑结果中提取可观测的强度指标；
+- 将其与目标强度进行对齐；
+- 对两者之间的误差进行惩罚。
+
+不同任务可采用不同的强度指标，例如：
+
+- trend 类编辑使用斜率变化、终点位移、局部面积差；
+- volatility 类编辑使用局部标准差、能量增量、峰值振幅；
+- level/step 类编辑使用均值偏移与平台高度差；
+- impulse 类编辑使用峰值高度、峰值位置与峰宽。
+
+这部分损失是本研究从“会编辑”走向“可控编辑”的关键。
+
+### 4.4 非编辑区保真损失
+幅度控制不能以破坏背景为代价。因此，训练时需要显式约束非编辑区的重建误差，使模型尽量在局部实现干预，而不把全局轮廓一起改坏。
+
+这部分目标尤其重要，因为控制越强，模型越容易在目标区外产生连带扰动。
+
+### 4.5 单调性约束
+如果仅靠点对点监督，模型仍可能在相邻幅度之间出现不稳定跳变。因此，建议加入单调性约束：
+
+- 对同一条样本构造多个幅度版本；
+- 要求更大强度输入对应的响应指标不小于更小强度输入；
+- 对违反顺序的结果施加排序损失或 margin 惩罚。
+
+这一设计可以让“weak/medium/strong”不只是标签，而真正形成有序控制关系。
+
+### 4.6 外部奖励或偏好约束
+当基础版本训练稳定后，可引入外部评价器提供更高层的行为约束。其形式可以逐步升级：
+
+1. 先使用回归式 critic，对输出强度与保真度打分；
+2. 再构造成对偏好样本，比较“幅度正确”与“幅度失控”编辑结果；
+3. 最后在条件允许时探索 DPO/CRD 等更强的对齐训练方式。
+
+这里的重点不是追求复杂优化框架，而是建立真正外部的纠偏信号，避免继续陷入模型自己给自己打标签的闭环。
+
+## 5. 实验体系
+
+### 5.1 实验目的重构
+本研究的实验体系不再围绕“谁的平均 MAE 更低”展开，而围绕以下三个问题展开：
+
+1. 模型是否真的具备幅度控制能力；
+2. 模型的控制是否稳定、单调、可校准；
+3. 在控制幅度的同时，模型是否仍然保持了非编辑区保真与任务泛化能力。
+
+### 5.2 实验一：幅度响应曲线
+这是核心实验，用于直接回答“是否真的实现了控制”。
+
+实验设置：
+- 固定编辑类型与编辑区域；
+- 对同一样本输入多个强度档位；
+- 观察输出的实际响应指标如何变化。
+
+对比对象：
+- 原生 TEdit 或固定属性编辑器；
+- 现有 heuristic / teacher-search 外控方法；
+- 本研究提出的幅度控制模型。
+
+关键结果形式：
+- 输入强度 vs 实际响应强度曲线；
+- 输入强度 vs 非编辑区误差曲线。
+
+预期目标：
+- baseline 呈现弱控制或阶跃式控制；
+- 我们的方法呈现单调、平滑的响应曲线。
+
+### 5.3 实验二：幅度校准误差
+该实验用于回答“模型不是只会变强，而是能否按指定强度去变”。
+
+实验指标可包括：
+- magnitude calibration error；
+- peak delta error；
+- signed area error；
+- local std ratio error。
+
+如果输入是离散桶，则评估各档位之间是否显著可区分；如果输入是连续值，则评估输出是否接近目标值。
+
+### 5.4 实验三：单调性与顺序一致性
+该实验用于验证文本强弱控制是否真正成立。
+
+实验设置：
+- 对相同样本分别输入 `weak / medium / strong / extreme`；
+- 检查响应指标是否满足全序关系；
+- 统计 monotonicity success rate。
+
+这项实验非常重要，因为它直接决定“文本强度控制”能否构成独立贡献。
+
+### 5.5 实验四：保真-控制折中
+控制越强，越容易破坏背景。因此需要单独考察：
+
+- 在不同强度下，目标区效果提升了多少；
+- 同时非目标区损伤增加了多少；
+- 不同方法在该折中上的 Pareto 关系如何。
+
+这项实验有助于说明你们的方法不是“越改越狠”，而是在控制与保真之间取得了更优的平衡。
+
+### 5.6 实验五：偏差抑制与部署稳定性
+该实验用于比较：
+
+- 启发式方法；
+- 自蒸馏 student；
+- 加入外部 critic / reward 的方法。
+
+重点关注：
+- 方向翻转率；
+- 幅度爆炸率；
+- 高强度输入下的异常率；
+- 跨数据集迁移后的稳定性。
+
+这项实验直接回应老师关于“自己教自己 bias 更高”的质疑。
+
+### 5.7 实验六：双任务验证
+为了保留 BetterTSE 的整体价值，最终仍需要在两个主任务上验证：
+
+1. 纯时序编辑
+用于验证局部控制能力本身；
+
+2. 预测修正
+用于验证幅度控制模块能否作为基线预测器上的残差修正插件。
+
+但需要强调：预测修正是下游应用验证，不应喧宾夺主。论文主贡献仍然应放在“幅度控制能力”本身。
+
+## 6. 风险与边界
+
+### 6.1 范围膨胀风险
+当前最需要警惕的问题，是把研究目标同时扩展到：
+
+- 复杂指令分解；
+- 区域定位；
+- 扩散内部幅度控制；
+- 奖励模型；
+- 自蒸馏纠偏；
+- 预测修正多基座泛化。
+
+如果全部同时推进，项目范围会过大，难以形成清晰主线。因此必须明确主次关系：
+
+- 主问题：编辑幅度控制；
+- 支撑模块：定位与语义解析；
+- 应用验证：预测修正。
+
+### 6.2 数据与标注风险
+幅度控制研究最大的实验难点，是缺少天然带有“目标强度标签”的真实数据。因此，前期很可能必须依赖：
+
+- 可控物理注入合成数据；
+- 半合成 benchmark；
+- 文本强度到数值强度的映射规则。
+
+这意味着前期实验的重点应是“验证控制机制是否成立”，而不是过早追求完全真实场景。
+
+### 6.3 连续数值控制难度较高
+连续控制虽然最有研究价值，但实现难度也最高。若直接上连续标量控制，可能会面临：
+
+- 数据覆盖不足；
+- 响应曲线不稳定；
+- 模型过拟合到少数幅度模式。
+
+因此，更稳妥的路径是：
+
+- 先做文本级或离散桶级控制；
+- 再扩展到连续数值控制。
+
+### 6.4 奖励模型训练成本高
+引入 reward model、偏好优化、DPO/CRD 会显著增加工程和训练复杂度。对于第一阶段研究，建议将其定位为增强模块，而不是前置前提。
+
+更现实的做法是：
+- 第一阶段先用显式指标和轻量 critic 做外部约束；
+- 第二阶段再探索更强的偏好优化框架。
+
+### 6.5 贡献边界需要诚实表述
+如果第一阶段方法主要依赖外部控制层，那么论文应诚实表述为：
+
+- 我们实现了“系统级幅度控制”；
+- 尚未完全证明扩散骨干本体已经学会最优的连续数值编辑。
+
+只有当幅度变量真正进入 diffusion 内部并在实验上表现出明确单调响应时，才能进一步主张“模型级幅度控制能力”。
+
+### 6.6 本阶段最合理的完成标准
+本阶段研究最合理的完成标准不是“解决所有问题”，而是满足以下条件：
+
+- 给出清晰的 `how much` 问题定义；
+- 建立文本或离散强度控制的可运行方法；
+- 证明模型具有单调、平滑、可区分的幅度响应；
+- 验证非编辑区保真没有显著崩坏；
+- 为后续连续数值控制与外部奖励优化留下清晰扩展路径。
+
+在这个意义上，只要我们能够让时序编辑系统真正具备“可验证的幅度控制能力”，即使控制变量最初是文本强弱或离散档位，这本身就已经构成了明确且有创新性的研究贡献。

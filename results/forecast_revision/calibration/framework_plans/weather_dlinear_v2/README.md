@@ -1,8 +1,22 @@
 # Forecast Revision Calibration Framework Plan
 
+- title: `Weather dlinear v2`
 - experiment_id: `weather_dlinear_v2`
+- dataset_role: `controlled calibration benchmark`
+- priority: `1`
+- status: `ready_for_gpu`
 - benchmark_path: `results/forecast_revision/benchmarks/weather_dlinear_v2/forecast_revision_Weather_dlinear_like_30.json`
 - output_root: `results/forecast_revision/calibration/framework_plans/weather_dlinear_v2`
+
+## Purpose
+
+Primary clean benchmark for establishing the calibration degradation curve and semi-oracle robustness pattern.
+
+## Notes
+
+- Run this first once GPU is available.
+- Use this line to validate signed-area degradation under increasingly imperfect upstream signals.
+- Keep Weather as the main positive calibration example.
 
 ## Planned Stages
 

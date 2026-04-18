@@ -1,8 +1,22 @@
 # Forecast Revision Calibration Framework Plan
 
+- title: `XTraffic dlinear v2`
 - experiment_id: `xtraffic_dlinear_v2`
+- dataset_role: `proxy-target stress test`
+- priority: `3`
+- status: `ready_for_gpu`
 - benchmark_path: `results/forecast_revision/benchmarks/xtraffic_p01_speed_dlinear_v2/forecast_revision_XTraffic_dlinear_like_9.json`
 - output_root: `results/forecast_revision/calibration/framework_plans/xtraffic_dlinear_v2`
+
+## Purpose
+
+Real-data stress test for target-space mismatch rather than a clean calibration oracle.
+
+## Notes
+
+- Do not present this as clean oracle calibration.
+- Use this line to document residual-derived target and executor-space mismatch.
+- Pair interpretation with executor refit sanity checks.
 
 ## Planned Stages
 

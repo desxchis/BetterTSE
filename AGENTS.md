@@ -12,6 +12,7 @@ Prioritize reproducibility, minimal-risk changes, and validation that matches th
 - Start from the original problem, desired outcome, and hard constraints instead of jumping directly to an implementation pattern.
 - Stay cautious about hidden assumptions, especially when the request is underspecified or the stated solution may not match the actual objective.
 - If the motivation, target behavior, or business intent is unclear, stop and discuss it with the user before making code or design decisions.
+- If the user's motivation or target outcome is unclear, pause and clarify before proposing a solution or editing code.
 
 ## Repository map
 
@@ -50,6 +51,7 @@ Do not invent a new workflow that bypasses the current pipeline structure.
 ## TypeScript rule
 
 - If any TypeScript code must be written, you must use the `typescript-project-specifications` skill.
+- This requirement is mandatory and must not be skipped when the task involves writing or modifying TypeScript.
 
 ## High-risk areas
 
@@ -120,6 +122,7 @@ Add TEdit paths only if the change depends on real model execution:
 - Do not introduce fallback, downgrade, hedging, or side-route solutions that the user did not ask for.
 - Do not add alternative business behaviors beyond the stated requirement, because that can shift business logic away from the true target.
 - Any proposed solution must be logically correct and must be checked through the full end-to-end flow before it is presented as the plan.
+- If the real requirement remains ambiguous after initial analysis, stop and discuss the goal with the user instead of filling gaps with assumptions.
 
 ## Documentation policy
 

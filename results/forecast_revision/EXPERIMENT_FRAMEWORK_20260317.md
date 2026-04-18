@@ -81,6 +81,22 @@ This layer is meant to stabilize:
 - train/eval dependency wiring
 - benchmark-role discipline
 
+
+Execution priority should stay fixed:
+
+1. `Weather`
+2. `MTBench`
+3. `XTraffic`
+
+Interpretation:
+
+- `Weather`:
+  - establish the main calibration degradation curve
+- `MTBench`:
+  - test native-text robustness, especially signed-area behavior
+- `XTraffic`:
+  - keep as a proxy-target stress test, not a clean oracle claim
+
 ## Dataset-Role Discipline
 
 Do not treat every candidate multimodal time-series dataset as a main benchmark.

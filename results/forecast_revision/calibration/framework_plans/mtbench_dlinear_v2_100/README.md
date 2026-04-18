@@ -1,8 +1,22 @@
 # Forecast Revision Calibration Framework Plan
 
+- title: `MTBench dlinear v2 100`
 - experiment_id: `mtbench_dlinear_v2_100`
+- dataset_role: `native-text robustness benchmark`
+- priority: `2`
+- status: `ready_for_gpu`
 - benchmark_path: `results/forecast_revision/benchmarks/mtbench_finance_dlinear_v2_100/forecast_revision_MTBench_dlinear_like_100.json`
 - output_root: `results/forecast_revision/calibration/framework_plans/mtbench_dlinear_v2_100`
+
+## Purpose
+
+Validate that real native-text calibration remains hardest on cumulative magnitude rather than duration parsing.
+
+## Notes
+
+- Run after Weather to test whether the same calibration story survives real text.
+- Focus analysis on signed-area and cumulative magnitude behavior.
+- Do not use this line as the sole main benchmark.
 
 ## Planned Stages
 
