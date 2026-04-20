@@ -44,6 +44,7 @@ class ConditionalGenerator(nn.Module):
         self.monotonic_loss_weight = float(strength_cfg.get("monotonic_loss_weight", 0.0))
         self.monotonic_margin = float(strength_cfg.get("monotonic_margin", 1.0e-3))
         self.gain_match_loss_weight = float(strength_cfg.get("gain_match_loss_weight", 0.0))
+        self.family_gap_match_loss_weight = float(strength_cfg.get("family_gap_match_loss_weight", 0.0))
         self.family_relative_gain_loss_weight = float(strength_cfg.get("family_relative_gain_loss_weight", 0.0))
         self.family_relative_margin_scale = float(strength_cfg.get("family_relative_margin_scale", 1.0))
         self.constant_gain_penalty_weight = float(strength_cfg.get("constant_gain_penalty_weight", 0.0))
@@ -52,6 +53,11 @@ class ConditionalGenerator(nn.Module):
         self.beta_direction_loss_weight = float(strength_cfg.get("beta_direction_loss_weight", 0.0))
         self.beta_direction_margin = float(strength_cfg.get("beta_direction_margin", 0.0))
         self.beta_direction_target = str(strength_cfg.get("beta_direction_target", "family_signed_gain"))
+        output_branch_carrier_cfg = dict(strength_cfg.get("output_branch_carrier") or {})
+        self.output_branch_regularizer_weight = float(output_branch_carrier_cfg.get("regularizer_weight", 0.0))
+        self.output_branch_scalar_order_weight = float(output_branch_carrier_cfg.get("scalar_order_weight", 0.0))
+        final_mapping_cfg = dict(strength_cfg.get("final_output_strength_mapping") or {})
+        self.final_output_strength_mapping_order_weight = float(final_mapping_cfg.get("gain_order_weight", 0.0))
         self._latest_loss_breakdown = None
 
         self._init_condition_encoders(configs["attrs"], configs["side"])
@@ -107,6 +113,7 @@ class ConditionalGenerator(nn.Module):
         soft_mask=None,
         keys_null=None,
         values_null=None,
+        final_strength_mask=None,
     ):
         """
         Predict noise with optional attention injection for soft-boundary editing.
@@ -136,11 +143,31 @@ class ConditionalGenerator(nn.Module):
             model_kwargs["text_context"] = text_context
         if strength_scalar is not None:
             model_kwargs["strength_scalar"] = strength_scalar
+        if final_strength_mask is not None:
+            model_kwargs["final_strength_mask"] = final_strength_mask
 
         pred_noise = self.diff_model(noisy_x, side_emb, src_attr_emb, t, **model_kwargs)  # (B,K,L)
         return pred_noise
 
-    def _noise_estimation_loss(self, x, side_emb, attr_emb, t, strength_label=None, task_id=None, text_context=None, strength_scalar=None):
+    def _output_branch_regularizer_loss(self, reference_tensor):
+        branch_loss = getattr(self.diff_model, "latest_output_branch_regularizer_loss", None)
+        if torch.is_tensor(branch_loss):
+            return branch_loss.to(device=reference_tensor.device, dtype=reference_tensor.dtype)
+        return reference_tensor.new_tensor(0.0)
+
+    def _output_branch_scalar_order_loss(self, reference_tensor):
+        branch_loss = getattr(self.diff_model, "latest_output_branch_scalar_order_loss", None)
+        if torch.is_tensor(branch_loss):
+            return branch_loss.to(device=reference_tensor.device, dtype=reference_tensor.dtype)
+        return reference_tensor.new_tensor(0.0)
+
+    def _final_output_strength_mapping_order_loss(self, reference_tensor):
+        gain_loss = getattr(self.diff_model, "latest_final_output_strength_mapping_order_loss", None)
+        if torch.is_tensor(gain_loss):
+            return gain_loss.to(device=reference_tensor.device, dtype=reference_tensor.dtype)
+        return reference_tensor.new_tensor(0.0)
+
+    def _noise_estimation_loss(self, x, side_emb, attr_emb, t, strength_label=None, task_id=None, text_context=None, strength_scalar=None, final_strength_mask=None):
         noise = torch.randn_like(x)
         noisy_x = self.ddpm.forward(x, t, noise)
         pred_noise = self.predict_noise(
@@ -152,6 +179,7 @@ class ConditionalGenerator(nn.Module):
             task_id=task_id,
             text_context=text_context,
             strength_scalar=strength_scalar,
+            final_strength_mask=final_strength_mask,
         )
         
         residual = noise - pred_noise
@@ -202,6 +230,7 @@ class ConditionalGenerator(nn.Module):
 
     def fintune(self, batch, is_train):
         src_x, tp, src_attrs, tgt_attrs, tgt_x, strength_label, strength_scalar, task_id, instruction_text = self._unpack_data_edit(batch)
+        final_strength_mask = self._prepare_final_strength_mask(batch, src_x.shape)
 
         side_emb = self.side_en(tp)
         src_attr_emb = self.attr_en(src_attrs)
@@ -218,7 +247,23 @@ class ConditionalGenerator(nn.Module):
             strength_scalar=strength_scalar,
             task_id=task_id,
             text_context=instruction_text,
+            final_strength_mask=final_strength_mask,
         )  # (B,V,L)
+        output_branch_regularizer_loss = (
+            self._output_branch_regularizer_loss(src_x)
+            if self.output_branch_regularizer_weight > 0.0
+            else src_x.new_tensor(0.0)
+        )
+        output_branch_scalar_order_loss = (
+            self._output_branch_scalar_order_loss(src_x)
+            if self.output_branch_scalar_order_weight > 0.0
+            else src_x.new_tensor(0.0)
+        )
+        final_output_strength_mapping_order_loss = (
+            self._final_output_strength_mapping_order_loss(src_x)
+            if self.final_output_strength_mapping_order_weight > 0.0
+            else src_x.new_tensor(0.0)
+        )
         if self.bootstrap_ratio > 0:
             bs_ids = self._bootstrap(tgt_x_pred, src_x, side_emb, src_attr_emb, tgt_attr_emb)  # (B)
         else:
@@ -236,6 +281,7 @@ class ConditionalGenerator(nn.Module):
                     strength_label=None if strength_label is None else strength_label[bs_ids],
                     strength_scalar=None if strength_scalar is None else strength_scalar[bs_ids],
                     task_id=None if task_id is None else task_id[bs_ids],
+                    final_strength_mask=None if final_strength_mask is None else final_strength_mask[bs_ids],
                     text_context=(
                         None
                         if instruction_text is None
@@ -261,15 +307,35 @@ class ConditionalGenerator(nn.Module):
                         strength_scalar=strength_scalar,
                         task_id=task_id,
                         text_context=instruction_text,
+                        final_strength_mask=final_strength_mask,
                     )
             loss_tgt = loss_tgt/self.num_steps
         weighted_loss_tgt = self.diffusion_loss_weight * loss_tgt
-        total_loss = weighted_loss_tgt
+        weighted_output_branch_regularizer_loss = self.output_branch_regularizer_weight * output_branch_regularizer_loss
+        weighted_output_branch_scalar_order_loss = self.output_branch_scalar_order_weight * output_branch_scalar_order_loss
+        weighted_final_output_strength_mapping_order_loss = (
+            self.final_output_strength_mapping_order_weight * final_output_strength_mapping_order_loss
+        )
+        total_loss = (
+            weighted_loss_tgt
+            + weighted_output_branch_regularizer_loss
+            + weighted_output_branch_scalar_order_loss
+            + weighted_final_output_strength_mapping_order_loss
+        )
         loss_breakdown = {
             "loss_tgt": float(loss_tgt.detach().item()) if isinstance(loss_tgt, torch.Tensor) else float(loss_tgt),
             "diffusion_realism_loss": float(loss_tgt.detach().item()) if isinstance(loss_tgt, torch.Tensor) else float(loss_tgt),
             "weighted_diffusion_realism_loss": float(weighted_loss_tgt.detach().item()) if isinstance(weighted_loss_tgt, torch.Tensor) else float(weighted_loss_tgt),
             "diffusion_loss_weight": float(self.diffusion_loss_weight),
+            "output_branch_regularizer_loss": float(output_branch_regularizer_loss.detach().item()),
+            "weighted_output_branch_regularizer_loss": float(weighted_output_branch_regularizer_loss.detach().item()),
+            "output_branch_regularizer_weight": float(self.output_branch_regularizer_weight),
+            "output_branch_scalar_order_loss": float(output_branch_scalar_order_loss.detach().item()),
+            "weighted_output_branch_scalar_order_loss": float(weighted_output_branch_scalar_order_loss.detach().item()),
+            "output_branch_scalar_order_weight": float(self.output_branch_scalar_order_weight),
+            "final_output_strength_mapping_order_loss": float(final_output_strength_mapping_order_loss.detach().item()),
+            "weighted_final_output_strength_mapping_order_loss": float(weighted_final_output_strength_mapping_order_loss.detach().item()),
+            "final_output_strength_mapping_order_weight": float(self.final_output_strength_mapping_order_weight),
             "edit_region_loss": 0.0,
             "background_loss": 0.0,
             "monotonic_loss": 0.0,
@@ -318,6 +384,9 @@ class ConditionalGenerator(nn.Module):
             "preservation": float(loss_breakdown.get("weighted_preservation_loss", 0.0)),
             "order_regularization": float(loss_breakdown.get("weighted_order_regularization_loss", 0.0)),
             "diffusion_realism": float(loss_breakdown.get("weighted_diffusion_realism_loss", 0.0)),
+            "branch_carrier": float(loss_breakdown.get("weighted_output_branch_regularizer_loss", 0.0)),
+            "branch_scalar_order": float(loss_breakdown.get("weighted_output_branch_scalar_order_loss", 0.0)),
+            "final_strength_mapping": float(loss_breakdown.get("weighted_final_output_strength_mapping_order_loss", 0.0)),
         }
         self._latest_loss_breakdown = loss_breakdown
         return total_loss
@@ -355,6 +424,7 @@ class ConditionalGenerator(nn.Module):
         background_l1 = src_x.new_tensor(0.0)
         monotonic_loss = src_x.new_tensor(0.0)
         gain_match_loss = src_x.new_tensor(0.0)
+        family_gap_match_loss = src_x.new_tensor(0.0)
         family_relative_gain_loss = src_x.new_tensor(0.0)
         constant_gain_penalty = src_x.new_tensor(0.0)
         numeric_only_gain_match_loss = src_x.new_tensor(0.0)
@@ -375,11 +445,13 @@ class ConditionalGenerator(nn.Module):
             weighted_losses.append(self.gain_match_loss_weight * gain_match_loss)
 
         family_monotonic_losses = []
+        family_gap_losses = []
         family_relative_losses = []
         family_constant_penalties = []
         family_beta_direction_losses = []
         family_hits = []
         family_rhos = []
+        family_hard_cases = []
         numeric_only_mask = None
         if isinstance(instruction_text, list):
             numeric_only_mask = torch.tensor(
@@ -413,20 +485,34 @@ class ConditionalGenerator(nn.Module):
                 if family_numeric_only is not None:
                     family_numeric_only = family_numeric_only[order]
 
-                family_hits.append(float(all(
+                family_monotonic_hit = float(all(
                     float(family_gains[idx + 1].item()) + 1.0e-6 >= float(family_gains[idx].item())
                     for idx in range(family_gains.numel() - 1)
-                )))
+                ))
+                family_hits.append(family_monotonic_hit)
                 rho = self._safe_spearman(family_scalar, family_gains)
                 if rho is not None:
                     family_rhos.append(float(rho))
+
+                pred_gain_seq = [float(value) for value in family_gains.detach().cpu().tolist()]
+                target_gain_seq = [float(value) for value in family_target_gains.detach().cpu().tolist()]
+                strength_scalar_seq = [float(value) for value in family_scalar.detach().cpu().tolist()]
+                pred_minus_target_seq = []
+                pred_gap_seq = []
+                target_gap_seq = []
+                gap_error_seq = []
 
                 for idx in range(family_gains.numel() - 1):
                     pred_gap = family_gains[idx + 1] - family_gains[idx]
                     target_gap = family_target_gains[idx + 1] - family_target_gains[idx]
                     required_gap = torch.clamp(target_gap * self.family_relative_margin_scale, min=self.monotonic_margin)
+                    pred_gap_seq.append(float(pred_gap.detach().item()))
+                    target_gap_seq.append(float(target_gap.detach().item()))
+                    gap_error_seq.append(float(torch.abs(pred_gap - target_gap).detach().item()))
                     if self.monotonic_loss_weight > 0.0:
                         family_monotonic_losses.append(torch.relu(required_gap - pred_gap))
+                    if self.family_gap_match_loss_weight > 0.0:
+                        family_gap_losses.append(torch.abs(pred_gap - target_gap))
                     if self.family_relative_gain_loss_weight > 0.0:
                         norm_gap = required_gap / torch.clamp(family_target_gains[idx + 1] + family_target_gains[idx], min=1.0e-6)
                         pred_norm_gap = pred_gap / torch.clamp(family_gains[idx + 1].detach() + family_gains[idx].detach(), min=1.0e-6)
@@ -436,6 +522,23 @@ class ConditionalGenerator(nn.Module):
                         if float(direction_target.abs().item()) > 0.0:
                             direction_margin = torch.clamp(target_gap.detach().abs(), min=self.beta_direction_margin)
                             family_beta_direction_losses.append(torch.relu(direction_margin - (direction_target * pred_gap)))
+
+                pred_minus_target_seq = [
+                    float(pred_value - target_value)
+                    for pred_value, target_value in zip(pred_gain_seq, target_gain_seq)
+                ]
+                family_hard_cases.append({
+                    "strength_scalar_seq": strength_scalar_seq,
+                    "pred_gain_seq": pred_gain_seq,
+                    "target_gain_seq": target_gain_seq,
+                    "pred_minus_target_seq": pred_minus_target_seq,
+                    "pred_gap_seq": pred_gap_seq,
+                    "target_gap_seq": target_gap_seq,
+                    "family_monotonic_hit": family_monotonic_hit,
+                    "family_spearman": None if rho is None else float(rho),
+                    "worst_gap_error": float(max(gap_error_seq)) if gap_error_seq else 0.0,
+                    "worst_gain_error": float(max(abs(value) for value in pred_minus_target_seq)) if pred_minus_target_seq else 0.0,
+                })
 
                 if self.constant_gain_penalty_weight > 0.0 and family_gains.numel() > 1:
                     family_gain_std = torch.std(family_gains, unbiased=False)
@@ -456,6 +559,9 @@ class ConditionalGenerator(nn.Module):
         if family_monotonic_losses:
             monotonic_loss = torch.stack(family_monotonic_losses).mean()
             weighted_losses.append(self.monotonic_loss_weight * monotonic_loss)
+        if family_gap_losses:
+            family_gap_match_loss = torch.stack(family_gap_losses).mean()
+            weighted_losses.append(self.family_gap_match_loss_weight * family_gap_match_loss)
         if family_relative_losses:
             family_relative_gain_loss = torch.stack(family_relative_losses).mean()
             weighted_losses.append(self.family_relative_gain_loss_weight * family_relative_gain_loss)
@@ -470,11 +576,35 @@ class ConditionalGenerator(nn.Module):
             'train_edit_gain_mean': float(gains.detach().mean().item()),
             'train_target_gain_mean': float(target_gains.detach().mean().item()),
             'train_gain_gap_abs_mean': float(torch.abs(gains - target_gains).detach().mean().item()),
+            'train_family_gap_match_loss': float(family_gap_match_loss.detach().item()),
             'train_family_relative_gain_loss': float(family_relative_gain_loss.detach().item()),
             'train_constant_gain_penalty': float(constant_gain_penalty.detach().item()),
             'train_numeric_only_gain_match_loss': float(numeric_only_gain_match_loss.detach().item()),
             'train_beta_direction_loss': float(beta_direction_loss.detach().item()),
         }
+        if family_hard_cases:
+            sorted_hard_cases = sorted(
+                family_hard_cases,
+                key=lambda row: (
+                    0 if not row['family_monotonic_hit'] else 1,
+                    -float(row['worst_gap_error']),
+                    -float(row['worst_gain_error']),
+                ),
+            )
+            diag_payload['train_family_hard_cases'] = sorted_hard_cases[: min(3, len(sorted_hard_cases))]
+            diag_payload['train_family_worst_gap_error_mean'] = float(
+                sum(float(row['worst_gap_error']) for row in family_hard_cases) / len(family_hard_cases)
+            )
+            diag_payload['train_family_worst_gain_error_mean'] = float(
+                sum(float(row['worst_gain_error']) for row in family_hard_cases) / len(family_hard_cases)
+            )
+            diag_payload['train_family_non_monotonic_count'] = int(
+                sum(1 for row in family_hard_cases if not row['family_monotonic_hit'])
+            )
+            valid_family_spearman = [float(row['family_spearman']) for row in family_hard_cases if row['family_spearman'] is not None]
+            if valid_family_spearman:
+                diag_payload['train_family_spearman_min'] = float(min(valid_family_spearman))
+
         if strength_scalar is not None:
             scalar_diag = {}
             target_scalar_diag = {}
@@ -528,12 +658,14 @@ class ConditionalGenerator(nn.Module):
         if not return_breakdown:
             return total_loss
         weighted_gain_match_loss = float((self.gain_match_loss_weight * gain_match_loss).detach().item()) if self.gain_match_loss_weight > 0.0 else 0.0
+        weighted_family_gap_match_loss = float((self.family_gap_match_loss_weight * family_gap_match_loss).detach().item()) if self.family_gap_match_loss_weight > 0.0 else 0.0
         weighted_family_relative_gain_loss = float((self.family_relative_gain_loss_weight * family_relative_gain_loss).detach().item()) if self.family_relative_gain_loss_weight > 0.0 else 0.0
         weighted_constant_gain_penalty = float((self.constant_gain_penalty_weight * constant_gain_penalty).detach().item()) if self.constant_gain_penalty_weight > 0.0 else 0.0
         weighted_numeric_only_gain_match_loss = float((self.numeric_only_loss_weight * numeric_only_gain_match_loss).detach().item()) if self.numeric_only_loss_weight > 0.0 else 0.0
         weighted_beta_direction_loss = float((self.beta_direction_loss_weight * beta_direction_loss).detach().item()) if self.beta_direction_loss_weight > 0.0 else 0.0
         weighted_amplitude_control_loss = (
             weighted_gain_match_loss
+            + weighted_family_gap_match_loss
             + weighted_family_relative_gain_loss
             + weighted_constant_gain_penalty
             + weighted_numeric_only_gain_match_loss
@@ -544,11 +676,12 @@ class ConditionalGenerator(nn.Module):
             'background_loss': float(background_l1.detach().item()),
             'monotonic_loss': float(monotonic_loss.detach().item()),
             'gain_match_loss': float(gain_match_loss.detach().item()),
+            'family_gap_match_loss': float(family_gap_match_loss.detach().item()),
             'family_relative_gain_loss': float(family_relative_gain_loss.detach().item()),
             'constant_gain_penalty': float(constant_gain_penalty.detach().item()),
             'numeric_only_gain_match_loss': float(numeric_only_gain_match_loss.detach().item()),
             'beta_direction_loss': float(beta_direction_loss.detach().item()),
-            'amplitude_control_loss': float((gain_match_loss + family_relative_gain_loss + constant_gain_penalty + numeric_only_gain_match_loss + beta_direction_loss).detach().item()),
+            'amplitude_control_loss': float((gain_match_loss + family_gap_match_loss + family_relative_gain_loss + constant_gain_penalty + numeric_only_gain_match_loss + beta_direction_loss).detach().item()),
             'local_fidelity_loss': float(edit_region_l1.detach().item()),
             'preservation_loss': float(background_l1.detach().item()),
             'order_regularization_loss': float(monotonic_loss.detach().item()),
@@ -556,6 +689,7 @@ class ConditionalGenerator(nn.Module):
             'weighted_background_loss': float((self.background_loss_weight * background_l1).detach().item()) if self.background_loss_weight > 0.0 else 0.0,
             'weighted_monotonic_loss': float((self.monotonic_loss_weight * monotonic_loss).detach().item()) if self.monotonic_loss_weight > 0.0 else 0.0,
             'weighted_gain_match_loss': weighted_gain_match_loss,
+            'weighted_family_gap_match_loss': weighted_family_gap_match_loss,
             'weighted_family_relative_gain_loss': weighted_family_relative_gain_loss,
             'weighted_constant_gain_penalty': weighted_constant_gain_penalty,
             'weighted_numeric_only_gain_match_loss': weighted_numeric_only_gain_match_loss,
@@ -564,6 +698,7 @@ class ConditionalGenerator(nn.Module):
             'weighted_local_fidelity_loss': float((self.edit_region_loss_weight * edit_region_l1).detach().item()) if self.edit_region_loss_weight > 0.0 else 0.0,
             'weighted_preservation_loss': float((self.background_loss_weight * background_l1).detach().item()) if self.background_loss_weight > 0.0 else 0.0,
             'weighted_order_regularization_loss': float((self.monotonic_loss_weight * monotonic_loss).detach().item()) if self.monotonic_loss_weight > 0.0 else 0.0,
+            'family_gap_match_loss_weight': float(self.family_gap_match_loss_weight),
             'family_relative_gain_loss_weight': float(self.family_relative_gain_loss_weight),
             'constant_gain_penalty_weight': float(self.constant_gain_penalty_weight),
             'numeric_only_loss_weight': float(self.numeric_only_loss_weight),
@@ -628,6 +763,29 @@ class ConditionalGenerator(nn.Module):
             instruction_text = None
         return src_x, tp, src_attrs, tgt_attrs, tgt_x, strength_label, strength_scalar, task_id, instruction_text
 
+    def _prepare_final_strength_mask(self, batch, x_shape):
+        mask = batch.get("mask_gt")
+        if mask is None:
+            return None
+        mask = mask.to(self.device).float()
+        batch_size, num_vars, seq_len = x_shape
+        if mask.dim() == 2:
+            mask = mask.unsqueeze(1)
+        elif mask.dim() == 3:
+            if mask.shape[1] == seq_len and mask.shape[2] == num_vars:
+                mask = mask.permute(0, 2, 1)
+            elif mask.shape[1] == num_vars and mask.shape[2] == seq_len:
+                pass
+            elif mask.shape[-1] == 1 and mask.shape[1] == seq_len:
+                mask = mask.permute(0, 2, 1)
+        if mask.shape[0] != batch_size:
+            raise ValueError(f"mask_gt batch size {mask.shape[0]} does not match input batch size {batch_size}")
+        if mask.shape[1] == 1 and num_vars != 1:
+            mask = mask.expand(-1, num_vars, -1)
+        if tuple(mask.shape) != (batch_size, num_vars, seq_len):
+            raise ValueError(f"mask_gt shape {tuple(mask.shape)} cannot broadcast to {(batch_size, num_vars, seq_len)}")
+        return mask
+
     """
     Generation.
     """
@@ -682,6 +840,7 @@ class ConditionalGenerator(nn.Module):
            sampler: forward-backward: ddim-ddim or ddim.
         """
         src_x, tp, src_attrs, tgt_attrs, tgt_x, strength_label, strength_scalar, task_id, instruction_text = self._unpack_data_edit(batch)
+        final_strength_mask = self._prepare_final_strength_mask(batch, src_x.shape)
 
         side_emb = self.side_en(tp)
         src_attr_emb = self.attr_en(src_attrs)
@@ -699,6 +858,7 @@ class ConditionalGenerator(nn.Module):
                 strength_scalar=strength_scalar,
                 task_id=task_id,
                 text_context=instruction_text,
+                final_strength_mask=final_strength_mask,
                 return_diagnostics=return_diagnostics,
             )
             if return_diagnostics:
@@ -708,7 +868,7 @@ class ConditionalGenerator(nn.Module):
                 samples.append({"sample": tgt_x_pred, "diagnostics": None})
         return self._stack_sample_outputs(samples, return_diagnostics=return_diagnostics)
 
-    def _edit(self, src_x, side_emb, src_attr_emb, tgt_attr_emb, sampler, strength_label=None, strength_scalar=None, task_id=None, text_context=None, return_diagnostics=False):
+    def _edit(self, src_x, side_emb, src_attr_emb, tgt_attr_emb, sampler, strength_label=None, strength_scalar=None, task_id=None, text_context=None, final_strength_mask=None, return_diagnostics=False):
         B = src_x.shape[0]
 
         # forward
@@ -732,6 +892,7 @@ class ConditionalGenerator(nn.Module):
                         strength_scalar=strength_scalar,
                         task_id=task_id,
                         text_context=text_context,
+                        final_strength_mask=final_strength_mask,
                     )
                 xt = self.ddim.forward(xt, pred_noise, t)
 
@@ -749,6 +910,7 @@ class ConditionalGenerator(nn.Module):
                 strength_scalar=strength_scalar,
                 task_id=task_id,
                 text_context=text_context,
+                final_strength_mask=final_strength_mask,
             )
             if sampler[-4:] == "ddpm":
                 xt = self.ddpm.reverse(xt, pred_noise, t, noise)
@@ -893,11 +1055,11 @@ class ConditionalGenerator(nn.Module):
         B, K, L = src_x.shape
 
         # Convert numpy mask to tensor: (1, 1, L)
-        mask_tensor = torch.from_numpy(soft_mask).to(self.device).float()
+        mask_tensor = torch.as_tensor(soft_mask, dtype=torch.float32, device=self.device)
         mask_tensor = mask_tensor.view(1, 1, L)
 
         # Prepare soft_mask for attention injection: (B, L)
-        soft_mask_attn = torch.from_numpy(soft_mask).to(self.device).float()
+        soft_mask_attn = torch.as_tensor(soft_mask, dtype=torch.float32, device=self.device)
         soft_mask_attn = soft_mask_attn.unsqueeze(0).expand(B, -1)  # (B, L)
 
         # ==================== Step 1: Forward Diffusion to obtain starting noisy latent ====================

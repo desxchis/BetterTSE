@@ -5,7 +5,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-
+import yaml
 import numpy as np
 import torch
 
@@ -25,11 +25,24 @@ from tool.tedit_wrapper import TEditWrapper
 
 def _resolve_runtime_config_path(model_path: str, config_path: str) -> str:
     model_file = Path(model_path).resolve()
+    for candidate_name in ("resolved_runtime_config.json", "model_configs.yaml"):
+        candidate = model_file.parent.parent / candidate_name
+        if candidate.exists():
+            return str(candidate)
     requested = Path(config_path).resolve()
-    candidate = model_file.parent.parent / "model_configs.yaml"
-    if candidate.exists():
-        return str(candidate)
     return str(requested)
+
+
+def _load_wrapper_config(config_path: str) -> dict[str, Any]:
+    config_file = Path(config_path).resolve()
+    payload = json.loads(config_file.read_text(encoding="utf-8"))
+    if isinstance(payload, dict):
+        resolved_model = payload.get("resolved_configs", {}).get("model")
+        if isinstance(resolved_model, dict) and all(key in resolved_model for key in ("attrs", "side", "diffusion")):
+            return resolved_model
+    if isinstance(payload, dict) and all(key in payload for key in ("attrs", "side", "diffusion")):
+        return payload
+    raise ValueError(f"Unsupported TEdit wrapper config structure: {config_file}")
 
 
 DEFAULT_STRENGTH_CONTROLS = [
@@ -37,6 +50,19 @@ DEFAULT_STRENGTH_CONTROLS = [
     {"strength_label": 1, "strength_scalar": 0.5, "strength_text": "medium"},
     {"strength_label": 2, "strength_scalar": 1.0, "strength_text": "strong"},
 ]
+
+
+def resolve_dataset_folder(dataset_folder: str, selector: str | None = None) -> str:
+    root = Path(dataset_folder)
+    if selector:
+        candidate = root / selector
+        if (candidate / "meta.json").exists():
+            return str(candidate)
+        if (root / "meta.json").exists() and root.name == selector:
+            return str(root)
+    if (root / "meta.json").exists():
+        return str(root)
+    return str(root / selector) if selector else str(root)
 
 
 def _load_eval_records(dataset_folder: str, split: str, max_samples: int) -> tuple[list[dict[str, Any]], list[str]]:
@@ -66,9 +92,20 @@ def _load_eval_records(dataset_folder: str, split: str, max_samples: int) -> tup
                         "target": np.asarray(row["tgt_x"], dtype=np.float32).squeeze(-1),
                     }
                 )
+            edit_indices = np.flatnonzero(edit_mask)
+            region_start = int(edit_indices[0]) if edit_indices.size > 0 else None
+            region_end = int(edit_indices[-1] + 1) if edit_indices.size > 0 else None
             records.append(
                 {
                     "sample_idx": int(family_idx),
+                    "family_id": str(family.get("family_id", family_idx)),
+                    "tool_name": str(per_strength[0].get("tool_name", "unknown")),
+                    "family_semantic_tag": str(per_strength[0].get("family_semantic_tag", "unknown")),
+                    "task_id": per_strength[0].get("task_id"),
+                    "region_start": region_start,
+                    "region_end": region_end,
+                    "region_len": None if region_start is None or region_end is None else int(region_end - region_start),
+                    "series_length": int(base.shape[0]),
                     "base": base,
                     "src_attrs": src_attrs,
                     "tgt_attrs": tgt_attrs,
@@ -164,6 +201,41 @@ def _compute_region_metrics(
     if np.any(bg_mask):
         metrics["bg_mae"] = float(np.mean(abs_delta[bg_mask]))
     return metrics
+
+
+def _region_value_stats(values: np.ndarray, mask: np.ndarray) -> dict[str, float | None]:
+    arr = np.asarray(values, dtype=np.float32).reshape(-1)
+    region_mask = np.asarray(mask, dtype=bool).reshape(-1)
+    if not np.any(region_mask):
+        return {
+            "mean": None,
+            "abs_mean": None,
+            "min": None,
+            "max": None,
+            "floor_distance": None,
+        }
+    region = arr[region_mask]
+    return {
+        "mean": float(np.mean(region)),
+        "abs_mean": float(np.mean(np.abs(region))),
+        "min": float(np.min(region)),
+        "max": float(np.max(region)),
+        "floor_distance": float(np.mean(np.abs(region))),
+    }
+
+
+def _gap_sequence(values: list[float | None]) -> list[float | None]:
+    gaps: list[float | None] = []
+    for left, right in zip(values[:-1], values[1:]):
+        if left is None or right is None:
+            gaps.append(None)
+        else:
+            gaps.append(float(right - left))
+    return gaps
+
+
+def _none_or_float(value: float | None) -> float | None:
+    return None if value is None else float(value)
 
 
 def _aggregate_mean(values: list[float | None]) -> float | None:
@@ -276,15 +348,21 @@ def main() -> None:
     parser.add_argument("--task-id", type=int, default=-1, help="use -1 to omit task_id for phase-1 strength+text evaluation")
     parser.add_argument("--condition-mode", default="both", choices=["both", "label_only", "text_only"], help="ablate whether strength comes from numeric label, text, or both")
     parser.add_argument("--enable-strength-diagnostics", type=int, default=1)
+    parser.add_argument("--selector", default="")
     parser.add_argument("--output", required=True)
     args = parser.parse_args()
 
     runtime_config_path = _resolve_runtime_config_path(args.model_path, args.config_path)
-    eval_records, attr_list = _load_eval_records(args.dataset_folder, args.split, args.max_samples)
+    wrapper_config = _load_wrapper_config(runtime_config_path)
+    resolved_dataset_folder = resolve_dataset_folder(args.dataset_folder, args.selector.strip() or None)
+    eval_records, attr_list = _load_eval_records(resolved_dataset_folder, args.split, args.max_samples)
     if not eval_records:
         raise ValueError("No evaluation records were found for the requested split.")
 
-    wrapper = TEditWrapper(model_path=args.model_path, config_path=runtime_config_path, device=args.device)
+    wrapper = TEditWrapper(model_path=None, config_path=None, device=args.device)
+    wrapper_config_path = Path(args.output).resolve().parent / "_wrapper_model_config.yaml"
+    wrapper_config_path.write_text(yaml.safe_dump(wrapper_config, allow_unicode=True, sort_keys=False), encoding="utf-8")
+    wrapper.load_model(model_path=args.model_path, config_path=str(wrapper_config_path))
 
     strength_rows: dict[str, list[dict[str, Any]]] = {}
     pairwise_rows: list[dict[str, Any]] = []
@@ -296,6 +374,14 @@ def main() -> None:
         src_attrs = np.asarray(record["src_attrs"], dtype=np.int64)
         tgt_attrs = np.asarray(record["tgt_attrs"], dtype=np.int64)
         edit_mask = np.asarray(record["edit_mask"], dtype=bool)
+        family_id = str(record.get("family_id", sample_idx))
+        tool_name = str(record.get("tool_name", "unknown"))
+        family_semantic_tag = str(record.get("family_semantic_tag", "unknown"))
+        task_id = record.get("task_id")
+        region_start = record.get("region_start")
+        region_end = record.get("region_end")
+        region_len = record.get("region_len")
+        series_length = record.get("series_length")
         controls = list(record.get("controls") or [])
         if not np.any(edit_mask):
             strongest_target = np.asarray(controls[-1]["target"], dtype=np.float32)
@@ -346,6 +432,7 @@ def main() -> None:
                 strength_scalar=run_strength_scalars,
                 task_id=None if args.task_id < 0 else [int(args.task_id)] * batch_size,
                 instruction_text=instruction_texts,
+                edit_mask=edit_mask.astype(np.float32),
                 return_diagnostics=True,
                 enable_strength_diagnostics=bool(args.enable_strength_diagnostics),
             )
@@ -354,7 +441,13 @@ def main() -> None:
                 f"Strength eval failed at sample_idx={sample_idx}, eval_idx={eval_idx}, condition_mode={args.condition_mode}, model_path={args.model_path}, config_path={runtime_config_path}"
             ) from exc
         model_diag = diagnostics["model"][0] if diagnostics.get("model") else {}
-        raw_batch = np.asarray(model_diag.get("raw_reverse_output"), dtype=np.float32).squeeze(1)
+        raw_reverse_output = model_diag.get("raw_reverse_output")
+        if raw_reverse_output is None:
+            raw_batch = np.zeros_like(edited_batch, dtype=np.float32)
+        else:
+            if hasattr(raw_reverse_output, "detach"):
+                raw_reverse_output = raw_reverse_output.detach().cpu().numpy()
+            raw_batch = np.asarray(raw_reverse_output, dtype=np.float32).squeeze(1)
         projector_pairwise = _aggregate_nested_numeric_dict(
             diagnostics.get("projector") or [],
             ["projector_output_pairwise_l2_by_scalar", "projector_output_pairwise_l2"],
@@ -373,6 +466,11 @@ def main() -> None:
         )
 
         per_strength: dict[str, dict[str, Any]] = {}
+        source_stats = _region_value_stats(base, edit_mask)
+        target_gain_seq: list[float | None] = []
+        pred_gain_seq: list[float | None] = []
+        target_floor_distance_seq: list[float | None] = []
+        pred_floor_distance_seq: list[float | None] = []
         for control_idx, control in enumerate(controls):
             scalar_key = f"{float(control['strength_scalar']):.4f}"
             strength_rows.setdefault(scalar_key, [])
@@ -382,8 +480,23 @@ def main() -> None:
 
             metrics = _compute_region_metrics(base=base, target=target, edited=edited, mask=edit_mask)
             raw_metrics = _compute_region_metrics(base=base, target=target, edited=raw_output, mask=edit_mask)
+            target_metrics = _compute_region_metrics(base=base, target=target, edited=target, mask=edit_mask)
+            target_stats = _region_value_stats(target, edit_mask)
+            pred_stats = _region_value_stats(edited, edit_mask)
+            target_gain_seq.append(target_metrics["edit_gain"])
+            pred_gain_seq.append(metrics["edit_gain"])
+            target_floor_distance_seq.append(target_stats["floor_distance"])
+            pred_floor_distance_seq.append(pred_stats["floor_distance"])
             row = {
                 "sample_idx": int(sample_idx),
+                "family_id": family_id,
+                "tool_name": tool_name,
+                "family_semantic_tag": family_semantic_tag,
+                "task_id": task_id,
+                "region_start": region_start,
+                "region_end": region_end,
+                "region_len": region_len,
+                "series_length": series_length,
                 "strength_label": None if control.get("strength_label") is None else int(control["strength_label"]),
                 "runtime_strength_label": None if run_strength_labels is None else int(run_strength_labels[control_idx]),
                 "strength_scalar": float(control["strength_scalar"]),
@@ -394,12 +507,18 @@ def main() -> None:
                 "edit_gain": metrics["edit_gain"],
                 "bg_mae": metrics["bg_mae"],
                 "target_mae_edit_region": metrics["target_mae_edit_region"],
-                "target_edit_gain": _compute_region_metrics(base=base, target=target, edited=target, mask=edit_mask)["edit_gain"],
-                "gain_gap_abs": None if metrics["edit_gain"] is None else float(abs(metrics["edit_gain"] - _compute_region_metrics(base=base, target=target, edited=target, mask=edit_mask)["edit_gain"])),
+                "target_edit_gain": target_metrics["edit_gain"],
+                "gain_gap_abs": None if metrics["edit_gain"] is None or target_metrics["edit_gain"] is None else float(abs(metrics["edit_gain"] - target_metrics["edit_gain"])),
                 "raw_edit_region_mean_abs_delta": raw_metrics["edit_gain"],
                 "final_edit_region_mean_abs_delta": metrics["edit_gain"],
                 "raw_background_mean_abs_delta": raw_metrics["bg_mae"],
                 "final_background_mean_abs_delta": metrics["bg_mae"],
+                "source_edit_mean": source_stats["mean"],
+                "source_edit_abs_mean": source_stats["abs_mean"],
+                "source_edit_min": source_stats["min"],
+                "source_edit_max": source_stats["max"],
+                "target_floor_distance": target_stats["floor_distance"],
+                "pred_floor_distance": pred_stats["floor_distance"],
                 "blend_gap_edit_region_mean_abs": None if metrics["edit_gain"] is None or raw_metrics["edit_gain"] is None else float(abs(metrics["edit_gain"] - raw_metrics["edit_gain"])),
                 "blend_gap_background_mean_abs": None if metrics["bg_mae"] is None or raw_metrics["bg_mae"] is None else float(abs(metrics["bg_mae"] - raw_metrics["bg_mae"])),
                 "projector_pairwise_l2": projector_pairwise,
@@ -456,13 +575,44 @@ def main() -> None:
             ordered_numeric_scalars,
             [float(value) for value in edit_gains if value is not None],
         ) if all(value is not None for value in edit_gains) else None
+        target_gap_seq = _gap_sequence(target_gain_seq)
+        pred_gap_seq = _gap_sequence(pred_gain_seq)
+        pred_minus_target_seq = [
+            None if pred is None or target is None else float(pred - target)
+            for pred, target in zip(pred_gain_seq, target_gain_seq)
+        ]
+        pred_gap_minus_target_gap_seq = [
+            None if pred is None or target is None else float(pred - target)
+            for pred, target in zip(pred_gap_seq, target_gap_seq)
+        ]
         pairwise_rows.append(
             {
                 "sample_idx": int(sample_idx),
+                "family_id": family_id,
+                "tool_name": tool_name,
+                "family_semantic_tag": family_semantic_tag,
+                "task_id": task_id,
+                "region_start": region_start,
+                "region_end": region_end,
+                "region_len": region_len,
+                "series_length": series_length,
                 "edit_region_fraction": float(np.mean(edit_mask.astype(np.float32))),
+                "source_edit_mean": source_stats["mean"],
+                "source_edit_abs_mean": source_stats["abs_mean"],
+                "source_edit_min": source_stats["min"],
+                "source_edit_max": source_stats["max"],
                 "min_strength_scalar": float(ordered_numeric_scalars[0]),
                 "mid_strength_scalar": float(ordered_numeric_scalars[len(ordered_numeric_scalars) // 2]),
                 "max_strength_scalar": float(ordered_numeric_scalars[-1]),
+                "strength_scalar_seq": [float(value) for value in ordered_numeric_scalars],
+                "target_gain_by_strength": [_none_or_float(value) for value in target_gain_seq],
+                "pred_gain_by_strength": [_none_or_float(value) for value in pred_gain_seq],
+                "pred_minus_target_seq": [_none_or_float(value) for value in pred_minus_target_seq],
+                "target_gap_seq": [_none_or_float(value) for value in target_gap_seq],
+                "pred_gap_seq": [_none_or_float(value) for value in pred_gap_seq],
+                "pred_gap_minus_target_gap_seq": [_none_or_float(value) for value in pred_gap_minus_target_gap_seq],
+                "target_floor_distance_by_strength": [_none_or_float(value) for value in target_floor_distance_seq],
+                "pred_floor_distance_by_strength": [_none_or_float(value) for value in pred_floor_distance_seq],
                 "min_edit_gain": edit_gains[0],
                 "mid_edit_gain": edit_gains[len(edit_gains) // 2],
                 "max_edit_gain": edit_gains[-1],
@@ -479,6 +629,8 @@ def main() -> None:
                 "gain_range": None if edit_gains[0] is None or edit_gains[-1] is None else float(edit_gains[-1] - edit_gains[0]),
                 "family_spearman_rho_strength_gain": family_spearman,
                 "gain_calibration_mae": _aggregate_mean([row["gain_gap_abs"] for row in per_strength.values()]),
+                "worst_gain_error": max((abs(value) for value in pred_minus_target_seq if value is not None), default=None),
+                "worst_gap_error": max((abs(value) for value in pred_gap_minus_target_gap_seq if value is not None), default=None),
                 "raw_monotonic_hit": raw_monotonic,
                 "final_monotonic_hit": final_monotonic,
                 "attenuation_suspected": attenuation_suspected,

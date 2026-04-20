@@ -1,6 +1,6 @@
 # Pipeline Execution Order - 实验执行流程
 
-> 最后更新：2026-04-08
+> 最后更新：2026-04-20
 >
 > 本文档只覆盖 pure-editing strength mainline，不覆盖 forecast-revision。
 
@@ -28,6 +28,9 @@
   - 同一个 family 固定 `source/region/template`
   - family 内只改变 `weak / medium / strong`
   - 训练显式使用 `src_x / tgt_x / mask_gt / strength_label / instruction_text`
+- hard_zero 补充约束：
+  - builder 会重采样退化 hard_zero family，避免 source 区域贴近零、target edit gain 间隔过小、或 target floor distance 随 strength 反向增大的样本进入 dedicated leaf
+  - 构建 hard_zero dedicated leaf 时优先使用 collection root 形态：`--collection-root <root> --selector hard_zero --injection-types hard_zero`，保证实际叶子路径为 `<root>/hard_zero`
 - 输出：
   - `<out>/train.json`
   - `<out>/valid.json`
@@ -69,11 +72,15 @@
   - `strength_control.enabled = true`
   - `use_text_context = true`
   - `use_task_id = false`
+  - hard_zero 局部性实验可显式设置 `train.strength_control.final_output_strength_mapping.scope = edit_region`；默认仍是 `global`
   - 新输出层监督：
     - `edit_region_loss_weight`
     - `background_loss_weight`
     - `monotonic_loss_weight`
     - `monotonic_margin`
+- 注意：
+  - `run_finetune.py` 的 CLI 默认 `--epochs=50` 会覆盖 yaml 里的 `train.epochs`；跑小样本对照时应显式传 `--epochs 10` 或目标 epoch 数。
+  - synthetic pretrain 基线通常需要显式 `--pretrained_dir save/synthetic/pretrain_multi_weaver`，避免落到不存在的默认 `save/synthetic/pretrain`。
 - 关键输出：
   - `save/.../ckpts/model_best.pth`
   - `model_configs.yaml`
@@ -84,6 +91,9 @@
 
 - 脚本：`python test_scripts/probe_tedit_strength_internal.py --model-path <pth> --config-path <yaml> --dataset-folder <dataset_folder> --output <json> [--task-id <id>]`
 - 目的：验证仅改变 `strength_label` 时，内部 diffusion 输出是否发生变化
+- mask-local 注意：
+  - dedicated leaf / collection-root probe 会把 `mask_gt` 传入 `TEditWrapper.edit_time_series(edit_mask=...)`。
+  - 如果绕过该脚本直接调用 wrapper，`final_output_strength_mapping.scope=edit_region` 需要显式传 `edit_mask`；否则会按兼容逻辑退回 global。
 - 固定原则：
   - 同一个样本
   - 同一个 seed
@@ -100,6 +110,8 @@
 
 - 简化入口脚本：`python test_scripts/evaluate_tedit_strength_effect.py --model-path <pth> --config-path <yaml> --dataset-folder <dataset_folder> --output <json>`
 - discrete benchmark 主实验：`python test_scripts/run_tedit_trend_monotonic_eval.py --benchmark <json> --model-path <pth> --config-path <yaml> --output <json>`
+- mask-local 注意：
+  - `evaluate_tedit_strength_effect.py` 会把 benchmark record 中的 `edit_mask` 路由到 wrapper；这是验证 `scope=edit_region` 的必要条件。
 - 评估目标：
   - monotonicity：`weak < medium < strong`
   - preservation：背景区误差不可失控

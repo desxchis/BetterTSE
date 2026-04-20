@@ -85,6 +85,16 @@ def _get_git_provenance():
         return None
 
 
+def _deep_merge_dict(base, override):
+    merged = copy.deepcopy(base)
+    for key, value in (override or {}).items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = _deep_merge_dict(merged[key], value)
+        else:
+            merged[key] = copy.deepcopy(value)
+    return merged
+
+
 def _build_resolved_runtime_payload(*, cli_overrides, run_index, seed, ctrl_attrs, only_evaluate, skip_final_evaluate,
                                     output_folder, dataset_folder, pretrained_model_path, evaluation_model_path,
                                     finetune_configs, model_configs, eval_configs):
@@ -214,6 +224,20 @@ def _evaluate_edit(evaluator, sampler="ddim", n_samples=1, c_mean=None):
     return df
 
 
+def _resolve_selector_name(attrs):
+    return "_".join(str(attr) for attr in attrs)
+
+
+def _resolve_finetune_dataset_folder(data_folder, attrs):
+    selector = _resolve_selector_name(attrs)
+    candidate = os.path.join(data_folder, selector)
+    if os.path.exists(os.path.join(candidate, "meta.json")):
+        return candidate
+    if os.path.exists(os.path.join(data_folder, "meta.json")):
+        return data_folder
+    return candidate
+
+
 def run(finetune_configs, eval_configs, model_configs, output_folder_all, data_folder="", only_evaluate="false", c_mean=None,
         cli_overrides=None, run_index=None, seed=None, pretrained_model_path=""):
     ctrl_attrs = finetune_configs["train"]["ctrl_attrs"]
@@ -226,17 +250,15 @@ def run(finetune_configs, eval_configs, model_configs, output_folder_all, data_f
         print("*****", attrs)
         print("**************************************")
 
-        output_folder = os.path.join(output_folder_all, "_".join(attrs))
+        selector = _resolve_selector_name(attrs)
+        output_folder = os.path.join(output_folder_all, selector)
         os.makedirs(output_folder, exist_ok=True)
 
         resolved_finetune_configs = copy.deepcopy(finetune_configs)
         resolved_eval_configs = copy.deepcopy(eval_configs)
         resolved_model_configs = copy.deepcopy(model_configs)
 
-        if data_name == "discrete_strength_family":
-            resolved_data_folder = data_folder
-        else:
-            resolved_data_folder = os.path.join(data_folder, "_".join(attrs))
+        resolved_data_folder = _resolve_finetune_dataset_folder(data_folder, attrs)
         resolved_finetune_configs["data"]["folder"] = resolved_data_folder
         resolved_eval_configs["data"]["folder"] = resolved_data_folder
         resolved_finetune_configs["train"]["output_folder"] = output_folder
@@ -324,7 +346,7 @@ def run(finetune_configs, eval_configs, model_configs, output_folder_all, data_f
     if df_list:
         df_finetune = pd.concat(df_list, ignore_index=True)
     else:
-        df_finetune = pd.DataFrame()
+        df_finetune = pd.DataFrame({})
     path = os.path.join(output_folder_all, "results_finetune.csv")
     df_finetune.to_csv(path)
     return df_finetune
@@ -453,8 +475,10 @@ for n in range(args.n_runs):
         template_model_cfg_path = args.model_config_path if os.path.isabs(args.model_config_path) else os.path.join(script_dir, "configs/synthetic/model_multi_weaver.yaml")
         template_model_cfg = yaml.safe_load(open(template_model_cfg_path))
         template_strength_cfg = dict(template_model_cfg.get("diffusion", {}).get("strength_control") or {})
-        merged_strength_cfg = dict(template_strength_cfg)
-        merged_strength_cfg.update(strength_cfg)
+        merged_strength_cfg = _deep_merge_dict(template_strength_cfg, strength_cfg)
+        train_strength_cfg = run_finetune_configs["train"].get("strength_control")
+        if isinstance(train_strength_cfg, dict):
+            merged_strength_cfg = _deep_merge_dict(merged_strength_cfg, train_strength_cfg)
         for key in [
             "diffusion_loss_weight",
             "edit_region_loss_weight",
@@ -462,6 +486,7 @@ for n in range(args.n_runs):
             "monotonic_loss_weight",
             "monotonic_margin",
             "gain_match_loss_weight",
+            "family_gap_match_loss_weight",
             "family_relative_gain_loss_weight",
             "family_relative_margin_scale",
             "constant_gain_penalty_weight",
@@ -519,7 +544,8 @@ for n in range(args.n_runs):
     )
 
     n_records = df.shape[0]
-    df.insert(0, column="run", value=[n] * n_records)
+    if n_records > 0:
+        df.insert(0, column="run", value=[n] * n_records)
     df_list.append(df)
 
 if df_list:

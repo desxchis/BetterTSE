@@ -155,7 +155,7 @@ class Finetuner:
             grad.mul_(self._beta_only_repair_masks[id(target["param"])].to(device=grad.device, dtype=grad.dtype))
 
     def _mask_grad_tensor(self, param, grad_norm):
-        mask = self._beta_only_repair_masks.get(id(param))
+        mask = getattr(self, "_beta_only_repair_masks", {}).get(id(param))
         if mask is None:
             return grad_norm
         grad = param.grad
@@ -359,6 +359,11 @@ class Finetuner:
                 "train_target_gain_by_strength": self._summarize_nested_metric(generator_records, "train_target_gain_by_strength"),
                 "train_edit_gain_by_scalar": self._summarize_nested_metric(generator_records, "train_edit_gain_by_scalar"),
                 "train_target_gain_by_scalar": self._summarize_nested_metric(generator_records, "train_target_gain_by_scalar"),
+                "train_family_hard_cases": [
+                    record.get("train_family_hard_cases")
+                    for record in generator_records
+                    if isinstance(record.get("train_family_hard_cases"), list) and record.get("train_family_hard_cases")
+                ],
             },
         }
 
@@ -447,6 +452,7 @@ class Finetuner:
             "strength_projector" in name
             or "strength_modulation" in name
             or "strength_input_projection" in name
+            or "final_output_strength_mapping_head" in name
         )
 
     def _is_modulation_neighbor_parameter(self, name):

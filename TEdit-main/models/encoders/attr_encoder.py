@@ -23,10 +23,10 @@ class AttributeEncoder(nn.Module):
         )
 
     def _init_embs(self, n_ops):
-        shift = np.cumsum(n_ops)  # the number of options for each attr
-        shift = np.insert(shift, 0, 0)
-        emb = nn.Embedding(num_embeddings=shift[-1], embedding_dim=self.emb_dim)
-        shift = torch.from_numpy(shift[:-1]).unsqueeze(0).to(self.device) # (1, total_attrs)
+        shift = np.asarray(np.cumsum(n_ops), dtype=np.int64)  # the number of options for each attr
+        shift = np.insert(shift, 0, 0).astype(np.int64, copy=False)
+        emb = nn.Embedding(num_embeddings=int(shift[-1]), embedding_dim=self.emb_dim)
+        shift = torch.as_tensor(shift[:-1], dtype=torch.long, device=self.device).unsqueeze(0) # (1, total_attrs)
         return emb, shift
 
     def forward(self, attrs, replace_with_empty=False):

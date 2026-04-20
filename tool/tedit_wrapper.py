@@ -24,7 +24,19 @@ ConditionalGenerator = None
 import numpy as np
 import torch
 import torch.nn as nn
-from scipy.ndimage import gaussian_filter1d
+
+try:
+    from scipy.ndimage import gaussian_filter1d
+except Exception:
+    def gaussian_filter1d(array, sigma):
+        sigma = float(sigma)
+        if sigma <= 0.0:
+            return np.asarray(array, dtype=np.float32)
+        radius = max(1, int(round(4.0 * sigma)))
+        x = np.arange(-radius, radius + 1, dtype=np.float32)
+        kernel = np.exp(-(x ** 2) / (2.0 * sigma * sigma))
+        kernel /= np.sum(kernel)
+        return np.convolve(np.asarray(array, dtype=np.float32), kernel, mode="same")
 
 
 class TEditWrapper:
@@ -142,25 +154,53 @@ class TEditWrapper:
         update_device(self.config, self.device)
 
         try:
-            self.model = ConditionalGenerator(self.config)
-            
-            # Load checkpoint with weights_only=False for compatibility
-            # Note: Only use weights_only=False if you trust the source of the model file
             checkpoint = torch.load(
-                model_path, 
+                model_path,
                 map_location=self.device,
                 weights_only=False  # Required for PyTorch 2.6+ to load older model formats
             )
-            
-            # Load state dict
-            if isinstance(checkpoint, dict):
-                if "model_state_dict" in checkpoint:
-                    self.model.load_state_dict(checkpoint["model_state_dict"], strict=False)
-                else:
-                    self.model.load_state_dict(checkpoint, strict=False)
-            else:
-                self.model.load_state_dict(checkpoint, strict=False)
-            
+            state_dict = checkpoint["model_state_dict"] if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint else checkpoint
+
+            strength_cfg = self.config.get("diffusion", {}).get("strength_control") or {}
+            projector_weight = None
+            text_emb_weight = None
+            if isinstance(state_dict, dict):
+                projector_weight = state_dict.get("diff_model.strength_projector.mlp.0.weight")
+                text_emb_weight = state_dict.get("diff_model.strength_projector.text_encoder.token_emb.weight")
+            if isinstance(strength_cfg, dict):
+                if projector_weight is not None:
+                    expected_in_dim = int(projector_weight.shape[1])
+                    emb_dim = int(strength_cfg.get("emb_dim", 32))
+                    use_task_id = bool(strength_cfg.get("use_task_id", False))
+                    base_in_dim = emb_dim * 2 + (emb_dim if use_task_id else 0)
+                    text_extra = max(0, expected_in_dim - base_in_dim)
+                    strength_cfg["use_text_context"] = bool(text_extra > 0)
+                    strength_cfg["text_dim"] = int(text_extra) if text_extra > 0 else 0
+                elif text_emb_weight is not None:
+                    strength_cfg["use_text_context"] = True
+                    strength_cfg["text_dim"] = int(text_emb_weight.shape[1])
+
+                if projector_weight is not None:
+                    expected_in_dim = int(projector_weight.shape[1])
+                    emb_dim = int(strength_cfg.get("emb_dim", 32))
+                    use_task_id = bool(strength_cfg.get("use_task_id", False))
+                    base_in_dim = emb_dim * 2 + (emb_dim if use_task_id else 0)
+                    text_dim = int(strength_cfg.get("text_dim", 0)) if bool(strength_cfg.get("use_text_context", False)) else 0
+                    if base_in_dim + text_dim != expected_in_dim:
+                        adjusted_text_dim = max(0, expected_in_dim - base_in_dim)
+                        strength_cfg["use_text_context"] = bool(adjusted_text_dim > 0)
+                        strength_cfg["text_dim"] = int(adjusted_text_dim) if adjusted_text_dim > 0 else 0
+
+                if (
+                    text_emb_weight is not None
+                    and bool(strength_cfg.get("use_text_context", False))
+                    and int(strength_cfg.get("text_dim", 0)) == int(text_emb_weight.shape[1])
+                ):
+                    strength_cfg["text_dim"] = int(text_emb_weight.shape[1])
+                    strength_cfg["use_text_context"] = True
+
+            self.model = ConditionalGenerator(self.config)
+            self.model.load_state_dict(state_dict, strict=False)
             self.model.eval()
             self.is_loaded = True
         except Exception as e:
@@ -221,6 +261,7 @@ class TEditWrapper:
         strength_scalar: Optional[float] = None,
         task_id: Optional[int] = None,
         instruction_text: Optional[np.ndarray] = None,
+        edit_mask: Optional[np.ndarray] = None,
         return_diagnostics: bool = False,
         enable_strength_diagnostics: bool = False,
         flip_beta_sign_inference: bool = False,
@@ -262,18 +303,16 @@ class TEditWrapper:
             )
 
         with torch.no_grad():
-            x = torch.from_numpy(ts_array).unsqueeze(1).to(self.device)
+            x = torch.as_tensor(ts_array, dtype=torch.float32, device=self.device).unsqueeze(1)
             src_attrs_tensor = (
-                torch.from_numpy(src_attrs_array)
+                torch.as_tensor(src_attrs_array, dtype=torch.long, device=self.device)
                 .unsqueeze(0)
                 .repeat(B, 1)
-                .to(self.device)
             )
             tgt_attrs_tensor = (
-                torch.from_numpy(tgt_attrs_array)
+                torch.as_tensor(tgt_attrs_array, dtype=torch.long, device=self.device)
                 .unsqueeze(0)
                 .repeat(B, 1)
-                .to(self.device)
             )
 
             tp = torch.zeros(B, L, device=self.device)
@@ -289,6 +328,15 @@ class TEditWrapper:
             strength_scalar_tensor = self._normalize_numeric_control(strength_scalar, B, dtype=torch.float32, name="strength_scalar")
             task_id_tensor = self._normalize_numeric_control(task_id, B, dtype=torch.long, name="task_id")
             instruction_payload = self._normalize_text_control(instruction_text, B)
+            if edit_mask is not None:
+                edit_mask_array = np.asarray(edit_mask, dtype=np.float32)
+                if edit_mask_array.ndim == 1:
+                    edit_mask_array = np.repeat(edit_mask_array.reshape(1, L), B, axis=0)
+                elif edit_mask_array.ndim == 2 and edit_mask_array.shape[0] == 1 and B != 1:
+                    edit_mask_array = np.repeat(edit_mask_array, B, axis=0)
+                if edit_mask_array.shape != (B, L):
+                    raise ValueError(f"edit_mask must have shape [L], [1,L], or [B,L]; got {edit_mask_array.shape} for B={B}, L={L}")
+                batch["mask_gt"] = torch.as_tensor(edit_mask_array, dtype=torch.float32, device=self.device).unsqueeze(-1)
             if strength_label_tensor is not None:
                 batch["strength_label"] = strength_label_tensor
             if strength_scalar_tensor is not None:
@@ -297,6 +345,8 @@ class TEditWrapper:
                 batch["task_id"] = task_id_tensor
             if instruction_payload is not None:
                 batch["instruction_text"] = instruction_payload
+            batch.setdefault("task_id", task_id_tensor)
+            batch.setdefault("instruction_text", instruction_payload)
 
             if edit_steps is not None:
                 self.model.edit_steps = edit_steps
@@ -360,7 +410,6 @@ class TEditWrapper:
             }
             return edited_ts, diagnostics
 
-        edited_ts = samples.cpu().numpy().squeeze(1)
         if enable_strength_diagnostics:
             if StrengthProjector is not None:
                 StrengthProjector.consume_diagnostics()
@@ -551,10 +600,10 @@ class TEditWrapper:
         tgt_attrs_array = np.asarray(tgt_attrs, dtype=np.int64)
 
         with torch.no_grad():
-            x = torch.from_numpy(ts_array).unsqueeze(1).to(self.device)
-            
-            src_attrs_tensor = torch.from_numpy(src_attrs_array).unsqueeze(0).repeat(B, 1).to(self.device)
-            tgt_attrs_tensor = torch.from_numpy(tgt_attrs_array).unsqueeze(0).repeat(B, 1).to(self.device)
+            x = torch.as_tensor(ts_array, dtype=torch.float32, device=self.device).unsqueeze(1)
+
+            src_attrs_tensor = torch.as_tensor(src_attrs_array, dtype=torch.long, device=self.device).unsqueeze(0).repeat(B, 1)
+            tgt_attrs_tensor = torch.as_tensor(tgt_attrs_array, dtype=torch.long, device=self.device).unsqueeze(0).repeat(B, 1)
             tp = torch.zeros(B, L, device=self.device)
 
             batch = {
@@ -576,6 +625,8 @@ class TEditWrapper:
                 batch["task_id"] = task_id_tensor
             if instruction_payload is not None:
                 batch["instruction_text"] = instruction_payload
+            batch.setdefault("task_id", task_id_tensor)
+            batch.setdefault("instruction_text", instruction_payload)
 
             samples = self.model.edit_soft(
                 batch,

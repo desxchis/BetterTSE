@@ -1,6 +1,7 @@
 import os
 import json
 import numpy as np
+import torch
 from torch.utils.data import Dataset
 
 
@@ -50,12 +51,12 @@ class SyntheticPretrainSplit(Dataset):
         self.n_samples = self.ts.shape[0]
         self.n_steps = self.ts.shape[1]
         self.n_attrs = self.attrs.shape[1]
-        self.time_point = np.arange(self.n_steps)
+        self.time_point = np.arange(self.n_steps, dtype=np.float32)
 
     def __getitem__(self, idx):
-        return {"x": self.ts[idx][...,np.newaxis], # (n_steps,1)
-                "attrs": self.attrs[idx],
-                "tp": self.time_point}
+        return {"x": torch.tensor(self.ts[idx][..., np.newaxis], dtype=torch.float32), # (n_steps,1)
+                "attrs": torch.tensor(self.attrs[idx], dtype=torch.long),
+                "tp": torch.tensor(self.time_point, dtype=torch.float32)}
 
     def __len__(self):
         return self.n_samples

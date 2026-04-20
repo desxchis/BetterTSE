@@ -5,6 +5,8 @@ import os
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
+import numbers
+
 import numpy as np
 import torch
 from torch.utils.data import DataLoader, Dataset
@@ -42,6 +44,9 @@ def _family_metadata_signature(sample: Dict[str, Any]) -> Tuple[Any, ...]:
         sample.get("region_start"),
         sample.get("region_end"),
         sample.get("series_length"),
+        sample.get("attr_strategy"),
+        sample.get("family_semantic_tag"),
+        sample.get("task_id"),
     )
 
 
@@ -97,13 +102,122 @@ def _validate_family(family: Dict[str, Any]) -> List[Dict[str, Any]]:
     return samples
 
 
-def _trend_attrs(direction: str) -> tuple[np.ndarray, np.ndarray]:
-    src_attrs = np.asarray([0, 0, 0], dtype=np.int64)
-    if str(direction) in {"down", "downward"}:
-        tgt_attrs = np.asarray([1, 0, 1], dtype=np.int64)
+def _normalize_direction(direction: Any) -> str:
+    token = str(direction or "").strip().lower()
+    if token in {"down", "downward", "decrease", "decreasing", "negative"}:
+        return "downward"
+    if token in {"up", "upward", "increase", "increasing", "positive"}:
+        return "upward"
+    return "neutral"
+
+
+def _canonical_tool_name(tool_name: Any, effect_family: Any) -> str:
+    tool_token = str(tool_name or "").strip().lower()
+    if tool_token:
+        return tool_token
+    family_token = str(effect_family or "").strip().lower()
+    if family_token == "trend":
+        return "trend_injection"
+    if family_token == "seasonality":
+        return "seasonality"
+    if family_token == "volatility":
+        return "noise_injection"
+    return family_token or "unknown"
+
+
+def _int_metadata_value(*values: Any) -> int | None:
+    for value in values:
+        if isinstance(value, numbers.Integral):
+            return int(value)
+        if isinstance(value, str) and value.strip():
+            try:
+                return int(float(value))
+            except ValueError:
+                continue
+    return None
+
+
+NEUTRAL_ATTRS = np.asarray([0, 0, 0], dtype=np.int64)
+
+FAMILY_PROXY_ATTRS = {
+    "trend_injection": {
+        "upward": [1, 1, 1],
+        "downward": [1, 0, 1],
+        "neutral": [1, 1, 1],
+    },
+    "step_change": {
+        "upward": [1, 1, 1],
+        "downward": [1, 0, 1],
+    },
+}
+
+STEP_CHANGE_PROXY_DIRECTIONS = {
+    "upward": "proxy",
+    "downward": "proxy",
+}
+
+
+def _normalize_attr_strategy(attr_strategy: Any) -> str:
+    token = str(attr_strategy or "").strip().lower()
+    if token in {"proxy", "trend_proxy", "signed_trend_proxy", "proxy(trend)", "proxy(trend_signed)"}:
+        return "proxy"
+    return "neutral"
+
+
+def _family_semantic_tag(tool_name: str, direction: str, attr_strategy: str) -> str:
+    normalized_tool = str(tool_name).strip().lower()
+    normalized_direction = _normalize_direction(direction)
+    normalized_strategy = _normalize_attr_strategy(attr_strategy)
+    if normalized_tool == "trend_injection":
+        return f"trend_proxy_{normalized_direction}"
+    if normalized_tool == "step_change":
+        return f"step_{normalized_strategy}_{normalized_direction}"
+    if normalized_tool == "multiplier":
+        return "multiplier_neutral"
+    if normalized_tool == "hard_zero":
+        return "hard_zero_neutral"
+    if normalized_tool == "noise_injection":
+        return "noise_injection_neutral"
+    return f"{normalized_tool}_{normalized_strategy}_{normalized_direction}"
+
+
+def _resolve_family_semantics(
+    tool_name: Any,
+    direction: Any,
+    effect_family: Any,
+    attr_strategy: Any,
+) -> Dict[str, Any]:
+    src_attrs = NEUTRAL_ATTRS.copy()
+    normalized_direction = _normalize_direction(direction)
+    canonical_tool = _canonical_tool_name(tool_name, effect_family)
+    requested_strategy = _normalize_attr_strategy(attr_strategy)
+
+    effective_strategy = requested_strategy
+    if canonical_tool == "step_change" and requested_strategy == "proxy":
+        if STEP_CHANGE_PROXY_DIRECTIONS.get(normalized_direction) != "proxy":
+            effective_strategy = "neutral"
+    elif canonical_tool != "trend_injection" and canonical_tool != "step_change":
+        effective_strategy = "neutral"
+
+    if effective_strategy == "proxy":
+        proxy_targets = FAMILY_PROXY_ATTRS.get(canonical_tool)
+        if proxy_targets is None:
+            effective_strategy = "neutral"
+            tgt_attrs = NEUTRAL_ATTRS.copy()
+        else:
+            proxy_direction = normalized_direction if normalized_direction in proxy_targets else "neutral"
+            tgt_attrs = np.asarray(proxy_targets[proxy_direction], dtype=np.int64)
     else:
-        tgt_attrs = np.asarray([1, 1, 1], dtype=np.int64)
-    return src_attrs, tgt_attrs
+        tgt_attrs = NEUTRAL_ATTRS.copy()
+
+    return {
+        "canonical_tool": canonical_tool,
+        "direction": normalized_direction,
+        "attr_strategy": effective_strategy,
+        "src_attrs": src_attrs,
+        "tgt_attrs": tgt_attrs,
+        "family_semantic_tag": _family_semantic_tag(canonical_tool, normalized_direction, effective_strategy),
+    }
 
 
 class DiscreteStrengthFamilyDataset:
@@ -114,8 +228,20 @@ class DiscreteStrengthFamilyDataset:
     def _load_meta(self) -> None:
         meta_path = Path(self.folder) / "meta.json"
         if not meta_path.exists():
-            raise FileNotFoundError(f"Discrete strength family meta not found: {meta_path}")
+            raise FileNotFoundError(
+                f"Discrete strength family meta not found: {meta_path}. Expected a dedicated family leaf like <collection_root>/<selector>/meta.json"
+            )
         self.meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        selector = self.meta.get("selector")
+        if selector is None:
+            selector = Path(self.folder).name
+            self.meta["selector"] = selector
+        expected_selector = str(Path(self.folder).name)
+        if str(selector) != expected_selector:
+            raise ValueError(
+                f"Discrete strength family selector mismatch: meta selector='{selector}' but folder leaf='{expected_selector}'. "
+                "Expected a dedicated family leaf <collection_root>/<selector>."
+            )
         self.attr_list = list(self.meta["attr_list"])
         self.attr_n_ops = np.asarray(self.meta["attr_n_ops"], dtype=np.int64)
         self.ctrl_attr_ids = list(self.meta["control_attr_ids"])
@@ -158,30 +284,48 @@ class DiscreteStrengthFamilySplit(Dataset):
         family = dict(self.families[idx])
         samples = [dict(sample) for sample in self.validated_samples[idx]]
 
-        direction = str(samples[0].get("direction", family.get("direction", "up")))
-        src_attrs, tgt_attrs = _trend_attrs(direction)
+        family_tool_name = family.get("tool_name", samples[0].get("tool_name"))
+        family_effect_family = family.get("effect_family", samples[0].get("effect_family"))
+        family_direction = family.get("direction", samples[0].get("direction"))
+        family_attr_strategy = family.get("attr_strategy", samples[0].get("attr_strategy", "neutral"))
+        family_semantics = _resolve_family_semantics(
+            tool_name=family_tool_name,
+            direction=family_direction,
+            effect_family=family_effect_family,
+            attr_strategy=family_attr_strategy,
+        )
+        src_attrs = family_semantics["src_attrs"]
+        tgt_attrs = family_semantics["tgt_attrs"]
         src_x = np.asarray(samples[0]["source_ts"], dtype=np.float32)
         tp = np.arange(src_x.shape[0], dtype=np.float32)
 
         records: List[Dict[str, Any]] = []
         for sample in samples:
             strength_label = sample.get("strength_label")
-            records.append(
-                {
-                    "family_id": str(family["family_id"]),
-                    "strength_text": str(sample["strength_text"]),
-                    "strength_label": -1 if strength_label is None else int(strength_label),
-                    "strength_scalar": float(sample["strength_scalar"]),
-                    "instruction_text": str(sample["instruction_text"]),
-                    "src_x": src_x[..., np.newaxis],
-                    "tgt_x": np.asarray(sample["target_ts"], dtype=np.float32)[..., np.newaxis],
-                    "mask_gt": np.asarray(sample["mask_gt"], dtype=np.float32)[..., np.newaxis],
-                    "tp": tp,
-                    "src_attrs": src_attrs,
-                    "tgt_attrs": tgt_attrs,
-                }
-            )
+            record = {
+                "family_id": str(family["family_id"]),
+                "strength_text": str(sample["strength_text"]),
+                "strength_label": -1 if strength_label is None else int(strength_label),
+                "strength_scalar": float(sample["strength_scalar"]),
+                "instruction_text": str(sample.get("instruction_text", family.get("instruction_text", ""))),
+                "src_x": src_x[..., np.newaxis],
+                "tgt_x": np.asarray(sample["target_ts"], dtype=np.float32)[..., np.newaxis],
+                "mask_gt": np.asarray(sample["mask_gt"], dtype=np.float32)[..., np.newaxis],
+                "tp": tp,
+                "src_attrs": src_attrs,
+                "tgt_attrs": tgt_attrs,
+                "tool_name": str(family_semantics["canonical_tool"]),
+                "effect_family": str(family_effect_family or "unknown"),
+                "direction": str(family_semantics["direction"]),
+                "attr_strategy": str(family_semantics["attr_strategy"]),
+                "family_semantic_tag": str(family_semantics["family_semantic_tag"]),
+            }
+            task_id = _int_metadata_value(family.get("task_id"), sample.get("task_id"))
+            if task_id is not None:
+                record["task_id"] = task_id
+            records.append(record)
         return {"family_id": str(family["family_id"]), "samples": records}
+
 
 
 def collate_discrete_strength_families(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -201,6 +345,9 @@ def collate_discrete_strength_families(batch: List[Dict[str, Any]]) -> Dict[str,
     instruction_text = [str(sample["instruction_text"]) for sample in flat_samples]
     strength_text = [str(sample["strength_text"]) for sample in flat_samples]
     strength_scalar = [float(sample["strength_scalar"]) for sample in flat_samples]
+    attr_strategy = [str(sample.get("attr_strategy", "neutral")) for sample in flat_samples]
+    family_semantic_tag = [str(sample.get("family_semantic_tag", "unknown")) for sample in flat_samples]
+    tool_name = [str(sample.get("tool_name", "unknown")) for sample in flat_samples]
 
     family_valid = all(size >= 2 for size in family_sizes)
     family_order_valid = all(
@@ -211,7 +358,7 @@ def collate_discrete_strength_families(batch: List[Dict[str, Any]]) -> Dict[str,
         for start, size in zip(np.cumsum([0] + family_sizes[:-1]).tolist(), family_sizes)
     )
 
-    return {
+    batch_dict = {
         "src_x": _stack_array("src_x", torch.float32),
         "tgt_x": _stack_array("tgt_x", torch.float32),
         "mask_gt": _stack_array("mask_gt", torch.float32),
@@ -222,8 +369,14 @@ def collate_discrete_strength_families(batch: List[Dict[str, Any]]) -> Dict[str,
         "strength_scalar": torch.as_tensor(strength_scalar, dtype=torch.float32),
         "instruction_text": instruction_text,
         "strength_text": strength_text,
+        "attr_strategy": attr_strategy,
+        "family_semantic_tag": family_semantic_tag,
+        "tool_name": tool_name,
         "family_sizes": torch.as_tensor(family_sizes, dtype=torch.long),
         "family_ids": family_ids,
         "family_valid": bool(family_valid),
         "family_order_valid": bool(family_order_valid),
     }
+    if flat_samples and all("task_id" in sample for sample in flat_samples):
+        batch_dict["task_id"] = _stack_array("task_id", torch.long)
+    return batch_dict

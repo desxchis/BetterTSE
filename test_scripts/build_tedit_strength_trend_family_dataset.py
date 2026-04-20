@@ -29,9 +29,21 @@ def build_family_dataset(
     train_families: int,
     valid_families: int,
     test_families: int,
+    injection_types: list[str] | None = None,
+    selector: str | None = None,
+    collection_root: str | None = None,
 ) -> dict[str, object]:
-    output_root = Path(output_dir)
+    chosen_injection_types = list(injection_types or ["trend_injection"])
+    resolved_selector = str(selector or chosen_injection_types[0]).strip()
+    base_root = Path(collection_root) if collection_root else Path(output_dir)
+    output_root = base_root / resolved_selector if collection_root else Path(output_dir)
     output_root.mkdir(parents=True, exist_ok=True)
+    if not resolved_selector:
+        raise ValueError("selector must be non-empty")
+    if len(chosen_injection_types) != 1:
+        raise ValueError("Dedicated family dataset build expects exactly one injection type")
+    if chosen_injection_types[0] != resolved_selector:
+        raise ValueError(f"selector '{resolved_selector}' must match the dedicated injection type '{chosen_injection_types[0]}'")
 
     split_specs = [
         ("train", train_families, random_seed),
@@ -48,7 +60,7 @@ def build_family_dataset(
             num_families=num_families,
             seq_len=seq_len,
             random_seed=seed,
-            injection_types=["trend_injection"],
+            injection_types=chosen_injection_types,
         )
         src_json = Path(result["json_path"])
         payload = json.loads(src_json.read_text(encoding="utf-8"))
@@ -81,6 +93,15 @@ def build_family_dataset(
         "control_attr": ["trend_types"],
         "control_attr_ids": [0],
         "strength_bins": ["weak", "medium", "strong"],
+        "selector": resolved_selector,
+        "injection_types": chosen_injection_types,
+        "semantic_alignment": {
+            "mode": "unified_strength_scalar_plus_family_mapping",
+            "semantic_authority": "benchmark_family_records",
+            "use_text_context": True,
+            "use_task_id": False,
+            "step_change_default_attr_strategy": "neutral",
+        },
         "strength_axis": {
             "type": "continuous_scalar",
             "anchor_mapping": LEGACY_STRENGTH_TO_SCALAR,
@@ -92,34 +113,51 @@ def build_family_dataset(
     (output_root / "README.md").write_text(
         "\n".join(
             [
-                "# Trend Strength Family Dataset",
+                "# Discrete Strength Family Dataset",
                 "",
                 f"- dataset_name: {dataset_name}",
                 f"- seq_len: {seq_len}",
                 f"- train_families: {train_families}",
                 f"- valid_families: {valid_families}",
                 f"- test_families: {test_families}",
+                f"- selector: {resolved_selector}",
+                f"- injection_types: {', '.join(chosen_injection_types)}",
+                "- semantic_mode: unified_strength_scalar_plus_family_mapping",
+                "- semantic_authority: benchmark family-level fields (tool_name/effect_family/shape/direction/task_id/instruction_text/attr_strategy)",
+                "- task_gate_default: off (use_task_id=false)",
                 "",
                 "每个 family 固定 source/region/template，只改变有序 strength scalar（当前 anchor: weak=0.0, medium=0.5, strong=1.0）。",
+                "非 trend family 的主语义由 instruction_text 承担，task_id 仅作为受控 gate 的辅助语义通道。",
             ]
         )
         + "\n",
         encoding="utf-8",
     )
-    return {"output_dir": str(output_root), "splits": split_results}
+    return {
+        "collection_root": str(base_root if collection_root else output_root.parent),
+        "selector": resolved_selector,
+        "output_dir": str(output_root),
+        "splits": split_results,
+    }
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Build a trend-only family dataset for discrete strength TEdit training.")
+    parser = argparse.ArgumentParser(description="Build a discrete strength family dataset for TEdit training.")
     parser.add_argument("--csv-path", required=True)
     parser.add_argument("--dataset-name", default="ETTh1")
     parser.add_argument("--output-dir", required=True)
+    parser.add_argument("--collection-root", default="")
     parser.add_argument("--seq-len", type=int, default=192)
     parser.add_argument("--random-seed", type=int, default=17)
     parser.add_argument("--train-families", type=int, default=96)
     parser.add_argument("--valid-families", type=int, default=24)
     parser.add_argument("--test-families", type=int, default=24)
+    parser.add_argument("--injection-types", default="trend_injection")
+    parser.add_argument("--selector", default="")
     args = parser.parse_args()
+
+    injection_types = [token.strip() for token in args.injection_types.split(",") if token.strip()]
+    selector = args.selector.strip() or (injection_types[0] if injection_types else "")
 
     result = build_family_dataset(
         csv_path=args.csv_path,
@@ -130,6 +168,9 @@ def main() -> None:
         train_families=args.train_families,
         valid_families=args.valid_families,
         test_families=args.test_families,
+        injection_types=injection_types,
+        selector=selector,
+        collection_root=args.collection_root.strip() or None,
     )
     print(json.dumps(result, ensure_ascii=False, indent=2))
 

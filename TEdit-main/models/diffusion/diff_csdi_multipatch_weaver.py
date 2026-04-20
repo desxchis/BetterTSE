@@ -118,6 +118,103 @@ def Conv1d_with_init(in_channels, out_channels, kernel_size):
     return layer
 
 
+def _normalize_output_branch_carrier_config(config):
+    config = dict(config or {})
+    config.setdefault("enabled", False)
+    config.setdefault("mode", "skip_residual_mix")
+    config.setdefault("skip_scale", 0.0)
+    config.setdefault("min_residual_to_skip_ratio", 0.0)
+    config.setdefault("scalar_order_margin", 0.0)
+    if str(config["mode"]) != "skip_residual_mix":
+        raise ValueError(f"Unsupported output_branch_carrier mode: {config['mode']}")
+    config["mode"] = "skip_residual_mix"
+    config["enabled"] = bool(config["enabled"])
+    config["skip_scale"] = float(config["skip_scale"])
+    config["min_residual_to_skip_ratio"] = float(config["min_residual_to_skip_ratio"])
+    config["scalar_order_margin"] = float(config["scalar_order_margin"])
+    if config["skip_scale"] < 0.0:
+        raise ValueError("output_branch_carrier.skip_scale must be non-negative")
+    if config["min_residual_to_skip_ratio"] < 0.0:
+        raise ValueError("output_branch_carrier.min_residual_to_skip_ratio must be non-negative")
+    if config["scalar_order_margin"] < 0.0:
+        raise ValueError("output_branch_carrier.scalar_order_margin must be non-negative")
+    return config
+
+
+def _normalize_final_output_strength_scale_config(config):
+    config = dict(config or {})
+    config.setdefault("enabled", False)
+    config.setdefault("mode", "linear_scalar")
+    config.setdefault("scale_per_unit", 0.0)
+    config.setdefault("scalar_center", 1.0)
+    config.setdefault("min_gain", 1.0)
+    config.setdefault("max_gain", 1.0)
+    if str(config["mode"]) != "linear_scalar":
+        raise ValueError(f"Unsupported final_output_strength_scale mode: {config['mode']}")
+    config["mode"] = "linear_scalar"
+    config["enabled"] = bool(config["enabled"])
+    config["scale_per_unit"] = float(config["scale_per_unit"])
+    config["scalar_center"] = float(config["scalar_center"])
+    config["min_gain"] = float(config["min_gain"])
+    config["max_gain"] = float(config["max_gain"])
+    if config["min_gain"] <= 0.0:
+        raise ValueError("final_output_strength_scale.min_gain must be positive")
+    if config["max_gain"] <= 0.0:
+        raise ValueError("final_output_strength_scale.max_gain must be positive")
+    if config["max_gain"] < config["min_gain"]:
+        raise ValueError("final_output_strength_scale.max_gain must be >= min_gain")
+    return config
+
+
+def _normalize_final_output_strength_mapping_config(config):
+    config = dict(config or {})
+    config.setdefault("enabled", False)
+    config.setdefault("mode", "bounded_scalar_gain")
+    config.setdefault("scalar_center", 1.0)
+    config.setdefault("scalar_prior_scale", 0.0)
+    config.setdefault("learned_max_delta", 0.0)
+    config.setdefault("min_gain", 1.0)
+    config.setdefault("max_gain", 1.0)
+    config.setdefault("hidden_dim", 64)
+    config.setdefault("gain_order_margin", 0.0)
+    config.setdefault("gain_order_weight", 0.0)
+    config.setdefault("gain_order_direction", "increasing")
+    config.setdefault("scope", "global")
+    if str(config["mode"]) != "bounded_scalar_gain":
+        raise ValueError(f"Unsupported final_output_strength_mapping mode: {config['mode']}")
+    config["mode"] = "bounded_scalar_gain"
+    config["enabled"] = bool(config["enabled"])
+    config["scalar_center"] = float(config["scalar_center"])
+    config["scalar_prior_scale"] = float(config["scalar_prior_scale"])
+    config["learned_max_delta"] = float(config["learned_max_delta"])
+    config["min_gain"] = float(config["min_gain"])
+    config["max_gain"] = float(config["max_gain"])
+    config["hidden_dim"] = int(config["hidden_dim"])
+    config["gain_order_margin"] = float(config["gain_order_margin"])
+    config["gain_order_weight"] = float(config["gain_order_weight"])
+    config["gain_order_direction"] = str(config["gain_order_direction"])
+    config["scope"] = str(config["scope"])
+    if config["gain_order_direction"] not in {"increasing", "decreasing"}:
+        raise ValueError("final_output_strength_mapping.gain_order_direction must be increasing or decreasing")
+    if config["scope"] not in {"global", "edit_region"}:
+        raise ValueError("final_output_strength_mapping.scope must be global or edit_region")
+    if config["min_gain"] <= 0.0:
+        raise ValueError("final_output_strength_mapping.min_gain must be positive")
+    if config["max_gain"] <= 0.0:
+        raise ValueError("final_output_strength_mapping.max_gain must be positive")
+    if config["max_gain"] < config["min_gain"]:
+        raise ValueError("final_output_strength_mapping.max_gain must be >= min_gain")
+    if config["hidden_dim"] <= 0:
+        raise ValueError("final_output_strength_mapping.hidden_dim must be positive")
+    if config["learned_max_delta"] < 0.0:
+        raise ValueError("final_output_strength_mapping.learned_max_delta must be non-negative")
+    if config["gain_order_margin"] < 0.0:
+        raise ValueError("final_output_strength_mapping.gain_order_margin must be non-negative")
+    if config["gain_order_weight"] < 0.0:
+        raise ValueError("final_output_strength_mapping.gain_order_weight must be non-negative")
+    return config
+
+
 class DiffusionEmbedding(nn.Module):
     def __init__(self, num_steps, embedding_dim=128, projection_dim=None):
         super().__init__()
@@ -194,6 +291,8 @@ class ResidualBlock(nn.Module):
         strength_cond_dim=0,
         strength_mode="modulation_residual",
         strength_gain_multiplier=4.0,
+        output_branch_carrier=None,
+        final_output_gain_gate=None,
     ):
         super().__init__()
         self.diffusion_projection = nn.Linear(diffusion_embedding_dim, channels)
@@ -210,8 +309,27 @@ class ResidualBlock(nn.Module):
         nn.init.zeros_(self.base_modulation[-1].bias)
         self.strength_mode = strength_mode
         self.strength_gain_multiplier = float(strength_gain_multiplier)
+        output_branch_carrier = _normalize_output_branch_carrier_config(output_branch_carrier)
+        self.output_branch_carrier_enabled = bool(output_branch_carrier["enabled"])
+        self.output_branch_carrier_skip_scale = float(output_branch_carrier["skip_scale"])
+        self.output_branch_carrier_min_residual_to_skip_ratio = float(
+            output_branch_carrier["min_residual_to_skip_ratio"]
+        )
+        self.output_branch_carrier_scalar_order_margin = float(
+            output_branch_carrier["scalar_order_margin"]
+        )
+        self._latest_output_branch_regularizer_loss = None
+        self._latest_output_branch_scalar_order_loss = None
+        final_output_gain_gate = dict(final_output_gain_gate or {})
+        self.final_output_gain_gate_enabled = bool(final_output_gain_gate.get("enabled", False)) and strength_cond_dim > 0
+        self.final_output_gain_gate_mode = str(final_output_gain_gate.get("mode", "sigmoid_range"))
+        self.final_output_gain_gate_min = float(final_output_gain_gate.get("min_gain", 1.0))
+        self.final_output_gain_gate_max = float(final_output_gain_gate.get("max_gain", 1.0))
+        if self.final_output_gain_gate_mode != "sigmoid_range":
+            raise ValueError(f"Unsupported final_output_gain_gate mode: {self.final_output_gain_gate_mode}")
         self.strength_modulation = None
         self.strength_amplitude_head = None
+        self.final_output_gain_gate_head = None
         self.use_amplitude_head = strength_cond_dim > 0 and self.strength_mode == "amplitude_decomposition"
         if strength_cond_dim > 0:
             self.strength_modulation = nn.Sequential(
@@ -229,6 +347,14 @@ class ResidualBlock(nn.Module):
                 )
                 nn.init.normal_(self.strength_amplitude_head[-1].weight, mean=0.0, std=1.0e-3)
                 nn.init.normal_(self.strength_amplitude_head[-1].bias, mean=0.0, std=1.0e-3)
+            if self.final_output_gain_gate_enabled:
+                self.final_output_gain_gate_head = nn.Sequential(
+                    nn.Linear(strength_cond_dim, channels),
+                    nn.SiLU(),
+                    nn.Linear(channels, channels),
+                )
+                nn.init.zeros_(self.final_output_gain_gate_head[-1].weight)
+                nn.init.zeros_(self.final_output_gain_gate_head[-1].bias)
         self.side_projection = Conv1d_with_init(side_dim, 2 * channels, 1)
         self.mid_projection = Conv1d_with_init(channels, 2 * channels, 1)
         self.output_projection = Conv1d_with_init(channels, 2 * channels, 1)
@@ -509,6 +635,73 @@ class ResidualBlock(nn.Module):
                 continue
             self._record_response_diagnostics(stage_name, tensor, strength_label=strength_label, strength_scalar=strength_scalar)
 
+    def _record_scalar_gain_diagnostics(self, record_name, gain, strength_scalar=None):
+        if not self.__class__._diag_enabled:
+            return
+        if len(self.__class__._diag_records) >= self.__class__._diag_max_records:
+            return
+        with torch.no_grad():
+            gain_cpu = gain.detach().cpu().float().reshape(gain.shape[0], -1)
+            record = {
+                f"{record_name}_mean": float(gain_cpu.mean().item()),
+                f"{record_name}_min": float(gain_cpu.min().item()),
+                f"{record_name}_max": float(gain_cpu.max().item()),
+            }
+            if strength_scalar is not None:
+                scalar_values = strength_scalar.detach().cpu().float().view(-1)
+                unique_scalars = sorted({float(value) for value in scalar_values.tolist()})
+                by_scalar = {}
+                for scalar_value in unique_scalars:
+                    mask = torch.isclose(
+                        scalar_values,
+                        scalar_values.new_tensor(float(scalar_value)),
+                        atol=1.0e-6,
+                        rtol=0.0,
+                    )
+                    if int(mask.sum().item()) == 0:
+                        continue
+                    scalar_key = _format_scalar_key(scalar_value)
+                    scalar_gain = gain_cpu[mask]
+                    by_scalar[scalar_key] = {
+                        "count": int(mask.sum().item()),
+                        "mean": float(scalar_gain.mean().item()),
+                        "min": float(scalar_gain.min().item()),
+                        "max": float(scalar_gain.max().item()),
+                    }
+                record[f"{record_name}_by_scalar"] = by_scalar
+            self.__class__._diag_records.append(record)
+
+    def _compute_scalar_order_loss(self, tensor, strength_scalar):
+        if strength_scalar is None or self.output_branch_carrier_scalar_order_margin <= 0.0:
+            return None
+        scalar_values = strength_scalar.float().view(-1)
+        if scalar_values.numel() != tensor.shape[0]:
+            return None
+        unique_scalars = sorted({float(value) for value in scalar_values.detach().cpu().tolist()})
+        if len(unique_scalars) < 2:
+            return None
+        sample_abs = tensor.float().reshape(tensor.shape[0], -1).abs().mean(dim=1)
+        scalar_means = []
+        for scalar_value in unique_scalars:
+            mask = torch.isclose(
+                scalar_values,
+                scalar_values.new_tensor(float(scalar_value)),
+                atol=1.0e-6,
+                rtol=0.0,
+            )
+            if int(mask.sum().item()) == 0:
+                continue
+            scalar_means.append(sample_abs[mask].mean())
+        if len(scalar_means) < 2:
+            return None
+        losses = []
+        margin = tensor.new_tensor(float(self.output_branch_carrier_scalar_order_margin))
+        for idx in range(len(scalar_means) - 1):
+            losses.append(torch.relu(margin - (scalar_means[idx + 1] - scalar_means[idx])))
+        if not losses:
+            return None
+        return torch.stack(losses).mean()
+
     def _apply_mid_gate_filter(self, y, strength_label=None, strength_scalar=None):
         gate, filter = torch.chunk(y, 2, dim=1)
         gated = torch.sigmoid(gate) * torch.tanh(filter)
@@ -579,6 +772,27 @@ class ResidualBlock(nn.Module):
             strength_label=strength_label,
             strength_scalar=strength_scalar,
         )
+        residual_content = residual
+        if self.output_branch_carrier_min_residual_to_skip_ratio > 0.0:
+            residual_content_train_abs = residual_content.float().reshape(B, -1).abs().mean(dim=1)
+            skip_train_abs = skip.detach().float().reshape(B, -1).abs().mean(dim=1)
+            branch_floor = self.output_branch_carrier_min_residual_to_skip_ratio * skip_train_abs
+            self._latest_output_branch_regularizer_loss = torch.relu(branch_floor - residual_content_train_abs).mean()
+        else:
+            self._latest_output_branch_regularizer_loss = None
+        carrier_source = torch.zeros_like(residual)
+        if self.output_branch_carrier_enabled and self.output_branch_carrier_skip_scale > 0.0:
+            carrier_source = skip * self.output_branch_carrier_skip_scale
+            residual = residual + carrier_source
+        self._record_forward_response_diagnostics(
+            {
+                "residual_carrier_source_branch": carrier_source,
+                "residual_carrier_restored_branch": residual,
+            },
+            strength_label=strength_label,
+            strength_scalar=strength_scalar,
+        )
+        gate_gain = None
         if self.use_amplitude_head and self.strength_amplitude_head is not None and strength_cond is not None:
             amp_gamma, amp_beta = torch.chunk(self.strength_amplitude_head(strength_cond), 2, dim=-1)
             amp_gamma = (1.0 + self.strength_gain_multiplier * amp_gamma).unsqueeze(-1)
@@ -599,6 +813,107 @@ class ResidualBlock(nn.Module):
                 strength_label=strength_label,
                 strength_scalar=strength_scalar,
             )
+        self._latest_output_branch_scalar_order_loss = self._compute_scalar_order_loss(residual, strength_scalar)
+        if self.final_output_gain_gate_enabled and self.final_output_gain_gate_head is not None and strength_cond is not None:
+            gate_logits = self.final_output_gain_gate_head(strength_cond)
+            gate_gain = torch.sigmoid(gate_logits)
+            gate_gain = self.final_output_gain_gate_min + (self.final_output_gain_gate_max - self.final_output_gain_gate_min) * gate_gain
+            gate_gain = gate_gain.unsqueeze(-1)
+            residual = residual * gate_gain
+            self._record_forward_response_diagnostics(
+                {
+                    "final_output_gain_gate_logits": gate_logits.unsqueeze(-1),
+                    "final_output_gain_gate": gate_gain,
+                    "residual_gain_gated_branch": residual,
+                },
+                strength_label=strength_label,
+                strength_scalar=strength_scalar,
+            )
+        else:
+            gain_fill = residual.new_full((B, channel, 1), 1.0)
+            self._record_forward_response_diagnostics(
+                {
+                    "final_output_gain_gate": gain_fill,
+                    "residual_gain_gated_branch": residual,
+                },
+                strength_label=strength_label,
+                strength_scalar=strength_scalar,
+            )
+        if self.__class__._diag_enabled and len(self.__class__._diag_records) < self.__class__._diag_max_records:
+            residual_content_stats = residual_content.detach().cpu().float().reshape(B, -1).abs().mean(dim=1)
+            skip_stats = skip.detach().cpu().float().reshape(B, -1).abs().mean(dim=1)
+            restored_stats = residual.detach().cpu().float().reshape(B, -1).abs().mean(dim=1)
+            carrier_stats = carrier_source.detach().cpu().float().reshape(B, -1).abs().mean(dim=1)
+            gate_stats = gate_gain if gate_gain is not None else residual.new_full((B, channel, 1), 1.0)
+            gate_stats = gate_stats.detach().cpu().float().reshape(B, -1)
+            record = {
+                "output_branch_carrier_enabled": float(self.output_branch_carrier_enabled),
+                "output_branch_carrier_skip_scale": float(self.output_branch_carrier_skip_scale),
+                "residual_content_abs_mean": float(residual_content_stats.mean().item()),
+                "skip_branch_abs_mean": float(skip_stats.mean().item()),
+                "residual_carrier_source_abs_mean": float(carrier_stats.mean().item()),
+                "residual_carrier_restored_abs_mean": float(restored_stats.mean().item()),
+                "residual_content_to_skip_abs_ratio": float((residual_content_stats / torch.clamp(skip_stats, min=1.0e-8)).mean().item()),
+                "residual_restored_to_skip_abs_ratio": float((restored_stats / torch.clamp(skip_stats, min=1.0e-8)).mean().item()),
+                "final_output_gain_gate_mean": float(gate_stats.mean().item()),
+                "final_output_gain_gate_min": float(gate_stats.min().item()),
+                "final_output_gain_gate_max": float(gate_stats.max().item()),
+            }
+            if strength_scalar is not None:
+                scalar_values = strength_scalar.detach().cpu().float().view(-1)
+                unique_scalars = sorted({float(value) for value in scalar_values.tolist()})
+                mean_by_scalar = {}
+                min_by_scalar = {}
+                max_by_scalar = {}
+                residual_content_by_scalar = {}
+                skip_by_scalar = {}
+                residual_restored_by_scalar = {}
+                residual_ratio_by_scalar = {}
+                for scalar_value in unique_scalars:
+                    mask = torch.isclose(scalar_values, scalar_values.new_tensor(float(scalar_value)), atol=1.0e-6, rtol=0.0)
+                    if int(mask.sum().item()) == 0:
+                        continue
+                    scalar_key = _format_scalar_key(scalar_value)
+                    scalar_gate = gate_stats[mask]
+                    mean_by_scalar[scalar_key] = {
+                        "count": int(mask.sum().item()),
+                        "mean": float(scalar_gate.mean().item()),
+                    }
+                    min_by_scalar[scalar_key] = {
+                        "count": int(mask.sum().item()),
+                        "mean": float(scalar_gate.min().item()),
+                    }
+                    max_by_scalar[scalar_key] = {
+                        "count": int(mask.sum().item()),
+                        "mean": float(scalar_gate.max().item()),
+                    }
+                    scalar_residual = residual_content_stats[mask]
+                    scalar_skip = skip_stats[mask]
+                    scalar_restored = restored_stats[mask]
+                    residual_content_by_scalar[scalar_key] = {
+                        "count": int(mask.sum().item()),
+                        "mean": float(scalar_residual.mean().item()),
+                    }
+                    skip_by_scalar[scalar_key] = {
+                        "count": int(mask.sum().item()),
+                        "mean": float(scalar_skip.mean().item()),
+                    }
+                    residual_restored_by_scalar[scalar_key] = {
+                        "count": int(mask.sum().item()),
+                        "mean": float(scalar_restored.mean().item()),
+                    }
+                    residual_ratio_by_scalar[scalar_key] = {
+                        "count": int(mask.sum().item()),
+                        "mean": float((scalar_restored / torch.clamp(scalar_skip, min=1.0e-8)).mean().item()),
+                    }
+                record["final_output_gain_gate_mean_by_scalar"] = mean_by_scalar
+                record["final_output_gain_gate_min_by_scalar"] = min_by_scalar
+                record["final_output_gain_gate_max_by_scalar"] = max_by_scalar
+                record["residual_content_abs_mean_by_scalar"] = residual_content_by_scalar
+                record["skip_branch_abs_mean_by_scalar"] = skip_by_scalar
+                record["residual_carrier_restored_abs_mean_by_scalar"] = residual_restored_by_scalar
+                record["residual_restored_to_skip_abs_ratio_by_scalar"] = residual_ratio_by_scalar
+            self.__class__._diag_records.append(record)
         return residual.reshape(base_shape), skip.reshape(base_shape)
 
     def _record_residual_merge(self, x, residual, strength_label=None, strength_scalar=None):
@@ -912,8 +1227,38 @@ class Diff_CSDI_MultiPatch_Weaver_Parallel(nn.Module):
         self.strength_mode = str(strength_cfg.get("mode", "modulation_residual"))
         self.strength_gain_multiplier = float(strength_cfg.get("gain_multiplier", 4.0))
         self.strength_cond_dim = int(strength_cfg.get("out_dim", self.channels))
+        self.output_branch_carrier_cfg = _normalize_output_branch_carrier_config(
+            strength_cfg.get("output_branch_carrier")
+        )
+        strength_cfg["output_branch_carrier"] = dict(self.output_branch_carrier_cfg)
+        self.latest_output_branch_regularizer_loss = None
+        self.latest_output_branch_scalar_order_loss = None
+        self.latest_final_output_strength_mapping_order_loss = None
+        self.final_output_gain_gate_cfg = dict(strength_cfg.get("final_output_gain_gate") or {})
+        self.final_output_gain_gate_cfg.setdefault("enabled", False)
+        self.final_output_gain_gate_cfg.setdefault("mode", "sigmoid_range")
+        self.final_output_gain_gate_cfg.setdefault("min_gain", 1.0)
+        self.final_output_gain_gate_cfg.setdefault("max_gain", 1.0)
+        if str(self.final_output_gain_gate_cfg.get("mode", "sigmoid_range")) != "sigmoid_range":
+            raise ValueError(f"Unsupported final_output_gain_gate mode: {self.final_output_gain_gate_cfg.get('mode')}")
+        self.final_output_gain_gate_cfg["mode"] = "sigmoid_range"
+        self.final_output_gain_gate_cfg["enabled"] = bool(self.final_output_gain_gate_cfg.get("enabled", False))
+        self.final_output_gain_gate_cfg["min_gain"] = float(self.final_output_gain_gate_cfg.get("min_gain", 1.0))
+        self.final_output_gain_gate_cfg["max_gain"] = float(self.final_output_gain_gate_cfg.get("max_gain", 1.0))
+        strength_cfg["final_output_gain_gate"] = dict(self.final_output_gain_gate_cfg)
+        self.final_output_strength_scale_cfg = _normalize_final_output_strength_scale_config(
+            strength_cfg.get("final_output_strength_scale")
+        )
+        strength_cfg["final_output_strength_scale"] = dict(self.final_output_strength_scale_cfg)
+        self.final_output_strength_mapping_cfg = _normalize_final_output_strength_mapping_config(
+            strength_cfg.get("final_output_strength_mapping")
+        )
+        strength_cfg["final_output_strength_mapping"] = dict(self.final_output_strength_mapping_cfg)
+        config["strength_control"] = strength_cfg
+        self.strength_control_config = strength_cfg
         self.strength_projector = None
         self.strength_input_projection = None
+        self.final_output_strength_mapping_head = None
         if self.strength_enabled:
             self.strength_projector = StrengthProjector(
                 num_strength_bins=int(strength_cfg.get("num_strength_bins", 3)),
@@ -930,6 +1275,14 @@ class Diff_CSDI_MultiPatch_Weaver_Parallel(nn.Module):
             self.strength_input_projection = nn.Linear(self.strength_cond_dim, self.channels)
             nn.init.zeros_(self.strength_input_projection.weight)
             nn.init.zeros_(self.strength_input_projection.bias)
+            if self.final_output_strength_mapping_cfg["enabled"]:
+                self.final_output_strength_mapping_head = nn.Sequential(
+                    nn.Linear(self.strength_cond_dim, int(self.final_output_strength_mapping_cfg["hidden_dim"])),
+                    nn.SiLU(),
+                    nn.Linear(int(self.final_output_strength_mapping_cfg["hidden_dim"]), 1),
+                )
+                nn.init.zeros_(self.final_output_strength_mapping_head[-1].weight)
+                nn.init.zeros_(self.final_output_strength_mapping_head[-1].bias)
         self.diffusion_embedding = DiffusionEmbedding(
             num_steps=config["num_steps"],
             embedding_dim=config["diffusion_embedding_dim"],
@@ -957,6 +1310,8 @@ class Diff_CSDI_MultiPatch_Weaver_Parallel(nn.Module):
                     strength_cond_dim=self.strength_cond_dim if self.strength_enabled else 0,
                     strength_mode=self.strength_mode,
                     strength_gain_multiplier=self.strength_gain_multiplier,
+                    output_branch_carrier=self.output_branch_carrier_cfg,
+                    final_output_gain_gate=self.final_output_gain_gate_cfg,
                 )
                 for _ in range(config["layers"])
             ]
@@ -967,6 +1322,117 @@ class Diff_CSDI_MultiPatch_Weaver_Parallel(nn.Module):
                 dim_hid=config["channels"], 
                 dim_out=config["channels"],
         )
+
+    def _apply_final_output_strength_scale(self, output, strength_scalar=None):
+        if not self.final_output_strength_scale_cfg.get("enabled", False):
+            return output, None
+        if strength_scalar is None:
+            return output, None
+        scalar = strength_scalar.float().view(-1)
+        if scalar.numel() != output.shape[0]:
+            return output, None
+        gain = 1.0 + float(self.final_output_strength_scale_cfg["scale_per_unit"]) * (
+            scalar - float(self.final_output_strength_scale_cfg["scalar_center"])
+        )
+        gain = torch.clamp(
+            gain,
+            min=float(self.final_output_strength_scale_cfg["min_gain"]),
+            max=float(self.final_output_strength_scale_cfg["max_gain"]),
+        )
+        view_shape = [output.shape[0]] + [1] * (output.ndim - 1)
+        gain = gain.view(*view_shape).to(device=output.device, dtype=output.dtype)
+        return output * gain, gain
+
+    def _compute_final_output_strength_mapping_order_loss(self, gain, strength_scalar):
+        cfg = self.final_output_strength_mapping_cfg
+        if strength_scalar is None or not cfg.get("enabled", False):
+            return None
+        if float(cfg.get("gain_order_margin", 0.0)) <= 0.0:
+            return None
+        scalar_values = strength_scalar.float().view(-1)
+        if scalar_values.numel() != gain.shape[0]:
+            return None
+        unique_scalars = sorted({float(value) for value in scalar_values.detach().cpu().tolist()})
+        if len(unique_scalars) < 2:
+            return None
+        gain_values = gain.float().reshape(gain.shape[0], -1).mean(dim=1)
+        scalar_means = []
+        for scalar_value in unique_scalars:
+            mask = torch.isclose(
+                scalar_values,
+                scalar_values.new_tensor(float(scalar_value)),
+                atol=1.0e-6,
+                rtol=0.0,
+            )
+            if int(mask.sum().item()) == 0:
+                continue
+            scalar_means.append(gain_values[mask].mean())
+        if len(scalar_means) < 2:
+            return None
+        margin = gain.new_tensor(float(cfg["gain_order_margin"]))
+        losses = [
+            torch.relu(
+                margin
+                - (
+                    scalar_means[idx + 1] - scalar_means[idx]
+                    if str(cfg.get("gain_order_direction", "increasing")) == "increasing"
+                    else scalar_means[idx] - scalar_means[idx + 1]
+                )
+            )
+            for idx in range(len(scalar_means) - 1)
+        ]
+        return torch.stack(losses).mean()
+
+    def _broadcast_final_strength_mask(self, final_strength_mask, output):
+        if final_strength_mask is None:
+            return None
+        mask = final_strength_mask.to(device=output.device, dtype=output.dtype)
+        if mask.ndim == output.ndim - 1:
+            mask = mask.unsqueeze(-1)
+        while mask.ndim < output.ndim:
+            mask = mask.unsqueeze(1)
+        if mask.shape[0] != output.shape[0]:
+            raise ValueError(
+                f"final_strength_mask batch size {mask.shape[0]} does not match output batch size {output.shape[0]}"
+            )
+        try:
+            return mask.expand_as(output)
+        except RuntimeError as exc:
+            raise ValueError(
+                f"final_strength_mask shape {tuple(final_strength_mask.shape)} cannot broadcast to output shape {tuple(output.shape)}"
+            ) from exc
+
+    def _apply_final_output_strength_mapping(self, output, strength_cond=None, strength_scalar=None, final_strength_mask=None):
+        cfg = self.final_output_strength_mapping_cfg
+        self.latest_final_output_strength_mapping_order_loss = None
+        if not cfg.get("enabled", False):
+            return output, None
+        batch_size = output.shape[0]
+        gain = output.new_ones(batch_size)
+        if strength_scalar is not None:
+            scalar = strength_scalar.float().view(-1)
+            if scalar.numel() == batch_size:
+                scalar = scalar.to(device=output.device, dtype=output.dtype)
+                gain = gain + float(cfg["scalar_prior_scale"]) * (scalar - float(cfg["scalar_center"]))
+        if (
+            self.final_output_strength_mapping_head is not None
+            and strength_cond is not None
+            and float(cfg["learned_max_delta"]) > 0.0
+        ):
+            learned_delta = torch.tanh(self.final_output_strength_mapping_head(strength_cond).view(-1))
+            if learned_delta.numel() == batch_size:
+                gain = gain + float(cfg["learned_max_delta"]) * learned_delta.to(device=output.device, dtype=output.dtype)
+        gain = torch.clamp(gain, min=float(cfg["min_gain"]), max=float(cfg["max_gain"]))
+        view_shape = [batch_size] + [1] * (output.ndim - 1)
+        gain = gain.view(*view_shape).to(device=output.device, dtype=output.dtype)
+        self.latest_final_output_strength_mapping_order_loss = self._compute_final_output_strength_mapping_order_loss(
+            gain,
+            strength_scalar,
+        )
+        if str(cfg.get("scope", "global")) == "edit_region" and final_strength_mask is not None:
+            mask = self._broadcast_final_strength_mask(final_strength_mask, output).clamp(0.0, 1.0)
+            gain = 1.0 + (gain - 1.0) * mask
+        return output * gain, gain
     
     def _build_strength_condition(self, strength_label=None, task_id=None, text_context=None, strength_scalar=None):
         if not self.strength_enabled:
@@ -985,7 +1451,8 @@ class Diff_CSDI_MultiPatch_Weaver_Parallel(nn.Module):
 
     def forward(self, x_raw, side_emb_raw, attr_emb_raw, diffusion_step,
                 soft_mask=None, keys_null=None, values_null=None,
-                strength_label=None, task_id=None, text_context=None, strength_scalar=None):
+                strength_label=None, task_id=None, text_context=None, strength_scalar=None,
+                final_strength_mask=None):
         """
         Forward pass with Soft-Boundary Attention Injection support.
         
@@ -1036,6 +1503,8 @@ class Diff_CSDI_MultiPatch_Weaver_Parallel(nn.Module):
             x_in = x_in + strength_map
 
         skip = []
+        output_branch_regularizer_losses = []
+        output_branch_scalar_order_losses = []
         for layer in self.residual_layers:
             x_in, skip_connection = layer(
                 x_in+_x_in+attr_emb, side_in, attr_emb_raw, diffusion_emb, 
@@ -1046,11 +1515,43 @@ class Diff_CSDI_MultiPatch_Weaver_Parallel(nn.Module):
                 strength_scalar=strength_scalar,
             )
             skip.append(skip_connection)        
+            branch_loss = getattr(layer, "_latest_output_branch_regularizer_loss", None)
+            if torch.is_tensor(branch_loss):
+                output_branch_regularizer_losses.append(branch_loss)
+            scalar_order_loss = getattr(layer, "_latest_output_branch_scalar_order_loss", None)
+            if torch.is_tensor(scalar_order_loss):
+                output_branch_scalar_order_losses.append(scalar_order_loss)
+        if output_branch_regularizer_losses:
+            self.latest_output_branch_regularizer_loss = torch.stack(output_branch_regularizer_losses).mean()
+        else:
+            self.latest_output_branch_regularizer_loss = None
+        if output_branch_scalar_order_losses:
+            self.latest_output_branch_scalar_order_loss = torch.stack(output_branch_scalar_order_losses).mean()
+        else:
+            self.latest_output_branch_scalar_order_loss = None
         
         x = torch.sum(torch.stack(skip), dim=0) / math.sqrt(len(self.residual_layers))
+        if self.residual_layers:
+            self.residual_layers[0]._record_forward_response_diagnostics(
+                {"skip_aggregate": x},
+                strength_label=strength_label,
+                strength_scalar=strength_scalar,
+            )
         x = x.reshape(B, self.channels, Nk * Nl)
         x = self.output_projection1(x)  # (B,channel,Nk*Nl)
+        if self.residual_layers:
+            self.residual_layers[0]._record_forward_response_diagnostics(
+                {"final_head_projection": x},
+                strength_label=strength_label,
+                strength_scalar=strength_scalar,
+            )
         x = F.relu(x)
+        if self.residual_layers:
+            self.residual_layers[0]._record_forward_response_diagnostics(
+                {"final_head_relu": x},
+                strength_label=strength_label,
+                strength_scalar=strength_scalar,
+            )
         x = x.reshape(B, self.channels, Nk, Nl)
 
         start_id = 0
@@ -1063,7 +1564,50 @@ class Diff_CSDI_MultiPatch_Weaver_Parallel(nn.Module):
             start_id += x_list[i].shape[-1]
 
         all_out = torch.cat(all_out, dim=1) # (B, M, K, L)
+        if self.residual_layers:
+            self.residual_layers[0]._record_forward_response_diagnostics(
+                {"patch_decoder_concat": all_out},
+                strength_label=strength_label,
+                strength_scalar=strength_scalar,
+            )
         all_out = self.multipatch_mixer(all_out.permute(0, 2, 3, 1).contiguous()) # (B, K, L, 1)
+        if self.residual_layers:
+            self.residual_layers[0]._record_forward_response_diagnostics(
+                {"final_multipatch_output": all_out},
+                strength_label=strength_label,
+                strength_scalar=strength_scalar,
+            )
+        all_out, final_mapping_gain = self._apply_final_output_strength_mapping(
+            all_out,
+            strength_cond=strength_cond,
+            strength_scalar=strength_scalar,
+            final_strength_mask=final_strength_mask,
+        )
+        if self.residual_layers:
+            self.residual_layers[0]._record_forward_response_diagnostics(
+                {"final_strength_mapped_output": all_out},
+                strength_label=strength_label,
+                strength_scalar=strength_scalar,
+            )
+            if final_mapping_gain is not None:
+                self.residual_layers[0]._record_scalar_gain_diagnostics(
+                    "final_output_strength_mapping",
+                    final_mapping_gain,
+                    strength_scalar=strength_scalar,
+                )
+        all_out, final_strength_gain = self._apply_final_output_strength_scale(all_out, strength_scalar=strength_scalar)
+        if self.residual_layers:
+            self.residual_layers[0]._record_forward_response_diagnostics(
+                {"final_strength_scaled_output": all_out},
+                strength_label=strength_label,
+                strength_scalar=strength_scalar,
+            )
+            if final_strength_gain is not None:
+                self.residual_layers[0]._record_scalar_gain_diagnostics(
+                    "final_output_strength_scale",
+                    final_strength_gain,
+                    strength_scalar=strength_scalar,
+                )
         all_out = all_out.reshape(B, K, L)
         return all_out
     

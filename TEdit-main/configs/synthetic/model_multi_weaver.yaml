@@ -37,7 +37,7 @@ diffusion:
     hidden_dim: 64
     out_dim: 64
     use_text_context: true
-    use_task_id: false
+    use_task_id: false  # gated semantic side-channel for multi-family alignment; keep mainline default off
     text_dim: 64
     text_num_buckets: 4096
     dropout: 0.0
@@ -47,6 +47,7 @@ diffusion:
     monotonic_loss_weight: 0.5
     monotonic_margin: 0.001
     gain_match_loss_weight: 4.0
+    family_gap_match_loss_weight: 0.0
     family_relative_gain_loss_weight: 3.0
     family_relative_margin_scale: 1.5
     constant_gain_penalty_weight: 2.0
@@ -55,6 +56,38 @@ diffusion:
     beta_direction_loss_weight: 0.0
     beta_direction_margin: 0.0
     beta_direction_target: family_signed_gain
+    output_branch_carrier:
+      enabled: false
+      mode: skip_residual_mix
+      skip_scale: 0.0
+      min_residual_to_skip_ratio: 0.0
+      regularizer_weight: 0.0
+      scalar_order_margin: 0.0
+      scalar_order_weight: 0.0
+    final_output_gain_gate:
+      enabled: false
+      mode: sigmoid_range
+      min_gain: 1.0
+      max_gain: 1.0
+    final_output_strength_scale:
+      enabled: false
+      mode: linear_scalar
+      scale_per_unit: 0.0
+      scalar_center: 1.0
+      min_gain: 1.0
+      max_gain: 1.0
+    final_output_strength_mapping:
+      enabled: false
+      mode: bounded_scalar_gain
+      scalar_center: 1.0
+      scalar_prior_scale: 0.0
+      learned_max_delta: 0.0
+      min_gain: 1.0
+      max_gain: 1.0
+      hidden_dim: 64
+      gain_order_margin: 0.0
+      gain_order_weight: 0.0
+      gain_order_direction: increasing
   ##### attr projector: deprecated
   attr_heads: 8
   attr_layers: 2
