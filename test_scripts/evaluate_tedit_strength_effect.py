@@ -224,6 +224,28 @@ def _region_value_stats(values: np.ndarray, mask: np.ndarray) -> dict[str, float
     }
 
 
+def _region_volatility_metrics(base: np.ndarray, edited: np.ndarray, mask: np.ndarray) -> dict[str, float | None]:
+    base_arr = np.asarray(base, dtype=np.float32).reshape(-1)
+    edited_arr = np.asarray(edited, dtype=np.float32).reshape(-1)
+    region_mask = np.asarray(mask, dtype=bool).reshape(-1)
+    if not np.any(region_mask):
+        return {
+            "local_std_delta": None,
+            "local_energy_delta": None,
+            "local_roughness": None,
+        }
+    region_delta = edited_arr[region_mask] - base_arr[region_mask]
+    region_values = edited_arr[region_mask]
+    roughness = None
+    if region_values.size > 1:
+        roughness = float(np.mean(np.abs(np.diff(region_values))))
+    return {
+        "local_std_delta": float(np.std(region_delta)),
+        "local_energy_delta": float(np.mean(np.square(region_delta))),
+        "local_roughness": roughness,
+    }
+
+
 def _gap_sequence(values: list[float | None]) -> list[float | None]:
     gaps: list[float | None] = []
     for left, right in zip(values[:-1], values[1:]):
@@ -471,6 +493,9 @@ def main() -> None:
         pred_gain_seq: list[float | None] = []
         target_floor_distance_seq: list[float | None] = []
         pred_floor_distance_seq: list[float | None] = []
+        pred_local_std_seq: list[float | None] = []
+        pred_local_energy_seq: list[float | None] = []
+        pred_local_roughness_seq: list[float | None] = []
         for control_idx, control in enumerate(controls):
             scalar_key = f"{float(control['strength_scalar']):.4f}"
             strength_rows.setdefault(scalar_key, [])
@@ -483,10 +508,14 @@ def main() -> None:
             target_metrics = _compute_region_metrics(base=base, target=target, edited=target, mask=edit_mask)
             target_stats = _region_value_stats(target, edit_mask)
             pred_stats = _region_value_stats(edited, edit_mask)
+            pred_volatility = _region_volatility_metrics(base=base, edited=edited, mask=edit_mask)
             target_gain_seq.append(target_metrics["edit_gain"])
             pred_gain_seq.append(metrics["edit_gain"])
             target_floor_distance_seq.append(target_stats["floor_distance"])
             pred_floor_distance_seq.append(pred_stats["floor_distance"])
+            pred_local_std_seq.append(pred_volatility["local_std_delta"])
+            pred_local_energy_seq.append(pred_volatility["local_energy_delta"])
+            pred_local_roughness_seq.append(pred_volatility["local_roughness"])
             row = {
                 "sample_idx": int(sample_idx),
                 "family_id": family_id,
@@ -519,6 +548,9 @@ def main() -> None:
                 "source_edit_max": source_stats["max"],
                 "target_floor_distance": target_stats["floor_distance"],
                 "pred_floor_distance": pred_stats["floor_distance"],
+                "local_std_delta": pred_volatility["local_std_delta"],
+                "local_energy_delta": pred_volatility["local_energy_delta"],
+                "local_roughness": pred_volatility["local_roughness"],
                 "blend_gap_edit_region_mean_abs": None if metrics["edit_gain"] is None or raw_metrics["edit_gain"] is None else float(abs(metrics["edit_gain"] - raw_metrics["edit_gain"])),
                 "blend_gap_background_mean_abs": None if metrics["bg_mae"] is None or raw_metrics["bg_mae"] is None else float(abs(metrics["bg_mae"] - raw_metrics["bg_mae"])),
                 "projector_pairwise_l2": projector_pairwise,
@@ -585,6 +617,9 @@ def main() -> None:
             None if pred is None or target is None else float(pred - target)
             for pred, target in zip(pred_gap_seq, target_gap_seq)
         ]
+        local_std_gap_seq = _gap_sequence(pred_local_std_seq)
+        local_energy_gap_seq = _gap_sequence(pred_local_energy_seq)
+        local_roughness_gap_seq = _gap_sequence(pred_local_roughness_seq)
         pairwise_rows.append(
             {
                 "sample_idx": int(sample_idx),
@@ -613,6 +648,12 @@ def main() -> None:
                 "pred_gap_minus_target_gap_seq": [_none_or_float(value) for value in pred_gap_minus_target_gap_seq],
                 "target_floor_distance_by_strength": [_none_or_float(value) for value in target_floor_distance_seq],
                 "pred_floor_distance_by_strength": [_none_or_float(value) for value in pred_floor_distance_seq],
+                "local_std_delta_by_strength": [_none_or_float(value) for value in pred_local_std_seq],
+                "local_energy_delta_by_strength": [_none_or_float(value) for value in pred_local_energy_seq],
+                "local_roughness_by_strength": [_none_or_float(value) for value in pred_local_roughness_seq],
+                "local_std_gap_seq": [_none_or_float(value) for value in local_std_gap_seq],
+                "local_energy_gap_seq": [_none_or_float(value) for value in local_energy_gap_seq],
+                "local_roughness_gap_seq": [_none_or_float(value) for value in local_roughness_gap_seq],
                 "min_edit_gain": edit_gains[0],
                 "mid_edit_gain": edit_gains[len(edit_gains) // 2],
                 "max_edit_gain": edit_gains[-1],
@@ -626,6 +667,9 @@ def main() -> None:
                 "mid_final_edit_region_mean_abs_delta": final_gains[len(final_gains) // 2],
                 "max_final_edit_region_mean_abs_delta": final_gains[-1],
                 "strong_minus_weak_edit_gain": None if edit_gains[0] is None or edit_gains[-1] is None else float(edit_gains[-1] - edit_gains[0]),
+                "local_std_strong_minus_weak": None if pred_local_std_seq[0] is None or pred_local_std_seq[-1] is None else float(pred_local_std_seq[-1] - pred_local_std_seq[0]),
+                "local_energy_strong_minus_weak": None if pred_local_energy_seq[0] is None or pred_local_energy_seq[-1] is None else float(pred_local_energy_seq[-1] - pred_local_energy_seq[0]),
+                "local_roughness_strong_minus_weak": None if pred_local_roughness_seq[0] is None or pred_local_roughness_seq[-1] is None else float(pred_local_roughness_seq[-1] - pred_local_roughness_seq[0]),
                 "gain_range": None if edit_gains[0] is None or edit_gains[-1] is None else float(edit_gains[-1] - edit_gains[0]),
                 "family_spearman_rho_strength_gain": family_spearman,
                 "gain_calibration_mae": _aggregate_mean([row["gain_gap_abs"] for row in per_strength.values()]),
@@ -657,6 +701,18 @@ def main() -> None:
         },
         "target_edit_gain_mean": {
             key: _aggregate_metric(strength_rows[key], "target_edit_gain")
+            for key in scalar_keys
+        },
+        "local_std_delta_mean": {
+            key: _aggregate_metric(strength_rows[key], "local_std_delta")
+            for key in scalar_keys
+        },
+        "local_energy_delta_mean": {
+            key: _aggregate_metric(strength_rows[key], "local_energy_delta")
+            for key in scalar_keys
+        },
+        "local_roughness_mean": {
+            key: _aggregate_metric(strength_rows[key], "local_roughness")
             for key in scalar_keys
         },
         "raw_edit_region_mean_abs_delta": {
@@ -713,6 +769,15 @@ def main() -> None:
         "attenuation_suspected_rate": float(np.mean([float(row["attenuation_suspected"]) for row in pairwise_rows])),
         "strong_minus_weak_edit_gain_mean": _aggregate_mean(
             [row["strong_minus_weak_edit_gain"] for row in pairwise_rows]
+        ),
+        "local_std_strong_minus_weak_mean": _aggregate_mean(
+            [row["local_std_strong_minus_weak"] for row in pairwise_rows]
+        ),
+        "local_energy_strong_minus_weak_mean": _aggregate_mean(
+            [row["local_energy_strong_minus_weak"] for row in pairwise_rows]
+        ),
+        "local_roughness_strong_minus_weak_mean": _aggregate_mean(
+            [row["local_roughness_strong_minus_weak"] for row in pairwise_rows]
         ),
         "family_spearman_rho_strength_gain_mean": _aggregate_mean(
             [row["family_spearman_rho_strength_gain"] for row in pairwise_rows]

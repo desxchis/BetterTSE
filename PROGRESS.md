@@ -2,6 +2,98 @@
 
 按时间倒序记录 pure-editing strength mainline 的关键推进，不混入 forecast-revision 主线。
 
+## [2026-04-20] - mask-local 扩展到 step_change / multiplier / noise_injection 小样本对照
+
+**本轮目标**：
+- 回答“mask-local final strength mapping 是否只对 hard_zero 有效，还是对其他局部编辑 family 也有普遍收益”。
+- 不改监督公式、不改 Trainer 主逻辑、不动 trend 既有成功主线。
+- 对 `step_change / multiplier / noise_injection` 做同口径小样本训练与验证。
+- 使用 `tedit` 环境、`CUDA_VISIBLE_DEVICES=0`、dedicated family leaf、`edit_mask` routed eval/probe。
+
+**单变量可比性核对**：
+- 本轮 mask-local 候选与已有 global baseline 保持一致：
+  - `pretrained_dir = TEdit-main/save/synthetic/pretrain_multi_weaver/0/ckpts/model_best.pth`
+  - `epochs = 10`
+  - `freeze_backbone_for_strength = false`
+  - `strength_lr_scale = 5.0`
+  - `scalar_prior_scale = 0.12`
+  - `learned_max_delta = 0.08`
+  - `data.folder = TEdit-main/datasets/discrete_strength_family/<family>`
+- 唯一核心变量：
+  - global baseline: `final_output_strength_mapping.scope = global / None`
+  - 本轮候选: `final_output_strength_mapping.scope = edit_region`
+
+**代码改动**：
+- `test_scripts/evaluate_tedit_strength_effect.py`
+  - 新增 noise/volatility 辅助指标：
+    - `local_std_delta`
+    - `local_energy_delta`
+    - `local_roughness`
+  - per-sample 增加对应 by-strength 序列和 strong-minus-weak gap。
+  - summary 增加：
+    - `local_std_strong_minus_weak_mean`
+    - `local_energy_strong_minus_weak_mean`
+    - `local_roughness_strong_minus_weak_mean`
+- 目的：`noise_injection` 不再只按平均 edit gain 判定，也能看局部波动性、能量和粗糙度是否随 strength 增强。
+
+**训练与评估产物**：
+- `results/strength_masklocal_step_change_s012_d008/`
+  - `quick_eval_maskrouted.json`
+  - `quick_probe_worst_sample0_maskrouted.json`
+- `results/strength_masklocal_multiplier_s012_d008/`
+  - `quick_eval_maskrouted.json`
+  - `quick_probe_worst_sample0_maskrouted.json`
+- `results/strength_masklocal_noise_injection_s012_d008/`
+  - `quick_eval_maskrouted.json`
+  - `quick_probe_worst_sample2_maskrouted.json`
+
+**结果对照**：
+
+| family | scope | raw mono | final mono | edit strong-weak | bg strong-weak | abs edit/bg | preservation |
+|---|---|---:|---:|---:|---:|---:|---:|
+| step_change | global baseline | 1.0 | 1.0 | 1.0928e-02 | 9.1185e-03 | 1.20 | true |
+| step_change | edit_region | 1.0 | 1.0 | 1.7341e-02 | -3.3965e-04 | 51.06 | true |
+| multiplier | global baseline | 1.0 | 1.0 | 1.0884e-02 | 1.0133e-02 | 1.07 | true |
+| multiplier | edit_region | 1.0 | 1.0 | 1.7479e-02 | -4.0682e-04 | 42.96 | true |
+| noise_injection | global baseline | 1.0 | 1.0 | 9.8289e-03 | 1.1738e-02 | 0.84 | true |
+| noise_injection | edit_region | 1.0 | 1.0 | 1.4211e-02 | 6.7941e-04 | 20.92 | true |
+
+**noise_injection 辅助指标**：
+
+| metric | strong-minus-weak mean |
+|---|---:|
+| `local_std` | 6.7552e-04 |
+| `local_energy` | 1.3990e-01 |
+| `local_roughness` | 5.8001e-04 |
+
+**worst-sample probe 策略**：
+- 不再写死 `sample_idx=1`。
+- 每个 family 先跑 3-sample quick eval，再选 `strong_minus_weak_edit_gain` 最小的样本做 probe：
+  - `step_change`: worst `sample_idx=0`, gap `1.4496e-02`
+  - `multiplier`: worst `sample_idx=0`, gap `1.4217e-02`
+  - `noise_injection`: worst `sample_idx=2`, gap `7.8125e-03`
+
+**阶段判断**：
+- 这轮支持把 mask-local final mapping 从 hard_zero 专项提升为“局部编辑 family 的标准可选机制”。
+- 三个 family 都保持 3/3 raw/final monotonic，edit gap 没有塌，background strong-minus-weak 被显著压低。
+- `step_change` 和 `multiplier` 的收益非常干净：edit gap 上升且 background gap 接近 0。
+- `noise_injection` 也有正信号，但问题更特殊：
+  - 平均 edit gap 增加；
+  - background gap 显著压低；
+  - local energy / roughness 随 strength 增强；
+  - 但绝对输出幅度仍远大于 target edit gain，说明它的主要瓶颈不只是 final mapping 泄漏，还包括 noise 语义/幅度校准。
+
+**当前问题与可能原因**：
+- `mask-local` 解决的是 final mapping 层的全局 gain 泄漏，不等于解决所有背景污染来源。
+- 当前三类的 `bg_mae_mean` 绝对值仍大，说明编辑生成本身仍有基础漂移；本轮观察的是 strong-minus-weak 背景差是否随强度泄漏。
+- `noise_injection` 的 target 是局部波动性而不是单纯均值幅度，后续需要继续把 local std / energy / roughness 纳入主判定。
+- 如果某个 family 后续在 `scope=edit_region` 下仍出现 high bg strong-minus-weak，就应怀疑污染发生在更早的 residual / modulation / carrier 层，而不是继续加 global scalar。
+
+**下一步建议**：
+- 保持代码默认 `scope=global`，只在局部编辑 family 新实验中显式打开 `scope=edit_region`。
+- 后续可按 `step_change -> multiplier -> noise_injection -> trend regression` 做更大样本验证。
+- trend 暂时作为 regression check，不应无条件切换默认行为；局部 trend 适合 local，全序列 trend 不一定适合。
+
 ## [2026-04-20] - hard_zero mask-local final mapping：局部性显著改善，背景 gap 被压低
 
 **本轮目标**：

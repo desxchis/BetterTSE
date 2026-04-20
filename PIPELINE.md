@@ -72,7 +72,8 @@
   - `strength_control.enabled = true`
   - `use_text_context = true`
   - `use_task_id = false`
-  - hard_zero 局部性实验可显式设置 `train.strength_control.final_output_strength_mapping.scope = edit_region`；默认仍是 `global`
+  - 局部编辑 family 可显式设置 `train.strength_control.final_output_strength_mapping.scope = edit_region`；默认仍是 `global`
+  - 已做小样本正向验证的局部 family：`hard_zero / step_change / multiplier / noise_injection`
   - 新输出层监督：
     - `edit_region_loss_weight`
     - `background_loss_weight`
@@ -123,6 +124,12 @@
   - `edit_gain_weak / medium / strong`
   - `monotonic_hit_rate`
   - `strong_minus_weak_edit_gain`
+  - `bg_mae_strong_minus_weak`
+  - `edit_gap / abs(bg_gap)`
+- volatility/noise 辅助指标：
+  - `local_std_strong_minus_weak_mean`
+  - `local_energy_strong_minus_weak_mean`
+  - `local_roughness_strong_minus_weak_mean`
   - `bg_mae_strong_minus_weak`
   - `mae_vs_target`
   - `mse_vs_target`
