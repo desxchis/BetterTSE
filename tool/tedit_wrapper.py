@@ -164,40 +164,82 @@ class TEditWrapper:
             strength_cfg = self.config.get("diffusion", {}).get("strength_control") or {}
             projector_weight = None
             text_emb_weight = None
+            out_weight = None
+            strength_emb_weight = None
+            task_emb_weight = None
             if isinstance(state_dict, dict):
                 projector_weight = state_dict.get("diff_model.strength_projector.mlp.0.weight")
                 text_emb_weight = state_dict.get("diff_model.strength_projector.text_encoder.token_emb.weight")
+                out_weight = state_dict.get("diff_model.strength_projector.mlp.6.weight")
+                strength_emb_weight = state_dict.get("diff_model.strength_projector.strength_emb.weight")
+                task_emb_weight = state_dict.get("diff_model.strength_projector.task_emb.weight")
             if isinstance(strength_cfg, dict):
+                if out_weight is not None:
+                    strength_cfg["out_dim"] = int(out_weight.shape[0])
+                if strength_emb_weight is not None:
+                    strength_cfg["num_strength_bins"] = int(strength_emb_weight.shape[0])
+                    strength_cfg["emb_dim"] = int(strength_emb_weight.shape[1])
+                if task_emb_weight is not None:
+                    strength_cfg["num_tasks"] = int(task_emb_weight.shape[0])
+                    strength_cfg["use_task_id"] = True
                 if projector_weight is not None:
                     expected_in_dim = int(projector_weight.shape[1])
                     emb_dim = int(strength_cfg.get("emb_dim", 32))
-                    use_task_id = bool(strength_cfg.get("use_task_id", False))
-                    base_in_dim = emb_dim * 2 + (emb_dim if use_task_id else 0)
-                    text_extra = max(0, expected_in_dim - base_in_dim)
-                    strength_cfg["use_text_context"] = bool(text_extra > 0)
-                    strength_cfg["text_dim"] = int(text_extra) if text_extra > 0 else 0
+                    ckpt_text_dim = int(text_emb_weight.shape[1]) if text_emb_weight is not None else 0
+                    task_options = [bool(task_emb_weight is not None)]
+                    if task_emb_weight is None:
+                        task_options.append(bool(strength_cfg.get("use_task_id", False)))
+                    text_options = [bool(text_emb_weight is not None)]
+                    if text_emb_weight is None:
+                        text_options.append(bool(strength_cfg.get("use_text_context", False)))
+                    scalar_options = [bool(strength_cfg.get("include_strength_scalar", True)), True, False]
+                    matched = None
+                    for include_scalar in scalar_options:
+                        for use_task_id in task_options:
+                            for use_text_context in text_options:
+                                text_dim = ckpt_text_dim if use_text_context and ckpt_text_dim > 0 else (
+                                    int(strength_cfg.get("text_dim", 0)) if use_text_context else 0
+                                )
+                                candidate_in_dim = emb_dim
+                                if include_scalar:
+                                    candidate_in_dim += emb_dim
+                                if use_task_id:
+                                    candidate_in_dim += emb_dim
+                                if use_text_context:
+                                    candidate_in_dim += text_dim
+                                if candidate_in_dim == expected_in_dim:
+                                    matched = (include_scalar, use_task_id, use_text_context, text_dim)
+                                    break
+                            if matched is not None:
+                                break
+                        if matched is not None:
+                            break
+
+                    if matched is not None:
+                        include_scalar, use_task_id, use_text_context, text_dim = matched
+                        strength_cfg["include_strength_scalar"] = bool(include_scalar)
+                        strength_cfg["use_task_id"] = bool(use_task_id)
+                        strength_cfg["use_text_context"] = bool(use_text_context)
+                        strength_cfg["text_dim"] = int(text_dim) if use_text_context else 0
+                    else:
+                        raise RuntimeError(
+                            "Cannot infer strength_projector input architecture from checkpoint: "
+                            f"expected mlp input dim {expected_in_dim}, emb_dim {emb_dim}, "
+                            f"text_dim {ckpt_text_dim}, task_emb={task_emb_weight is not None}"
+                        )
                 elif text_emb_weight is not None:
                     strength_cfg["use_text_context"] = True
                     strength_cfg["text_dim"] = int(text_emb_weight.shape[1])
 
+                strength_cfg["hidden_dim"] = int(strength_cfg.get("hidden_dim", 64))
                 if projector_weight is not None:
-                    expected_in_dim = int(projector_weight.shape[1])
-                    emb_dim = int(strength_cfg.get("emb_dim", 32))
-                    use_task_id = bool(strength_cfg.get("use_task_id", False))
-                    base_in_dim = emb_dim * 2 + (emb_dim if use_task_id else 0)
-                    text_dim = int(strength_cfg.get("text_dim", 0)) if bool(strength_cfg.get("use_text_context", False)) else 0
-                    if base_in_dim + text_dim != expected_in_dim:
-                        adjusted_text_dim = max(0, expected_in_dim - base_in_dim)
-                        strength_cfg["use_text_context"] = bool(adjusted_text_dim > 0)
-                        strength_cfg["text_dim"] = int(adjusted_text_dim) if adjusted_text_dim > 0 else 0
+                    strength_cfg["hidden_dim"] = int(projector_weight.shape[0])
 
-                if (
-                    text_emb_weight is not None
-                    and bool(strength_cfg.get("use_text_context", False))
-                    and int(strength_cfg.get("text_dim", 0)) == int(text_emb_weight.shape[1])
-                ):
-                    strength_cfg["text_dim"] = int(text_emb_weight.shape[1])
-                    strength_cfg["use_text_context"] = True
+                final_mapping_head_weight = state_dict.get("diff_model.final_output_strength_mapping_head.0.weight") if isinstance(state_dict, dict) else None
+                if final_mapping_head_weight is not None:
+                    final_mapping_cfg = strength_cfg.get("final_output_strength_mapping") or {}
+                    final_mapping_cfg["hidden_dim"] = int(final_mapping_head_weight.shape[0])
+                    strength_cfg["final_output_strength_mapping"] = final_mapping_cfg
 
             self.model = ConditionalGenerator(self.config)
             self.model.load_state_dict(state_dict, strict=False)

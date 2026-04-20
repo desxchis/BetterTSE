@@ -74,6 +74,7 @@ def check_benchmark(path: Path) -> Dict[str, Any]:
     all_bg_leaks: List[float | None] = []
     tool_counts: Dict[str, int] = {}
     duration_counts: Dict[str, int] = {}
+    noise_subtype_counts: Dict[str, int] = {}
     scalar_coverages: List[float] = []
     family_rhos: List[float] = []
 
@@ -133,14 +134,18 @@ def check_benchmark(path: Path) -> Dict[str, Any]:
 
         tool_name = str(family.get("tool_name", "unknown"))
         duration_bucket = str(family.get("duration_bucket", "unknown"))
+        noise_subtype = str(family.get("noise_subtype", "") or "")
         tool_counts[tool_name] = tool_counts.get(tool_name, 0) + 1
         duration_counts[duration_bucket] = duration_counts.get(duration_bucket, 0) + 1
+        if noise_subtype:
+            noise_subtype_counts[noise_subtype] = noise_subtype_counts.get(noise_subtype, 0) + 1
 
         family_rows.append(
             {
                 "family_id": family.get("family_id"),
                 "tool_name": tool_name,
                 "duration_bucket": duration_bucket,
+                "noise_subtype": noise_subtype or None,
                 "strength_scalar": strengths,
                 "num_samples": len(samples),
                 "scalar_order_valid": scalar_order_valid,
@@ -169,6 +174,7 @@ def check_benchmark(path: Path) -> Dict[str, Any]:
         "family_spearman_rho": _summarize(family_rhos),
         "tool_counts": tool_counts,
         "duration_counts": duration_counts,
+        "noise_subtype_counts": noise_subtype_counts,
         "health_pass": bool(
             len(families) > 0
             and family_valid_count == len(families)
@@ -216,6 +222,10 @@ def main() -> None:
     lines.extend(["", "## Duration Counts", ""])
     for key, value in sorted(s["duration_counts"].items()):
         lines.append(f"- `{key}`: {value}")
+    if s["noise_subtype_counts"]:
+        lines.extend(["", "## Noise Subtype Counts", ""])
+        for key, value in sorted(s["noise_subtype_counts"].items()):
+            lines.append(f"- `{key}`: {value}")
     md_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
     print(json.dumps(report, ensure_ascii=False, indent=2))

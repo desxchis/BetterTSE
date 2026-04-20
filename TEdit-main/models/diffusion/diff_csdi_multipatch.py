@@ -820,6 +820,7 @@ class Diff_CSDI_MultiPatch_Parallel(nn.Module):
                 dropout=float(strength_cfg.get("dropout", 0.0)),
                 use_task_id=bool(strength_cfg.get("use_task_id", False)),
                 text_num_buckets=int(strength_cfg.get("text_num_buckets", 4096)),
+                include_strength_scalar=bool(strength_cfg.get("include_strength_scalar", True)),
             )
             self.strength_input_projection = nn.Linear(self.strength_cond_dim, self.channels)
             nn.init.zeros_(self.strength_input_projection.weight)

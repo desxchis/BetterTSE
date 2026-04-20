@@ -24,18 +24,24 @@ from tool.tedit_wrapper import TEditWrapper
 
 
 def _resolve_runtime_config_path(model_path: str, config_path: str) -> str:
+    requested = Path(config_path).resolve()
+    if requested.exists():
+        return str(requested)
     model_file = Path(model_path).resolve()
     for candidate_name in ("resolved_runtime_config.json", "model_configs.yaml"):
         candidate = model_file.parent.parent / candidate_name
         if candidate.exists():
             return str(candidate)
-    requested = Path(config_path).resolve()
     return str(requested)
 
 
 def _load_wrapper_config(config_path: str) -> dict[str, Any]:
     config_file = Path(config_path).resolve()
-    payload = json.loads(config_file.read_text(encoding="utf-8"))
+    text = config_file.read_text(encoding="utf-8")
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        payload = yaml.safe_load(text)
     if isinstance(payload, dict):
         resolved_model = payload.get("resolved_configs", {}).get("model")
         if isinstance(resolved_model, dict) and all(key in resolved_model for key in ("attrs", "side", "diffusion")):
@@ -101,6 +107,7 @@ def _load_eval_records(dataset_folder: str, split: str, max_samples: int) -> tup
                     "family_id": str(family.get("family_id", family_idx)),
                     "tool_name": str(per_strength[0].get("tool_name", "unknown")),
                     "family_semantic_tag": str(per_strength[0].get("family_semantic_tag", "unknown")),
+                    "duration_bucket": str(per_strength[0].get("duration_bucket", family.get("duration_bucket", "unknown"))),
                     "task_id": per_strength[0].get("task_id"),
                     "region_start": region_start,
                     "region_end": region_end,
@@ -399,6 +406,7 @@ def main() -> None:
         family_id = str(record.get("family_id", sample_idx))
         tool_name = str(record.get("tool_name", "unknown"))
         family_semantic_tag = str(record.get("family_semantic_tag", "unknown"))
+        duration_bucket = str(record.get("duration_bucket", "unknown"))
         task_id = record.get("task_id")
         region_start = record.get("region_start")
         region_end = record.get("region_end")
@@ -521,6 +529,7 @@ def main() -> None:
                 "family_id": family_id,
                 "tool_name": tool_name,
                 "family_semantic_tag": family_semantic_tag,
+                "duration_bucket": duration_bucket,
                 "task_id": task_id,
                 "region_start": region_start,
                 "region_end": region_end,
@@ -626,6 +635,7 @@ def main() -> None:
                 "family_id": family_id,
                 "tool_name": tool_name,
                 "family_semantic_tag": family_semantic_tag,
+                "duration_bucket": duration_bucket,
                 "task_id": task_id,
                 "region_start": region_start,
                 "region_end": region_end,
@@ -683,6 +693,10 @@ def main() -> None:
         )
 
     scalar_keys = sorted(strength_rows.keys(), key=float)
+    duration_bucket_rows: dict[str, list[dict[str, Any]]] = {}
+    for row in pairwise_rows:
+        duration_bucket_rows.setdefault(str(row.get("duration_bucket", "unknown")), []).append(row)
+
     summary = {
         "condition_mode": args.condition_mode,
         "n_samples": len(eval_records),
@@ -796,6 +810,30 @@ def main() -> None:
             _aggregate_mean([row["max_bg_mae"] for row in pairwise_rows]),
             _aggregate_mean([row["min_bg_mae"] for row in pairwise_rows]),
         ),
+        "duration_bucket_summary": {
+            bucket: {
+                "n_samples": len(bucket_rows),
+                "monotonic_hit_rate": float(np.mean([float(row["monotonic_hit"]) for row in bucket_rows])),
+                "raw_monotonic_hit_rate": float(np.mean([float(row["raw_monotonic_hit"]) for row in bucket_rows])),
+                "final_monotonic_hit_rate": float(np.mean([float(row["final_monotonic_hit"]) for row in bucket_rows])),
+                "strong_minus_weak_edit_gain_mean": _aggregate_mean([row["strong_minus_weak_edit_gain"] for row in bucket_rows]),
+                "local_std_strong_minus_weak_mean": _aggregate_mean([row["local_std_strong_minus_weak"] for row in bucket_rows]),
+                "local_energy_strong_minus_weak_mean": _aggregate_mean([row["local_energy_strong_minus_weak"] for row in bucket_rows]),
+                "local_roughness_strong_minus_weak_mean": _aggregate_mean([row["local_roughness_strong_minus_weak"] for row in bucket_rows]),
+                "bg_mae_strong_minus_weak": _safe_diff(
+                    _aggregate_mean([row["max_bg_mae"] for row in bucket_rows]),
+                    _aggregate_mean([row["min_bg_mae"] for row in bucket_rows]),
+                ),
+                "preservation_pass_rate": float(np.mean([
+                    float(
+                        _safe_diff(row["max_bg_mae"], row["min_bg_mae"]) is not None
+                        and float(_safe_diff(row["max_bg_mae"], row["min_bg_mae"])) <= float(args.bg_drift_threshold)
+                    )
+                    for row in bucket_rows
+                ])),
+            }
+            for bucket, bucket_rows in sorted(duration_bucket_rows.items())
+        },
     }
     summary["raw_to_final_monotonic_drop"] = _safe_diff(
         summary["raw_monotonic_hit_rate"],

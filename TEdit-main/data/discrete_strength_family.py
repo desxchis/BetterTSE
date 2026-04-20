@@ -47,6 +47,7 @@ def _family_metadata_signature(sample: Dict[str, Any]) -> Tuple[Any, ...]:
         sample.get("attr_strategy"),
         sample.get("family_semantic_tag"),
         sample.get("task_id"),
+        sample.get("noise_subtype"),
     )
 
 
@@ -319,6 +320,7 @@ class DiscreteStrengthFamilySplit(Dataset):
                 "direction": str(family_semantics["direction"]),
                 "attr_strategy": str(family_semantics["attr_strategy"]),
                 "family_semantic_tag": str(family_semantics["family_semantic_tag"]),
+                "duration_bucket": str(sample.get("duration_bucket", family.get("duration_bucket", "unknown"))),
             }
             task_id = _int_metadata_value(family.get("task_id"), sample.get("task_id"))
             if task_id is not None:

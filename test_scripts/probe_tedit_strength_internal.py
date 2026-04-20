@@ -30,18 +30,24 @@ DEFAULT_STRENGTH_CONTROLS = [
 
 
 def _resolve_runtime_config_path(model_path: str, config_path: str) -> str:
+    requested = Path(config_path).resolve()
+    if requested.exists():
+        return str(requested)
     model_file = Path(model_path).resolve()
     for candidate_name in ("resolved_runtime_config.json", "model_configs.yaml"):
         candidate = model_file.parent.parent / candidate_name
         if candidate.exists():
             return str(candidate)
-    requested = Path(config_path).resolve()
     return str(requested)
 
 
 def _load_wrapper_config(config_path: str) -> dict[str, Any]:
     config_file = Path(config_path).resolve()
-    payload = json.loads(config_file.read_text(encoding="utf-8"))
+    text = config_file.read_text(encoding="utf-8")
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        payload = yaml.safe_load(text)
     if isinstance(payload, dict):
         resolved_model = payload.get("resolved_configs", {}).get("model")
         if isinstance(resolved_model, dict) and all(key in resolved_model for key in ("attrs", "side", "diffusion")):

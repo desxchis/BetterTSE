@@ -540,6 +540,48 @@ def heuristic_volatility_operator(base_ts: np.ndarray, region: List[int]) -> np.
     )
 
 
+def build_noise_calibration_baselines(
+    *,
+    base_ts: np.ndarray,
+    region: List[int],
+    subtype: str,
+) -> Dict[str, np.ndarray]:
+    base = np.asarray(base_ts, dtype=np.float32)
+    selected_subtype = str(subtype or "uniform_variance").strip().lower()
+    baselines: Dict[str, np.ndarray] = {
+        "generic_noise_family": heuristic_volatility_operator(base, region),
+        "volatility_global_scale": volatility_global_scale(
+            base,
+            region,
+            base_noise_scale=1.0,
+            local_std_target_ratio=2.0,
+            baseline_offset_ratio=0.05,
+            trend_preserve=0.0,
+        ),
+        "volatility_local_burst": volatility_burst_local(
+            base,
+            region,
+            background_scale=0.5,
+            burst_center=0.5,
+            burst_width=0.25,
+            burst_amplitude=2.4,
+            burst_envelope_sharpness=0.8,
+            baseline_offset_ratio=0.05,
+        ),
+    }
+    if selected_subtype == "monotonic_envelope":
+        baselines["volatility_envelope_monotonic"] = volatility_envelope_monotonic(
+            base,
+            region,
+            base_noise_scale=1.0,
+            start_scale=0.3,
+            end_scale=2.0,
+            baseline_offset_ratio=0.05,
+            trend_preserve=0.0,
+        )
+    return baselines
+
+
 def _candidate_grid(operator_name: str) -> List[Dict[str, Any]]:
     if operator_name == "volatility_global_scale":
         grid = []

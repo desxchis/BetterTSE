@@ -2,6 +2,122 @@
 
 按时间倒序记录 pure-editing strength mainline 的关键推进，不混入 forecast-revision 主线。
 
+## [2026-04-20] - T2 trend regression rerun：配置 blocker 解除，但旧 checkpoint 行为不达标
+
+**本轮目标**：
+- 接手 Claude 中断点，修复 `finetune_strength_trend_family_semantic_split` checkpoint 在 T2 probe/eval 中的 architecture mismatch。
+- 按当前主线计划执行 T2：先 probe，再 trend monotonic eval，再 effect eval。
+- 不改 Trainer 主逻辑，不改监督公式，不把 trend 默认切到 mask-local。
+
+**关键 blocker 与修复**：
+- 目标 checkpoint：
+  - `TEdit-main/save/synthetic/finetune_strength_trend_family_semantic_split/0/trend_injection/ckpts/model_best.pth`
+- 旧失败不再是 CUDA 或 JSON/YAML resolver 本身，而是 checkpoint/config architecture mismatch：
+  - checkpoint: `diff_model.strength_projector.mlp.0.weight = [64, 96]`
+  - 当前运行时新结构默认会构造 `emb_dim * 2 + text_dim = 128` 或在错误推断后退到 64。
+- 修复方式：
+  - `StrengthProjector` 增加 `include_strength_scalar`，默认 `true`，不改变新训练行为。
+  - `TEditWrapper.load_model()` 从 checkpoint 权重反推 legacy projector 输入结构。
+  - 对该 checkpoint 自动推断为：
+    - `emb_dim = 32`
+    - `text_dim = 64`
+    - `use_text_context = true`
+    - `use_task_id = false`
+    - `include_strength_scalar = false`
+  - 构造后 `mlp.0.weight` 为 `[64, 96]`，和 checkpoint 对齐。
+- 同时补齐：
+  - dedicated family loader 透传 `duration_bucket`
+  - trend monotonic/effect eval 的 duration bucket 汇总不再显示为 `unknown`
+  - effect eval bucket preservation 汇总不再读取不存在的 row 字段
+
+**T2 产物**：
+- `results/strength_t2_regression_20260420/probe_sample0_after_legacy_projector_fix.json`
+- `results/strength_t2_regression_20260420/trend_monotonic_eval_after_legacy_projector_fix.json`
+- `results/strength_t2_regression_20260420/effect_eval_after_legacy_projector_fix.json`
+
+**T2 结果**：
+
+| check | value |
+|---|---:|
+| probe gate `diff_0_2_linf` | 0.0 |
+| monotonic eval adjacent pass rate | 0.0 |
+| monotonic eval gain_range_mean | -2.5144e-03 |
+| monotonic eval preservation_pass_rate | 1.0 |
+| effect raw_monotonic_hit_rate | 0.0 |
+| effect final_monotonic_hit_rate | 0.0 |
+| effect strong_minus_weak_edit_gain_mean | 3.3580e-05 |
+| effect bg_mae_strong_minus_weak | 3.2900e-05 |
+| effect preservation_pass | true |
+
+**duration bucket 结果**：
+
+| source | bucket | n | monotonic | strong-minus-weak / gain range | preservation |
+|---|---|---:|---:|---:|---:|
+| monotonic eval | short | 3 | 0.0 | 1.4576e-03 | 1.0 |
+| monotonic eval | medium | 3 | 0.0 | 2.8090e-04 | 1.0 |
+| monotonic eval | long | 2 | 0.0 | -1.2665e-02 | 1.0 |
+| effect eval | short | 3 | 0.0 | 3.3696e-05 | 1.0 |
+| effect eval | medium | 3 | 0.0 | 3.7511e-05 | 1.0 |
+| effect eval | long | 2 | 0.0 | 2.7508e-05 | 1.0 |
+
+**阶段判断**：
+- T2 已从“跑不起来”推进为“能跑，但旧 checkpoint 行为不达标”。
+- 当前旧 trend checkpoint 有 projector/modulation 信号，但输出层强度排序基本不可见：
+  - raw/final 都不可分；
+  - strong-minus-weak 量级只有 `3e-05`；
+  - preservation 稳定通过，说明问题不是 final preservation flattening，而是 strength conditioning/训练动态没有转成有效输出排序。
+- 按 Claude plan 的 stop rule：当前 healthy benchmark 上 raw 都不可分，因此不进入 T3 larger benchmark。
+- trend verdict 应写为 `no-regression-but-not-ready`：
+  - 没有证据说明 mask-local 会破坏 trend；
+  - 但也没有证据支持把该旧 checkpoint 的局部 trend 纳入 promotable local family。
+
+## [2026-04-20] - trend regression / noise calibration 计划收口到主线资产
+
+**本轮目标**：
+- 把 `mask-local` 从 hard_zero 专项推进为局部 family 可选机制后的结论，正式收口到主线资产。
+- 明确 trend 下一步先做 regression check，不默认切到 local 主线。
+- 明确 noise 下一步从“修 final mapping 泄漏”转向“做局部波动语义/统计校准”。
+- 不改 Trainer 主逻辑，不扩展高层工具链，只补 benchmark/eval/reporting 支撑。
+
+**代码改动**：
+- `test_scripts/run_tedit_trend_monotonic_eval.py`
+  - summary 新增 `duration_bucket_summary`，按 `short / medium / long` 聚合：
+    - `adjacent_monotonic_pass_rate`
+    - `off_anchor_monotonic_pass_rate`
+    - `gain_range_mean`
+    - `family_spearman_rho_mean`
+    - `bg_mae_mean`
+    - `preservation_pass_rate`
+- `test_scripts/evaluate_tedit_strength_effect.py`
+  - summary 新增 `duration_bucket_summary`，按 `short / medium / long` 聚合：
+    - `monotonic_hit_rate`
+    - `raw_monotonic_hit_rate`
+    - `final_monotonic_hit_rate`
+    - `strong_minus_weak_edit_gain_mean`
+    - `local_std/local_energy/local_roughness strong-minus-weak`
+    - `bg_mae_strong_minus_weak`
+    - `preservation_pass_rate`
+- `test_scripts/build_tedit_strength_discrete_benchmark.py`
+  - `noise_injection` family 现默认先采样两类 pilot subtype：
+    - `uniform_variance`
+    - `local_burst`
+  - family/sample payload 新增 `noise_subtype`，便于 health check 与 calibration baseline 按 subtype 切片。
+- `test_scripts/check_tedit_strength_discrete_benchmark.py`
+  - summary 新增 `noise_subtype_counts`，markdown health 报告同步输出 subtype 计数。
+- `TEdit-main/data/discrete_strength_family.py`
+  - family invariant 校验把 `noise_subtype` 纳入 metadata signature，保证同一 family 三个 strength 不发生 subtype 泄漏。
+- `docs/pure_editing_how_much_protocol.md`
+  - 追加主线 staging update：trend verdict/noise verdict 标签、duration bucket 报告口径、noise 2-subtype pilot 决策边界。
+
+**当前结论锁定**：
+- trend：先做 regression-only 检查；若 raw 可分但 final 塌缩，结论应记为 `no-regression-but-not-ready`。
+- noise：默认先做 2-subtype pilot；若 benchmark 不健康或两类结构指标无稳定分离，不扩到第三类。
+- `monotonic_envelope` 只在 pilot 已成立后再恢复为扩展阶段。
+
+**验证状态**：
+- 当前仅完成代码与文档收口。
+- 按用户要求，涉及 GPU / CUDA 的训练与评估暂不执行，等待后续排队窗口。
+
 ## [2026-04-20] - mask-local 扩展到 step_change / multiplier / noise_injection 小样本对照
 
 **本轮目标**：

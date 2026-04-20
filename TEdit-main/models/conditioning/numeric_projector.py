@@ -108,10 +108,12 @@ class StrengthProjector(nn.Module):
         dropout: float = 0.0,
         use_task_id: bool = False,
         text_num_buckets: int = 4096,
+        include_strength_scalar: bool = True,
     ) -> None:
         super().__init__()
         self.use_text_context = bool(use_text_context)
         self.use_task_id = bool(use_task_id)
+        self.include_strength_scalar = bool(include_strength_scalar)
 
         self.strength_emb = nn.Embedding(num_strength_bins, emb_dim)
         self.strength_scalar_proj = nn.Sequential(
@@ -126,7 +128,9 @@ class StrengthProjector(nn.Module):
             else None
         )
 
-        in_dim = emb_dim * 2
+        in_dim = emb_dim
+        if self.include_strength_scalar:
+            in_dim += emb_dim
         if self.use_task_id:
             in_dim += emb_dim
         if self.use_text_context:
@@ -361,7 +365,9 @@ class StrengthProjector(nn.Module):
                 )
             strength_scalar_vec = self.strength_scalar_proj(strength_scalar)
 
-        feats = [strength_vec, strength_scalar_vec]
+        feats = [strength_vec]
+        if self.include_strength_scalar:
+            feats.append(strength_scalar_vec)
 
         if self.use_task_id:
             if task_id is None:

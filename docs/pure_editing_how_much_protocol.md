@@ -343,6 +343,57 @@ Current next step:
 2. connect the validated split tools back to the BetterTSE canonical/hybrid registry
 3. run a small full-pipeline sanity check to ensure the new routing does not damage other tool families
 
+## 2026-04-20 strength mainline staging update
+
+Current staging decision:
+
+- `mask-local` is treated as an optional mechanism for local families, not a hard-zero-only exception
+- trend stays on a regression-check route first; do not switch trend mainline to local by default
+- noise work is reframed from `fix final mapping leakage` to `local volatility semantic/statistical calibration`
+
+Required reporting contract for the next strength runs:
+
+- trend regression runs must report `short / medium / long` duration buckets
+- trend verdicts must bind to:
+  - `monotonic_hit_rate`
+  - `raw_monotonic_hit_rate`
+  - `final_monotonic_hit_rate`
+  - `strong_minus_weak_edit_gain_mean`
+  - `bg_mae_strong_minus_weak`
+  - `preservation_pass_rate`
+  - worst-case probe
+- noise pilot runs should start with only two subtypes:
+  - `uniform_variance`
+  - `local_burst`
+- only when the two-subtype pilot is both benchmark-healthy and structurally separable should `monotonic_envelope` be added back
+
+Noise calibration reading:
+
+- subtype-specific structure metrics remain the authoritative comparison line:
+  - `uniform_variance` -> `local_std_error`
+  - `local_burst` -> `windowed_energy_profile_error`
+  - expansion-only `monotonic_envelope` -> `roughness_error + windowed_energy_profile_error`
+- preservation must remain part of the go/no-go rule; structural gains without preservation do not promote the route
+- benchmark health stays upstream of all model-side interpretation
+
+Implementation note:
+
+- current benchmark/eval helpers should carry `duration_bucket` consistently
+- noise-only strength benchmarks should record `noise_subtype` at both family and sample level so health checks and calibration summaries can slice by subtype without trainer changes
+
+Decision boundary:
+
+- trend verdict labels are restricted to:
+  - `no-regression-but-not-ready`
+  - `local-trend-promising`
+  - `promotable-for-local-families`
+- noise verdict labels are restricted to:
+  - `keep_generic`
+  - `split_for_calibration_only`
+  - `ready_for_dedicated_line`
+
+No trainer rewrite is part of this staging update.
+
 ## Post-Integration Formal Rerun
 
 Reference artifacts:

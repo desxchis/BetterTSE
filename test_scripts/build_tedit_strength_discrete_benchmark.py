@@ -600,6 +600,7 @@ def build_discrete_benchmark(
             elif injection_type == "noise_injection":
                 shared_state["baseline_ratio"] = float(rng.uniform(0.02, 0.08))
                 shared_state["family_noise"] = rng.normal(loc=0.0, scale=1.0, size=duration)
+                shared_state["noise_subtype"] = str(rng.choice(["uniform_variance", "local_burst"]))
 
             injector = injector_factory.create_injector(injection_type)
             feature_desc = data_loader.feature_descriptions.get(feature, injector_factory.get_feature_description(feature))
@@ -629,6 +630,10 @@ def build_discrete_benchmark(
                     direction=normalized_direction,
                 )
                 end_step = int(injection_config["end_step"])
+                noise_subtype = None
+                if injection_type == "noise_injection":
+                    noise_subtype = str(shared_state.get("noise_subtype", "uniform_variance"))
+
                 sample_payload = {
                     "family_id": f"family_{family_idx + 1:03d}",
                     "sample_id": f"family_{family_idx + 1:03d}_{strength_text}",
@@ -652,6 +657,7 @@ def build_discrete_benchmark(
                     "attr_strategy": attr_strategy,
                     "family_semantic_tag": family_semantic_tag,
                     "target_energy_type": _target_energy_type(base_ts, target_ts, start_step, end_step),
+                    "noise_subtype": noise_subtype,
                     "injection_config": injection_config,
                     "timestamp": datetime.now().isoformat(),
                 }
@@ -674,6 +680,7 @@ def build_discrete_benchmark(
         family_attr_strategy = str(family_samples[0].get("attr_strategy", "neutral")) if family_samples else "neutral"
         family_semantic_tag = str(family_samples[0].get("family_semantic_tag", "unknown")) if family_samples else "unknown"
         family_injection_config = dict(family_samples[0].get("injection_config", {})) if family_samples else {}
+        family_noise_subtype = str(family_samples[0].get("noise_subtype", "")) if family_samples else ""
         families.append(
             {
                 "family_id": f"family_{family_idx + 1:03d}",
@@ -689,6 +696,7 @@ def build_discrete_benchmark(
                 "target_feature": feature,
                 "feature_description": feature_desc,
                 "duration_bucket": duration_bucket,
+                "noise_subtype": family_noise_subtype,
                 "region": [int(start_step), int(start_step + duration)],
                 "source_ts": base_ts.astype(float).tolist(),
                 "samples": family_samples,

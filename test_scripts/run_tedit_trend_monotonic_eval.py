@@ -194,6 +194,7 @@ def run_eval(
             "family_id": family.get("family_id"),
             "tool_name": family.get("tool_name"),
             "direction": direction,
+            "duration_bucket": str(samples[0].get("duration_bucket", family.get("duration_bucket", "unknown"))),
             "region": family.get("region"),
             "anchor_strength_scalar": [float(sample["strength_scalar"]) for sample in samples],
             "anchor_target_edit_gain": [
@@ -284,6 +285,10 @@ def run_eval(
             "pass": bool(float(probe.get("diff_0_2_linf", 0.0)) > 0.0),
         }
 
+    duration_bucket_rows: Dict[str, List[Dict[str, Any]]] = {}
+    for row in family_rows:
+        duration_bucket_rows.setdefault(str(row.get("duration_bucket", "unknown")), []).append(row)
+
     summary = {
         "num_families": len(family_rows),
         "family_filter": "trend_injection",
@@ -306,6 +311,18 @@ def run_eval(
         "gain_range_mean": _aggregate([row["gain_range"] for row in family_rows]),
         "family_spearman_rho_mean": _aggregate([row["spearman_rho_strength_gain"] for row in family_rows]),
         "preservation_pass_rate": float(np.mean([float(row["preservation_pass"]) for row in family_rows])),
+        "duration_bucket_summary": {
+            bucket: {
+                "num_families": len(bucket_rows),
+                "adjacent_monotonic_pass_rate": float(np.mean([float(item["adjacent_monotonic_pass"]) for item in bucket_rows])),
+                "off_anchor_monotonic_pass_rate": float(np.mean([float(item["off_anchor_monotonic_pass"]) for item in bucket_rows])),
+                "gain_range_mean": _aggregate([item["gain_range"] for item in bucket_rows]),
+                "family_spearman_rho_mean": _aggregate([item["spearman_rho_strength_gain"] for item in bucket_rows]),
+                "bg_mae_mean": _aggregate([item["bg_mae_mean"] for item in bucket_rows]),
+                "preservation_pass_rate": float(np.mean([float(item["preservation_pass"]) for item in bucket_rows])),
+            }
+            for bucket, bucket_rows in sorted(duration_bucket_rows.items())
+        },
     }
     summary["minimum_usable_gain_range_mean"] = summary["gain_range_mean"]
     summary["family_spearman_rho_strength_gain_mean"] = summary["family_spearman_rho_mean"]
