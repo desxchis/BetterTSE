@@ -2,6 +2,103 @@
 
 按时间倒序记录 pure-editing strength mainline 的关键推进，不混入 forecast-revision 主线。
 
+## [2026-04-20] - trend inverse final mapping 旧成功线复核：smoke 成功依赖旧 strength scalar 合约，T2 held-out 方向反转
+
+**本轮目标**：
+- 回答“之前 trend 表现好的时候”到底是哪一层证据。
+- 把 2026-04-19 的 `tmp/output_final_mapping_inverse004_3epoch` inverse final mapping 成功线，用同一套 T2 contract 复跑：
+  - 同一个 healthy held-out trend benchmark；
+  - 同样的 `probe -> monotonic eval -> effect eval`；
+  - 同样的 duration bucket 汇总。
+- 不扩大 benchmark，不改 Trainer / loss，不把 trend 提升为 promotable local family。
+
+**复核对象**：
+- checkpoint:
+  - `tmp/output_final_mapping_inverse004_3epoch/0/trend_injection/ckpts/model_best.pth`
+- training/runtime config:
+  - `tmp/output_final_mapping_inverse004_3epoch/0/trend_injection/resolved_runtime_config.json`
+- final mapping 关键设置：
+  - `final_output_strength_mapping.enabled = true`
+  - `gain_order_direction = decreasing`
+  - `scalar_prior_scale = -0.04`
+  - `learned_max_delta = 0.04`
+  - `scalar_center = 1.0`
+
+**历史正证据边界**：
+- 2026-04-19 旧 smoke 结果来自：
+  - `tmp/final_mapping_inverse004_eval_both.json`
+- 当时 3-sample smoke 显示：
+  - `final_monotonic_hit_rate = 1.0`
+  - `strong_minus_weak_edit_gain_mean = 5.1547e-02`
+  - `bg_mae_strong_minus_weak = 4.4010e-02`
+  - `preservation_pass = true`
+- 旧 probe 的 final mapping scalar/gain 关系近似为：
+  - `0.0000 -> 1.039996`
+  - `1.0000 -> 0.999996`
+  - `2.0000 -> 0.959996`
+- 因此旧结论应限定为：inverse final mapping 机制能在当时的 3-sample smoke 合约下显化 strength 差异。
+
+**T2 复跑产物**：
+- `results/strength_t2_inverse004_20260420/probe_sample0.json`
+- `results/strength_t2_inverse004_20260420/trend_monotonic_eval.json`
+- `results/strength_t2_inverse004_20260420/effect_eval.json`
+
+**T2 关键发现**：
+- 当前 held-out `discrete_strength_trend_family` 的 strength scalar 合约是：
+  - `weak = 0.0`
+  - `medium = 0.5`
+  - `strong = 1.0`
+- 同一个 inverse mapping 在当前合约下给出的 gain 顺序变成：
+  - `0.0000 -> 1.039996`
+  - `0.5000 -> 1.019996`
+  - `1.0000 -> 0.999996`
+- 这等价于 weak gain 最大、strong gain 最小，和当前 benchmark 的 `weak < medium < strong` 目标方向相反。
+
+**T2 结果**：
+
+| check | value |
+|---|---:|
+| probe gate `diff_0_2_linf` | 0.0 |
+| monotonic eval adjacent pass rate | 0.0 |
+| monotonic eval off-anchor pass rate | 0.625 |
+| monotonic eval gain_range_mean | -2.9919e-02 |
+| monotonic eval family_spearman_rho_mean | -0.325 |
+| monotonic eval preservation_pass_rate | 1.0 |
+| effect raw_monotonic_hit_rate | 0.0 |
+| effect final_monotonic_hit_rate | 0.0 |
+| effect strong_minus_weak_edit_gain_mean | -5.7758e-03 |
+| effect bg_mae_strong_minus_weak | -5.6047e-03 |
+| effect family_spearman_rho_strength_gain_mean | -1.0 |
+| effect preservation_pass | true |
+
+**duration bucket 结果**:
+
+| source | bucket | n | monotonic | strong-minus-weak / gain range | preservation |
+|---|---|---:|---:|---:|---:|
+| monotonic eval | short | 3 | 0.0 | -2.2847e-02 | 1.0 |
+| monotonic eval | medium | 3 | 0.0 | -5.0694e-02 | 1.0 |
+| monotonic eval | long | 2 | 0.0 | -9.3655e-03 | 1.0 |
+| effect eval | short | 3 | 0.0 | -5.9420e-03 | 1.0 |
+| effect eval | medium | 3 | 0.0 | -6.8916e-03 | 1.0 |
+| effect eval | long | 2 | 0.0 | -3.8528e-03 | 1.0 |
+
+**阶段判断**：
+- 旧 trend 正证据不应被抹掉，但必须分层：
+  - 机制层：inverse final mapping 在旧 3-sample smoke 合约下确实能显化 strength 差异。
+  - T2 held-out 层：同一个 inverse004 checkpoint/config 在当前 healthy held-out regression 上 raw/final 都不可分，且方向为负。
+  - 合约层：失败不只是“小样本不泛化”，还暴露出旧 smoke 使用的 strength scalar 合约与当前 `0 / 0.5 / 1.0` family 合约不一致。
+- 因此当前 trend 结论应更新为：
+  - `trend` 仍停留在 `regression-only / no-regression-but-not-ready`；
+  - 不能把 inverse004 旧 smoke 直接升级为 promotable local trend 证据；
+  - 下一步如果继续 trend，不应扩大当前 benchmark，而应先做 scalar-contract-aligned 的最小配置实验。
+
+**下一步建议**：
+- 不再扩大当前 semantic-split checkpoint 或 inverse004 checkpoint 的 T2 benchmark。
+- 若继续验证 trend 机制，优先做 config-only 合约对齐：
+  - 明确当前 `0 / 0.5 / 1.0` scalar 合约下 final mapping 的期望方向；
+  - 或把 final mapping 内部 scalar 规范到旧 `0 / 1 / 2` 合约后再比较；
+  - 然后再跑同一套 T2 `probe -> monotonic eval -> effect eval`。
+
 ## [2026-04-20] - T2 trend regression rerun：配置 blocker 解除，但旧 checkpoint 行为不达标
 
 **本轮目标**：
