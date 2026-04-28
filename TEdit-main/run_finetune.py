@@ -464,7 +464,11 @@ for n in range(args.n_runs):
 
     model_config_path = args.model_config_path
     if not os.path.isabs(model_config_path):
-        model_config_path = fr"{args.pretrained_dir}/{n}/{model_config_path}"
+        candidate_model_config_path = os.path.normpath(os.path.join(args.pretrained_dir, str(n), model_config_path))
+        if os.path.exists(candidate_model_config_path):
+            model_config_path = candidate_model_config_path
+        else:
+            model_config_path = os.path.normpath(model_config_path)
     model_configs = yaml.safe_load(open(model_config_path))
     model_configs["diffusion"]["bootstrap_ratio"] = args.bootstrap_ratio
     run_finetune_configs = copy.deepcopy(base_finetune_configs)
@@ -504,7 +508,11 @@ for n in range(args.n_runs):
 
     pretrained_model_path = args.pretrained_model_path
     if not os.path.isabs(pretrained_model_path):
-        pretrained_model_path = fr"{args.pretrained_dir}/{n}/{pretrained_model_path}"
+        candidate_pretrained_model_path = os.path.normpath(os.path.join(args.pretrained_dir, str(n), pretrained_model_path))
+        if os.path.exists(candidate_pretrained_model_path):
+            pretrained_model_path = candidate_pretrained_model_path
+        else:
+            pretrained_model_path = os.path.normpath(pretrained_model_path)
     run_finetune_configs["train"]["model_path"] = pretrained_model_path
 
     output_folder = os.path.join(save_folder, str(n))

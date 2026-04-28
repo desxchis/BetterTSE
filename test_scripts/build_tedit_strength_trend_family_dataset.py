@@ -12,10 +12,39 @@ if str(_ROOT) not in sys.path:
 from test_scripts.build_tedit_strength_discrete_benchmark import build_discrete_benchmark
 
 
-LEGACY_STRENGTH_TO_SCALAR = {
+DEFAULT_STRENGTH_TO_SCALAR = {
     "weak": 0.0,
     "medium": 0.5,
     "strong": 1.0,
+}
+
+LEGACY_0_1_2_STRENGTH_TO_SCALAR = {
+    "weak": 0.0,
+    "medium": 1.0,
+    "strong": 2.0,
+}
+
+SCALAR_SCHEME_TO_AXIS = {
+    "default_0_0p5_1": {
+        "anchor_mapping": DEFAULT_STRENGTH_TO_SCALAR,
+        "range": [0.0, 1.0],
+    },
+    "legacy_0_1_2": {
+        "anchor_mapping": LEGACY_0_1_2_STRENGTH_TO_SCALAR,
+        "range": [0.0, 2.0],
+    },
+}
+
+
+SELECTOR_CONTROL_META = {
+    "trend_injection": {
+        "control_attr": ["trend_types"],
+        "control_attr_ids": [0],
+    },
+    "seasonality_injection": {
+        "control_attr": ["season_cycles"],
+        "control_attr_ids": [2],
+    },
 }
 
 
@@ -32,6 +61,7 @@ def build_family_dataset(
     injection_types: list[str] | None = None,
     selector: str | None = None,
     collection_root: str | None = None,
+    scalar_scheme: str = "default_0_0p5_1",
 ) -> dict[str, object]:
     chosen_injection_types = list(injection_types or ["trend_injection"])
     resolved_selector = str(selector or chosen_injection_types[0]).strip()
@@ -44,6 +74,10 @@ def build_family_dataset(
         raise ValueError("Dedicated family dataset build expects exactly one injection type")
     if chosen_injection_types[0] != resolved_selector:
         raise ValueError(f"selector '{resolved_selector}' must match the dedicated injection type '{chosen_injection_types[0]}'")
+    axis_spec = SCALAR_SCHEME_TO_AXIS.get(str(scalar_scheme).strip())
+    if axis_spec is None:
+        raise ValueError(f"Unsupported scalar_scheme={scalar_scheme}")
+    strength_to_scalar = dict(axis_spec["anchor_mapping"])
 
     split_specs = [
         ("train", train_families, random_seed),
@@ -66,16 +100,17 @@ def build_family_dataset(
         payload = json.loads(src_json.read_text(encoding="utf-8"))
         for family in payload.get("families", []):
             samples = list(family.get("samples", []))
-            samples.sort(key=lambda sample: float(sample.get("strength_scalar", LEGACY_STRENGTH_TO_SCALAR.get(str(sample.get("strength_text", "")), 0.0))))
+            samples.sort(key=lambda sample: float(sample.get("strength_scalar", strength_to_scalar.get(str(sample.get("strength_text", "")), 0.0))))
             for sample in samples:
                 strength_text = str(sample.get("strength_text", ""))
-                strength_scalar = float(sample.get("strength_scalar", LEGACY_STRENGTH_TO_SCALAR.get(strength_text, 0.0)))
+                strength_scalar = float(strength_to_scalar.get(strength_text, sample.get("strength_scalar", 0.0)))
                 sample["strength_scalar"] = strength_scalar
             family["samples"] = samples
+        payload["scalar_scheme"] = str(scalar_scheme)
         payload["strength_axis"] = {
             "type": "continuous_scalar",
-            "anchor_mapping": LEGACY_STRENGTH_TO_SCALAR,
-            "range": [0.0, 1.0],
+            "anchor_mapping": strength_to_scalar,
+            "range": list(axis_spec["range"]),
         }
         (output_root / f"{split}.json").write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
         split_results[split] = {
@@ -84,15 +119,24 @@ def build_family_dataset(
             "random_seed": int(seed),
         }
 
+    selector_meta = SELECTOR_CONTROL_META.get(
+        resolved_selector,
+        {
+            "control_attr": [],
+            "control_attr_ids": [],
+        },
+    )
+
     meta = {
         "dataset_type": "discrete_strength_family",
         "dataset_name": dataset_name,
         "seq_len": seq_len,
         "attr_list": ["trend_types", "trend_directions", "season_cycles"],
         "attr_n_ops": [4, 2, 4],
-        "control_attr": ["trend_types"],
-        "control_attr_ids": [0],
+        "control_attr": selector_meta["control_attr"],
+        "control_attr_ids": selector_meta["control_attr_ids"],
         "strength_bins": ["weak", "medium", "strong"],
+        "scalar_scheme": str(scalar_scheme),
         "selector": resolved_selector,
         "injection_types": chosen_injection_types,
         "semantic_alignment": {
@@ -104,8 +148,8 @@ def build_family_dataset(
         },
         "strength_axis": {
             "type": "continuous_scalar",
-            "anchor_mapping": LEGACY_STRENGTH_TO_SCALAR,
-            "range": [0.0, 1.0],
+            "anchor_mapping": strength_to_scalar,
+            "range": list(axis_spec["range"]),
         },
         "splits": split_results,
     }
@@ -126,8 +170,8 @@ def build_family_dataset(
                 "- semantic_authority: benchmark family-level fields (tool_name/effect_family/shape/direction/task_id/instruction_text/attr_strategy)",
                 "- task_gate_default: off (use_task_id=false)",
                 "",
-                "每个 family 固定 source/region/template，只改变有序 strength scalar（当前 anchor: weak=0.0, medium=0.5, strong=1.0）。",
-                "非 trend family 的主语义由 instruction_text 承担，task_id 仅作为受控 gate 的辅助语义通道。",
+                f"每个 family 固定 source/region/template，只改变有序 strength scalar（scheme={scalar_scheme}；anchor: weak={strength_to_scalar['weak']}, medium={strength_to_scalar['medium']}, strong={strength_to_scalar['strong']}）。",
+                "非 trend/seasonality family 的主语义由 instruction_text 承担，task_id 仅作为受控 gate 的辅助语义通道。",
             ]
         )
         + "\n",
@@ -154,6 +198,7 @@ def main() -> None:
     parser.add_argument("--test-families", type=int, default=24)
     parser.add_argument("--injection-types", default="trend_injection")
     parser.add_argument("--selector", default="")
+    parser.add_argument("--scalar-scheme", default="default_0_0p5_1", choices=sorted(SCALAR_SCHEME_TO_AXIS.keys()))
     args = parser.parse_args()
 
     injection_types = [token.strip() for token in args.injection_types.split(",") if token.strip()]
@@ -171,6 +216,7 @@ def main() -> None:
         injection_types=injection_types,
         selector=selector,
         collection_root=args.collection_root.strip() or None,
+        scalar_scheme=str(args.scalar_scheme),
     )
     print(json.dumps(result, ensure_ascii=False, indent=2))
 

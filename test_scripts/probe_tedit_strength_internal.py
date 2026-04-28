@@ -27,6 +27,36 @@ DEFAULT_STRENGTH_CONTROLS = [
     {"strength_label": 1, "strength_scalar": 0.5, "strength_text": "medium"},
     {"strength_label": 2, "strength_scalar": 1.0, "strength_text": "strong"},
 ]
+LEGACY_STRENGTH_CONTROLS = [
+    {"strength_label": 0, "strength_scalar": 0.0, "strength_text": "weak"},
+    {"strength_label": 1, "strength_scalar": 1.0, "strength_text": "medium"},
+    {"strength_label": 2, "strength_scalar": 2.0, "strength_text": "strong"},
+]
+
+
+def _resolve_strength_controls_from_meta(meta: dict[str, Any] | None) -> tuple[list[dict[str, Any]], str]:
+    if not isinstance(meta, dict):
+        return list(DEFAULT_STRENGTH_CONTROLS), "default_0_0p5_1"
+    scalar_scheme = str(meta.get("scalar_scheme", "")).strip() or "default_0_0p5_1"
+    strength_axis = meta.get("strength_axis")
+    if isinstance(strength_axis, dict):
+        anchor_mapping = strength_axis.get("anchor_mapping")
+        if isinstance(anchor_mapping, dict):
+            controls = []
+            for label, strength_text in enumerate(["weak", "medium", "strong"]):
+                if strength_text in anchor_mapping:
+                    controls.append(
+                        {
+                            "strength_label": label,
+                            "strength_scalar": float(anchor_mapping[strength_text]),
+                            "strength_text": strength_text,
+                        }
+                    )
+            if len(controls) == 3:
+                return controls, scalar_scheme
+    if scalar_scheme == "legacy_0_1_2":
+        return list(LEGACY_STRENGTH_CONTROLS), scalar_scheme
+    return list(DEFAULT_STRENGTH_CONTROLS), scalar_scheme
 
 
 def _resolve_runtime_config_path(model_path: str, config_path: str) -> str:
@@ -57,9 +87,61 @@ def _load_wrapper_config(config_path: str) -> dict[str, Any]:
     raise ValueError(f"Unsupported TEdit wrapper config structure: {config_file}")
 
 
-def _build_wrapper(model_path: str, config_path: str, device: str, output_path: str) -> TEditWrapper:
+def _apply_final_mapping_overrides(
+    wrapper_config: dict[str, Any],
+    *,
+    scalar_transform_scale: float | None = None,
+    scalar_transform_offset: float | None = None,
+    scalar_transform_name: str | None = None,
+    scalar_prior_scale: float | None = None,
+    gain_order_direction: str | None = None,
+    scope: str | None = None,
+) -> dict[str, Any]:
+    diffusion_cfg = wrapper_config.setdefault("diffusion", {})
+    strength_cfg = diffusion_cfg.setdefault("strength_control", {})
+    mapping_cfg = strength_cfg.setdefault("final_output_strength_mapping", {})
+    if scalar_prior_scale is not None:
+        mapping_cfg["scalar_prior_scale"] = float(scalar_prior_scale)
+    if gain_order_direction:
+        mapping_cfg["gain_order_direction"] = str(gain_order_direction)
+    if scope:
+        mapping_cfg["scope"] = str(scope)
+    if scalar_transform_scale is not None or scalar_transform_offset is not None or scalar_transform_name:
+        transform_cfg = mapping_cfg.setdefault("scalar_transform", {})
+        transform_cfg["enabled"] = True
+        if scalar_transform_scale is not None:
+            transform_cfg["scale"] = float(scalar_transform_scale)
+        if scalar_transform_offset is not None:
+            transform_cfg["offset"] = float(scalar_transform_offset)
+        if scalar_transform_name:
+            transform_cfg["name"] = str(scalar_transform_name)
+    return wrapper_config
+
+
+def _build_wrapper(
+    model_path: str,
+    config_path: str,
+    device: str,
+    output_path: str,
+    *,
+    scalar_transform_scale: float | None = None,
+    scalar_transform_offset: float | None = None,
+    scalar_transform_name: str | None = None,
+    scalar_prior_scale: float | None = None,
+    gain_order_direction: str | None = None,
+    scope: str | None = None,
+) -> TEditWrapper:
     runtime_config_path = _resolve_runtime_config_path(model_path, config_path)
     wrapper_config = _load_wrapper_config(runtime_config_path)
+    wrapper_config = _apply_final_mapping_overrides(
+        wrapper_config,
+        scalar_transform_scale=scalar_transform_scale,
+        scalar_transform_offset=scalar_transform_offset,
+        scalar_transform_name=scalar_transform_name,
+        scalar_prior_scale=scalar_prior_scale,
+        gain_order_direction=gain_order_direction,
+        scope=scope,
+    )
     wrapper = TEditWrapper(model_path=None, config_path=None, device=device)
     wrapper_config_path = Path(output_path).resolve().parent / "_wrapper_model_config.yaml"
     wrapper_config_path.write_text(yaml.safe_dump(wrapper_config, allow_unicode=True, sort_keys=False), encoding="utf-8")
@@ -136,6 +218,37 @@ def _aggregate_nested_metric_by_strength(records, key_candidates):
     }
 
 
+def _canonical_strength_label_key(value: object) -> str:
+    mapping = {0: "weak", 1: "medium", 2: "strong"}
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in {"weak", "medium", "strong"}:
+            return text
+        if text.isdigit():
+            return mapping.get(int(text), text)
+        return text
+    if isinstance(value, (int, np.integer)):
+        return mapping.get(int(value), str(int(value)))
+    return str(value)
+
+
+def _canonical_local_path_metadata(condition_mode: str) -> dict[str, object]:
+    return {
+        "route_statement": "edit_time_series + edit_mask + final_output_strength_mapping.scope=edit_region",
+        "generation_route": "standard_edit_time_series",
+        "generation_route_label": "standard_edit_time_series",
+        "acceptance_route": "local_path_mask_routed",
+        "eval_mask_routed": True,
+        "local_path_route_active": True,
+        "local_path_route_exclusions": [
+            "edit_region_soft latent blending",
+            "unmasked global standard route",
+        ],
+        "strength_label_mode": "semantic_weak_medium_strong",
+        "condition_mode": str(condition_mode),
+    }
+
+
 def _extract_scalar_metrics(diagnostics: dict[str, object]) -> dict[str, object]:
     projector = diagnostics.get("projector") or []
     modulation_records = list(diagnostics.get("modulation_base") or []) + list(diagnostics.get("modulation_weaver") or [])
@@ -206,6 +319,18 @@ def _extract_scalar_metrics(diagnostics: dict[str, object]) -> dict[str, object]
         modulation_core_records,
         ["final_output_strength_mapping_by_scalar"],
     )
+    final_output_strength_mapping_transformed_scalar_by_scalar = _aggregate_nested_metric_by_strength(
+        modulation_core_records,
+        ["final_output_strength_mapping_transformed_scalar_by_scalar"],
+    )
+    final_output_strength_mapping_scalar_transform = next(
+        (
+            record.get("final_output_strength_mapping_scalar_transform")
+            for record in modulation_core_records
+            if isinstance(record, dict) and isinstance(record.get("final_output_strength_mapping_scalar_transform"), dict)
+        ),
+        None,
+    )
 
     return {
         "projector_pairwise_l2": _aggregate_nested_numeric_dict(
@@ -260,6 +385,11 @@ def _extract_scalar_metrics(diagnostics: dict[str, object]) -> dict[str, object]
             str(k): v.get("mean") if isinstance(v, dict) else None
             for k, v in final_output_strength_mapping_by_scalar.items()
         },
+        "final_output_strength_mapping_transformed_scalar_by_scalar": {
+            str(k): v.get("mean") if isinstance(v, dict) else None
+            for k, v in final_output_strength_mapping_transformed_scalar_by_scalar.items()
+        },
+        "final_output_strength_mapping_scalar_transform": final_output_strength_mapping_scalar_transform,
         "output_branch_carrier_enabled": _aggregate_mean([record.get("output_branch_carrier_enabled") for record in modulation_core_records]),
         "output_branch_carrier_skip_scale": _aggregate_mean([record.get("output_branch_carrier_skip_scale") for record in modulation_core_records]),
         "residual_content_abs_mean": _aggregate_mean([record.get("residual_content_abs_mean") for record in modulation_core_records]),
@@ -458,6 +588,8 @@ def resolve_dataset_folder(dataset_folder: str, selector: str | None = None) -> 
 def _load_probe_sample(dataset_folder: Path, split: str, requested_idx: int) -> dict[str, object]:
     meta_path = dataset_folder / "meta.json"
     if meta_path.exists():
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        _, scalar_scheme = _resolve_strength_controls_from_meta(meta)
         from data.discrete_strength_family import DiscreteStrengthFamilyDataset
 
         dataset = DiscreteStrengthFamilyDataset(str(dataset_folder))
@@ -485,6 +617,7 @@ def _load_probe_sample(dataset_folder: Path, split: str, requested_idx: int) -> 
             "probe_idx": idx,
             "family_id": str(sample.get("family_id", idx)),
             "tool_name": str(sample.get("tool_name", "unknown")),
+            "scalar_scheme": scalar_scheme,
             "family_semantic_tag": str(sample.get("family_semantic_tag", "unknown")),
             "task_id": sample.get("task_id"),
             "base": base_ts,
@@ -519,6 +652,7 @@ def _load_probe_sample(dataset_folder: Path, split: str, requested_idx: int) -> 
         instruction_text = None
     return {
         "probe_idx": idx,
+        "scalar_scheme": "default_0_0p5_1",
         "base": ts[idx, 0].astype(np.float32),
         "src_attrs": attrs[idx, 0].astype(np.int64),
         "tgt_attrs": attrs[idx, 1].astype(np.int64),
@@ -551,6 +685,12 @@ def main() -> None:
     parser.add_argument("--enable-strength-diagnostics", type=int, default=1)
     parser.add_argument("--flip-beta-sign", type=int, default=0, choices=[0, 1])
     parser.add_argument("--selector", default="")
+    parser.add_argument("--final-mapping-scalar-transform-scale", type=float, default=None)
+    parser.add_argument("--final-mapping-scalar-transform-offset", type=float, default=None)
+    parser.add_argument("--final-mapping-scalar-transform-name", default="")
+    parser.add_argument("--final-mapping-scalar-prior-scale", type=float, default=None)
+    parser.add_argument("--final-mapping-gain-order-direction", default="", choices=["", "increasing", "decreasing"])
+    parser.add_argument("--final-mapping-scope", default="", choices=["", "global", "edit_region"])
     parser.add_argument("--output", required=True)
     args = parser.parse_args()
 
@@ -591,7 +731,18 @@ def main() -> None:
         run_strength_scalars = numeric_strength_scalars
         run_strength_labels = None if any(value is None for value in numeric_strength_labels) else [int(value) for value in numeric_strength_labels]
 
-    wrapper = _build_wrapper(args.model_path, args.config_path, args.device, args.output)
+    wrapper = _build_wrapper(
+        args.model_path,
+        args.config_path,
+        args.device,
+        args.output,
+        scalar_transform_scale=args.final_mapping_scalar_transform_scale,
+        scalar_transform_offset=args.final_mapping_scalar_transform_offset,
+        scalar_transform_name=args.final_mapping_scalar_transform_name.strip() or None,
+        scalar_prior_scale=args.final_mapping_scalar_prior_scale,
+        gain_order_direction=args.final_mapping_gain_order_direction.strip() or None,
+        scope=args.final_mapping_scope.strip() or None,
+    )
 
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
@@ -643,7 +794,9 @@ def main() -> None:
         rows.append(
             {
                 "strength_label": None if control.get("strength_label") is None else int(control["strength_label"]),
+                "strength_label_key": _canonical_strength_label_key(control.get("strength_text", control.get("strength_label", "medium"))),
                 "runtime_strength_label": None if run_strength_labels is None else int(run_strength_labels[control_idx]),
+                "runtime_strength_label_key": None if run_strength_labels is None else _canonical_strength_label_key(run_strength_labels[control_idx]),
                 "strength_scalar": float(control["strength_scalar"]),
                 "runtime_strength_scalar": float(run_strength_scalars[control_idx]),
                 "strength_text": str(control.get("strength_text", "medium")),
@@ -681,6 +834,7 @@ def main() -> None:
 
     family_profile = {
         "family_id": sample_payload.get("family_id"),
+        "scalar_scheme": sample_payload.get("scalar_scheme", "default_0_0p5_1"),
         "tool_name": sample_payload.get("tool_name"),
         "family_semantic_tag": sample_payload.get("family_semantic_tag"),
         "task_id": sample_payload.get("task_id"),
@@ -709,6 +863,7 @@ def main() -> None:
 
     sample_profile = {
         "family_id": sample_payload.get("family_id"),
+        "scalar_scheme": sample_payload.get("scalar_scheme", "default_0_0p5_1"),
         "probe_idx": int(idx),
         "tool_name": sample_payload.get("tool_name"),
         "family_semantic_tag": sample_payload.get("family_semantic_tag"),
@@ -746,9 +901,21 @@ def main() -> None:
     final_edit_monotonic = bool(
         all(final_values[idx] is not None and final_values[idx + 1] is not None and final_values[idx] < final_values[idx + 1] for idx in range(len(final_values) - 1))
     )
+    route_metadata = _canonical_local_path_metadata(args.condition_mode)
     summary = {
         "condition_mode": args.condition_mode,
+        "scalar_scheme": sample_payload.get("scalar_scheme", "default_0_0p5_1"),
         "flip_beta_sign": bool(args.flip_beta_sign),
+        "route_statement": route_metadata["route_statement"],
+        "generation_route": route_metadata["generation_route"],
+        "generation_route_label": route_metadata["generation_route_label"],
+        "acceptance_route": route_metadata["acceptance_route"],
+        "eval_mask_routed": route_metadata["eval_mask_routed"],
+        "local_path_route_active": route_metadata["local_path_route_active"],
+        "local_path_route_exclusions": route_metadata["local_path_route_exclusions"],
+        "strength_label_mode": route_metadata["strength_label_mode"],
+        "strength_labels": [row.get("strength_label_key") for row in rows],
+        "runtime_strength_labels": [row.get("runtime_strength_label_key") for row in rows],
         "raw_edit_region_mean_abs_delta": {
             scalar_keys[row_idx]: row["raw_edit_region_mean_abs_delta"]
             for row_idx, row in enumerate(rows)
@@ -783,6 +950,8 @@ def main() -> None:
         "final_output_strength_mapping_min": scalar_diagnostics.get("final_output_strength_mapping_min"),
         "final_output_strength_mapping_max": scalar_diagnostics.get("final_output_strength_mapping_max"),
         "final_output_strength_mapping_by_scalar": scalar_diagnostics.get("final_output_strength_mapping_by_scalar"),
+        "final_output_strength_mapping_transformed_scalar_by_scalar": scalar_diagnostics.get("final_output_strength_mapping_transformed_scalar_by_scalar"),
+        "final_output_strength_mapping_scalar_transform": scalar_diagnostics.get("final_output_strength_mapping_scalar_transform"),
         "output_branch_carrier_enabled": scalar_diagnostics.get("output_branch_carrier_enabled"),
         "output_branch_carrier_skip_scale": scalar_diagnostics.get("output_branch_carrier_skip_scale"),
         "residual_content_abs_mean": scalar_diagnostics.get("residual_content_abs_mean"),
@@ -804,6 +973,7 @@ def main() -> None:
     }
     payload = {
         "dataset_folder": str(dataset_root),
+        "scalar_scheme": sample_payload.get("scalar_scheme", "default_0_0p5_1"),
         "split": args.split,
         "probe_idx": int(idx),
         "family_id": sample_payload.get("family_id"),
@@ -814,6 +984,14 @@ def main() -> None:
         "flip_beta_sign": bool(args.flip_beta_sign),
         "seed": int(args.seed),
         "task_id": None if args.task_id < 0 else int(args.task_id),
+        "final_mapping_overrides": {
+            "scalar_transform_scale": args.final_mapping_scalar_transform_scale,
+            "scalar_transform_offset": args.final_mapping_scalar_transform_offset,
+            "scalar_transform_name": args.final_mapping_scalar_transform_name.strip() or None,
+            "scalar_prior_scale": args.final_mapping_scalar_prior_scale,
+            "gain_order_direction": args.final_mapping_gain_order_direction.strip() or None,
+            "scope": args.final_mapping_scope.strip() or None,
+        },
         "rows": rows,
         "summary": summary,
         "hard_case_diagnostics": hard_case_diagnostics,

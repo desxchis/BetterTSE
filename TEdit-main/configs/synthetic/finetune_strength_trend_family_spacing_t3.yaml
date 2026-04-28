@@ -52,14 +52,15 @@ train:
       enabled: true
       mode: bounded_scalar_gain
       scalar_center: 1.0
-      scalar_prior_scale: 0.08
+      scalar_prior_scale: 0.24
       learned_max_delta: 0.08
       min_gain: 0.85
       max_gain: 1.15
       hidden_dim: 64
-      gain_order_margin: 0.02
-      gain_order_weight: 0.3
+      gain_order_margin: 0.03
+      gain_order_weight: 0.5
       gain_order_direction: increasing
+      scope: edit_region
       scalar_transform:
         enabled: true
         scale: 2.0

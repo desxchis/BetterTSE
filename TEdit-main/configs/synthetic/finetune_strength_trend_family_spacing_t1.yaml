@@ -60,6 +60,7 @@ train:
       gain_order_margin: 0.02
       gain_order_weight: 0.3
       gain_order_direction: increasing
+      scope: edit_region
       scalar_transform:
         enabled: true
         scale: 2.0

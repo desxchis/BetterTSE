@@ -23,6 +23,7 @@ from test_scripts.build_event_driven_testset import (
 
 DEFAULT_INJECTION_TYPES = [
     "trend_injection",
+    "seasonality_injection",
     "step_change",
     "multiplier",
     "hard_zero",
@@ -72,6 +73,8 @@ def _strength_bucket(
     scale = max(float(np.std(base)), float(np.max(base) - np.min(base)) * 0.1, 1e-6)
     if injection_type == "trend_injection":
         value = abs(float(injection_config.get("amplitude", 0.0))) / scale
+    elif injection_type == "seasonality_injection":
+        value = abs(float(injection_config.get("seasonal_amplitude", 0.0))) / scale
     elif injection_type == "step_change":
         value = abs(float(injection_config.get("magnitude", 0.0))) / scale
     elif injection_type == "multiplier":

@@ -291,6 +291,60 @@ class TEditWrapper:
             output = output[:, 0, :]
         return output
 
+    def _normalize_edit_mask_array(self, edit_mask: Optional[np.ndarray], *, batch_size: int, seq_len: int) -> Optional[np.ndarray]:
+        if edit_mask is None:
+            return None
+        edit_mask_array = np.asarray(edit_mask, dtype=np.float32)
+        if edit_mask_array.ndim == 1:
+            edit_mask_array = np.repeat(edit_mask_array.reshape(1, seq_len), batch_size, axis=0)
+        elif edit_mask_array.ndim == 2 and edit_mask_array.shape[0] == 1 and batch_size != 1:
+            edit_mask_array = np.repeat(edit_mask_array, batch_size, axis=0)
+        if edit_mask_array.shape != (batch_size, seq_len):
+            raise ValueError(
+                f"edit_mask must have shape [L], [1,L], or [B,L]; got {edit_mask_array.shape} for B={batch_size}, L={seq_len}"
+            )
+        return np.clip(edit_mask_array, 0.0, 1.0)
+
+    def _blend_generated_samples(self, sample_tensor: torch.Tensor, source_tensor: torch.Tensor, edit_mask_array: Optional[np.ndarray]) -> torch.Tensor:
+        if edit_mask_array is None:
+            return sample_tensor
+        mask_tensor = torch.as_tensor(edit_mask_array, dtype=sample_tensor.dtype, device=sample_tensor.device)
+        mask_tensor = mask_tensor.unsqueeze(0).unsqueeze(2)  # [1, B, 1, L]
+        source_view = source_tensor.unsqueeze(0)  # [1, B, 1, L]
+        return source_view * (1.0 - mask_tensor) + sample_tensor * mask_tensor
+
+    def _update_generation_diagnostics_with_blend(
+        self,
+        model_diagnostics: Optional[List[Dict[str, Any]]],
+        *,
+        blended_sample_tensor: torch.Tensor,
+        source_tensor: torch.Tensor,
+        edit_mask_array: Optional[np.ndarray],
+    ) -> Optional[List[Dict[str, Any]]]:
+        if model_diagnostics is None or edit_mask_array is None:
+            return model_diagnostics
+        mask_tensor = torch.as_tensor(edit_mask_array, dtype=source_tensor.dtype, device=source_tensor.device).unsqueeze(1)
+        bg_mask = 1.0 - mask_tensor
+        denom_edit = float(torch.clamp(mask_tensor.sum(), min=1.0).item())
+        denom_bg = float(torch.clamp(bg_mask.sum(), min=1.0).item())
+        for sample_idx, diagnostics in enumerate(model_diagnostics):
+            if not isinstance(diagnostics, dict):
+                continue
+            blended_output = blended_sample_tensor[sample_idx]
+            raw_reverse = diagnostics.get("raw_reverse_output")
+            if raw_reverse is None:
+                continue
+            raw_reverse_tensor = torch.as_tensor(raw_reverse, dtype=source_tensor.dtype, device=source_tensor.device)
+            final_edit_delta = torch.abs(blended_output - source_tensor)
+            blend_gap = torch.abs(blended_output - raw_reverse_tensor)
+            diagnostics["blended_output"] = blended_output.detach().cpu()
+            diagnostics["final_output"] = blended_output.detach().cpu()
+            diagnostics["final_edit_region_mean_abs_delta"] = float((final_edit_delta * mask_tensor).sum().item() / denom_edit)
+            diagnostics["final_background_mean_abs_delta"] = float((final_edit_delta * bg_mask).sum().item() / denom_bg)
+            diagnostics["blend_gap_edit_region_mean_abs"] = float((blend_gap * mask_tensor).sum().item() / denom_edit)
+            diagnostics["blend_gap_background_mean_abs"] = float((blend_gap * bg_mask).sum().item() / denom_bg)
+        return model_diagnostics
+
     def edit_time_series(
         self,
         ts: np.ndarray,
@@ -370,14 +424,8 @@ class TEditWrapper:
             strength_scalar_tensor = self._normalize_numeric_control(strength_scalar, B, dtype=torch.float32, name="strength_scalar")
             task_id_tensor = self._normalize_numeric_control(task_id, B, dtype=torch.long, name="task_id")
             instruction_payload = self._normalize_text_control(instruction_text, B)
-            if edit_mask is not None:
-                edit_mask_array = np.asarray(edit_mask, dtype=np.float32)
-                if edit_mask_array.ndim == 1:
-                    edit_mask_array = np.repeat(edit_mask_array.reshape(1, L), B, axis=0)
-                elif edit_mask_array.ndim == 2 and edit_mask_array.shape[0] == 1 and B != 1:
-                    edit_mask_array = np.repeat(edit_mask_array, B, axis=0)
-                if edit_mask_array.shape != (B, L):
-                    raise ValueError(f"edit_mask must have shape [L], [1,L], or [B,L]; got {edit_mask_array.shape} for B={B}, L={L}")
+            edit_mask_array = self._normalize_edit_mask_array(edit_mask, batch_size=B, seq_len=L)
+            if edit_mask_array is not None:
                 batch["mask_gt"] = torch.as_tensor(edit_mask_array, dtype=torch.float32, device=self.device).unsqueeze(-1)
             if strength_label_tensor is not None:
                 batch["strength_label"] = strength_label_tensor
@@ -442,7 +490,14 @@ class TEditWrapper:
         diagnostics = None
         if return_diagnostics:
             sample_tensor, model_diagnostics = samples
-            edited_ts = self._format_sample_output(sample_tensor, input_was_vector=input_was_vector)
+            blended_tensor = self._blend_generated_samples(sample_tensor, x, edit_mask_array)
+            model_diagnostics = self._update_generation_diagnostics_with_blend(
+                model_diagnostics,
+                blended_sample_tensor=blended_tensor,
+                source_tensor=x,
+                edit_mask_array=edit_mask_array,
+            )
+            edited_ts = self._format_sample_output(blended_tensor, input_was_vector=input_was_vector)
             diagnostics = {
                 "model": model_diagnostics,
                 "projector": [] if StrengthProjector is None else StrengthProjector.consume_diagnostics(),
@@ -462,7 +517,8 @@ class TEditWrapper:
             if ConditionalGenerator is not None:
                 ConditionalGenerator.consume_strength_diagnostics()
 
-        return self._format_sample_output(samples, input_was_vector=input_was_vector)
+        blended_samples = self._blend_generated_samples(samples, x, edit_mask_array)
+        return self._format_sample_output(blended_samples, input_was_vector=input_was_vector)
 
     def edit_region(
         self,
@@ -588,6 +644,8 @@ class TEditWrapper:
         strength_scalar: Optional[float] = None,
         task_id: Optional[int] = None,
         instruction_text: Optional[np.ndarray] = None,
+        return_diagnostics: bool = False,
+        enable_strength_diagnostics: bool = False,
     ) -> np.ndarray:
         """Edit a specific region using Latent Blending (State-Space Mixing).
 
@@ -670,12 +728,65 @@ class TEditWrapper:
             batch.setdefault("task_id", task_id_tensor)
             batch.setdefault("instruction_text", instruction_payload)
 
-            samples = self.model.edit_soft(
-                batch,
-                n_samples=n_samples,
-                sampler=sampler,
-                soft_mask=soft_mask
-            )
+            if StrengthProjector is not None and enable_strength_diagnostics:
+                StrengthProjector.enable_diagnostics(True)
+            if ResidualBlockBase is not None and enable_strength_diagnostics:
+                ResidualBlockBase.enable_diagnostics(True)
+            if ResidualBlockWeaver is not None and enable_strength_diagnostics:
+                ResidualBlockWeaver.enable_diagnostics(True)
+            if ConditionalGenerator is not None and enable_strength_diagnostics:
+                ConditionalGenerator.enable_strength_diagnostics(True)
+
+            try:
+                samples = self.model.edit_soft(
+                    batch,
+                    n_samples=n_samples,
+                    sampler=sampler,
+                    soft_mask=soft_mask,
+                    return_diagnostics=return_diagnostics,
+                )
+            finally:
+                if not enable_strength_diagnostics:
+                    if StrengthProjector is not None:
+                        StrengthProjector.consume_diagnostics()
+                    if ConditionalGenerator is not None:
+                        ConditionalGenerator.consume_strength_diagnostics()
+                    if ResidualBlockBase is not None:
+                        ResidualBlockBase.consume_diagnostics()
+                    if ResidualBlockWeaver is not None:
+                        ResidualBlockWeaver.consume_diagnostics()
+                else:
+                    if StrengthProjector is not None:
+                        StrengthProjector.disable_diagnostics()
+                    if ResidualBlockBase is not None:
+                        ResidualBlockBase.disable_diagnostics()
+                    if ResidualBlockWeaver is not None:
+                        ResidualBlockWeaver.disable_diagnostics()
+                    if ConditionalGenerator is not None:
+                        ConditionalGenerator.enable_strength_diagnostics(False)
+
+        diagnostics = None
+        if return_diagnostics:
+            sample_tensor, model_diagnostics = samples
+            edited_ts = self._format_sample_output(sample_tensor, input_was_vector=input_was_vector)
+            diagnostics = {
+                "model": model_diagnostics,
+                "projector": [] if StrengthProjector is None else StrengthProjector.consume_diagnostics(),
+                "modulation_base": [] if ResidualBlockBase is None else ResidualBlockBase.consume_diagnostics(),
+                "modulation_weaver": [] if ResidualBlockWeaver is None else ResidualBlockWeaver.consume_diagnostics(),
+                "generator": [] if ConditionalGenerator is None else ConditionalGenerator.consume_strength_diagnostics(),
+            }
+            return edited_ts, diagnostics
+
+        if enable_strength_diagnostics:
+            if StrengthProjector is not None:
+                StrengthProjector.consume_diagnostics()
+            if ResidualBlockBase is not None:
+                ResidualBlockBase.consume_diagnostics()
+            if ResidualBlockWeaver is not None:
+                ResidualBlockWeaver.consume_diagnostics()
+            if ConditionalGenerator is not None:
+                ConditionalGenerator.consume_strength_diagnostics()
 
         edited_ts = self._format_sample_output(samples, input_was_vector=input_was_vector)
         if input_was_vector and isinstance(edited_ts, np.ndarray) and edited_ts.ndim == 2 and edited_ts.shape[0] == 1:

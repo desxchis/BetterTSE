@@ -180,6 +180,12 @@ def _normalize_final_output_strength_mapping_config(config):
     config.setdefault("gain_order_weight", 0.0)
     config.setdefault("gain_order_direction", "increasing")
     config.setdefault("scope", "global")
+    scalar_transform = dict(config.get("scalar_transform") or {})
+    scalar_transform.setdefault("enabled", False)
+    scalar_transform.setdefault("scale", 1.0)
+    scalar_transform.setdefault("offset", 0.0)
+    scalar_transform.setdefault("name", "identity")
+    scalar_transform.setdefault("auto_legacy_half_step", True)
     if str(config["mode"]) != "bounded_scalar_gain":
         raise ValueError(f"Unsupported final_output_strength_mapping mode: {config['mode']}")
     config["mode"] = "bounded_scalar_gain"
@@ -194,6 +200,12 @@ def _normalize_final_output_strength_mapping_config(config):
     config["gain_order_weight"] = float(config["gain_order_weight"])
     config["gain_order_direction"] = str(config["gain_order_direction"])
     config["scope"] = str(config["scope"])
+    scalar_transform["enabled"] = bool(scalar_transform["enabled"])
+    scalar_transform["scale"] = float(scalar_transform["scale"])
+    scalar_transform["offset"] = float(scalar_transform["offset"])
+    scalar_transform["name"] = str(scalar_transform["name"])
+    scalar_transform["auto_legacy_half_step"] = bool(scalar_transform["auto_legacy_half_step"])
+    config["scalar_transform"] = scalar_transform
     if config["gain_order_direction"] not in {"increasing", "decreasing"}:
         raise ValueError("final_output_strength_mapping.gain_order_direction must be increasing or decreasing")
     if config["scope"] not in {"global", "edit_region"}:
@@ -212,6 +224,10 @@ def _normalize_final_output_strength_mapping_config(config):
         raise ValueError("final_output_strength_mapping.gain_order_margin must be non-negative")
     if config["gain_order_weight"] < 0.0:
         raise ValueError("final_output_strength_mapping.gain_order_weight must be non-negative")
+    if not math.isfinite(config["scalar_transform"]["scale"]):
+        raise ValueError("final_output_strength_mapping.scalar_transform.scale must be finite")
+    if not math.isfinite(config["scalar_transform"]["offset"]):
+        raise ValueError("final_output_strength_mapping.scalar_transform.offset must be finite")
     return config
 
 
@@ -635,7 +651,7 @@ class ResidualBlock(nn.Module):
                 continue
             self._record_response_diagnostics(stage_name, tensor, strength_label=strength_label, strength_scalar=strength_scalar)
 
-    def _record_scalar_gain_diagnostics(self, record_name, gain, strength_scalar=None):
+    def _record_scalar_gain_diagnostics(self, record_name, gain, strength_scalar=None, transformed_scalar=None, scalar_transform=None):
         if not self.__class__._diag_enabled:
             return
         if len(self.__class__._diag_records) >= self.__class__._diag_max_records:
@@ -669,6 +685,30 @@ class ResidualBlock(nn.Module):
                         "max": float(scalar_gain.max().item()),
                     }
                 record[f"{record_name}_by_scalar"] = by_scalar
+            if transformed_scalar is not None:
+                transformed_values = transformed_scalar.detach().cpu().float().view(-1)
+                record[f"{record_name}_transformed_scalar"] = [float(value) for value in transformed_values.tolist()]
+                if strength_scalar is not None and transformed_values.numel() == scalar_values.numel():
+                    transformed_by_scalar = {}
+                    for scalar_value in unique_scalars:
+                        mask = torch.isclose(
+                            scalar_values,
+                            scalar_values.new_tensor(float(scalar_value)),
+                            atol=1.0e-6,
+                            rtol=0.0,
+                        )
+                        if int(mask.sum().item()) == 0:
+                            continue
+                        scalar_key = _format_scalar_key(scalar_value)
+                        transformed_by_scalar[scalar_key] = {
+                            "count": int(mask.sum().item()),
+                            "mean": float(transformed_values[mask].mean().item()),
+                            "min": float(transformed_values[mask].min().item()),
+                            "max": float(transformed_values[mask].max().item()),
+                        }
+                    record[f"{record_name}_transformed_scalar_by_scalar"] = transformed_by_scalar
+            if isinstance(scalar_transform, dict):
+                record[f"{record_name}_scalar_transform"] = dict(scalar_transform)
             self.__class__._diag_records.append(record)
 
     def _compute_scalar_order_loss(self, tensor, strength_scalar):
@@ -1234,6 +1274,7 @@ class Diff_CSDI_MultiPatch_Weaver_Parallel(nn.Module):
         self.latest_output_branch_regularizer_loss = None
         self.latest_output_branch_scalar_order_loss = None
         self.latest_final_output_strength_mapping_order_loss = None
+        self.latest_final_output_strength_mapping_scalar_transform = None
         self.final_output_gain_gate_cfg = dict(strength_cfg.get("final_output_gain_gate") or {})
         self.final_output_gain_gate_cfg.setdefault("enabled", False)
         self.final_output_gain_gate_cfg.setdefault("mode", "sigmoid_range")
@@ -1384,6 +1425,33 @@ class Diff_CSDI_MultiPatch_Weaver_Parallel(nn.Module):
         ]
         return torch.stack(losses).mean()
 
+    def _transform_final_output_strength_scalar(self, strength_scalar):
+        cfg = self.final_output_strength_mapping_cfg
+        transform = dict(cfg.get("scalar_transform") or {})
+        if strength_scalar is None:
+            return strength_scalar
+        if bool(transform.get("enabled", False)):
+            return strength_scalar.float() * float(transform.get("scale", 1.0)) + float(transform.get("offset", 0.0))
+
+        auto_legacy_half_step = bool(transform.get("auto_legacy_half_step", True))
+        scalar_center = float(cfg.get("scalar_center", 1.0))
+        if not auto_legacy_half_step or not math.isclose(scalar_center, 1.0, rel_tol=0.0, abs_tol=1.0e-6):
+            return strength_scalar
+
+        scalar_values = strength_scalar.detach().cpu().float().view(-1)
+        if scalar_values.numel() == 0:
+            return strength_scalar
+        scalar_min = float(scalar_values.min().item())
+        scalar_max = float(scalar_values.max().item())
+        if scalar_min < -1.0e-6 or scalar_max > 1.0 + 1.0e-6:
+            return strength_scalar
+
+        unique_scalars = sorted({round(float(value), 6) for value in scalar_values.tolist()})
+        has_half_step = any(abs(value - round(value)) > 1.0e-6 for value in unique_scalars)
+        if not has_half_step:
+            return strength_scalar
+        return strength_scalar.float() * 2.0
+
     def _broadcast_final_strength_mask(self, final_strength_mask, output):
         if final_strength_mask is None:
             return None
@@ -1406,12 +1474,32 @@ class Diff_CSDI_MultiPatch_Weaver_Parallel(nn.Module):
     def _apply_final_output_strength_mapping(self, output, strength_cond=None, strength_scalar=None, final_strength_mask=None):
         cfg = self.final_output_strength_mapping_cfg
         self.latest_final_output_strength_mapping_order_loss = None
+        self.latest_final_output_strength_mapping_scalar_transform = None
         if not cfg.get("enabled", False):
             return output, None
         batch_size = output.shape[0]
         gain = output.new_ones(batch_size)
-        if strength_scalar is not None:
-            scalar = strength_scalar.float().view(-1)
+        mapping_strength_scalar = self._transform_final_output_strength_scalar(strength_scalar)
+        if strength_scalar is not None and mapping_strength_scalar is not strength_scalar:
+            transform_cfg = dict(cfg.get("scalar_transform") or {})
+            transform_name = str(transform_cfg.get("name", "identity"))
+            transform_scale = float(transform_cfg.get("scale", 1.0))
+            transform_offset = float(transform_cfg.get("offset", 0.0))
+            transform_enabled = bool(transform_cfg.get("enabled", False))
+            if not transform_enabled:
+                transform_name = "auto_legacy_half_step_0_0p5_1_to_legacy_0_1_2"
+                transform_scale = 2.0
+                transform_offset = 0.0
+            self.latest_final_output_strength_mapping_scalar_transform = {
+                "name": transform_name,
+                "enabled": True,
+                "scale": transform_scale,
+                "offset": transform_offset,
+                "original_scalar": strength_scalar.detach().cpu().float().view(-1),
+                "transformed_scalar": mapping_strength_scalar.detach().cpu().float().view(-1),
+            }
+        if mapping_strength_scalar is not None:
+            scalar = mapping_strength_scalar.float().view(-1)
             if scalar.numel() == batch_size:
                 scalar = scalar.to(device=output.device, dtype=output.dtype)
                 gain = gain + float(cfg["scalar_prior_scale"]) * (scalar - float(cfg["scalar_center"]))
@@ -1428,7 +1516,7 @@ class Diff_CSDI_MultiPatch_Weaver_Parallel(nn.Module):
         gain = gain.view(*view_shape).to(device=output.device, dtype=output.dtype)
         self.latest_final_output_strength_mapping_order_loss = self._compute_final_output_strength_mapping_order_loss(
             gain,
-            strength_scalar,
+            mapping_strength_scalar,
         )
         if str(cfg.get("scope", "global")) == "edit_region" and final_strength_mask is not None:
             mask = self._broadcast_final_strength_mask(final_strength_mask, output).clamp(0.0, 1.0)
@@ -1595,6 +1683,10 @@ class Diff_CSDI_MultiPatch_Weaver_Parallel(nn.Module):
                     "final_output_strength_mapping",
                     final_mapping_gain,
                     strength_scalar=strength_scalar,
+                    transformed_scalar=getattr(self, "latest_final_output_strength_mapping_scalar_transform", None).get("transformed_scalar")
+                    if isinstance(getattr(self, "latest_final_output_strength_mapping_scalar_transform", None), dict)
+                    else None,
+                    scalar_transform=(self.final_output_strength_mapping_cfg.get("scalar_transform") or None),
                 )
         all_out, final_strength_gain = self._apply_final_output_strength_scale(all_out, strength_scalar=strength_scalar)
         if self.residual_layers:

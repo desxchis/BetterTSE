@@ -703,12 +703,28 @@ def execute_llm_tool(
             log = f"[trend_quadratic_down_soft] region=[{start_idx},{end_idx}], math_shift={math_shift:.3f}"
 
         elif tool_name == "season_enhance":
-            edited_ts = season_enhance_soft(ts=ts, start_idx=start_idx, end_idx=end_idx, tedit=tedit)
-            log = f"[season_enhance_soft] region=[{start_idx},{end_idx}]"
+            edited_ts = season_enhance_soft(
+                ts=ts,
+                start_idx=start_idx,
+                end_idx=end_idx,
+                tedit=tedit,
+                strength_label=params.get("strength_label"),
+                strength_scalar=params.get("strength_scalar"),
+                instruction_text=params.get("instruction_text"),
+            )
+            log = f"[season_enhance_soft] region=[{start_idx},{end_idx}], strength_label={params.get('strength_label')}, strength_scalar={params.get('strength_scalar')}"
 
         elif tool_name == "season_reduce":
-            edited_ts = season_reduce_soft(ts=ts, start_idx=start_idx, end_idx=end_idx, tedit=tedit)
-            log = f"[season_reduce_soft] region=[{start_idx},{end_idx}]"
+            edited_ts = season_reduce_soft(
+                ts=ts,
+                start_idx=start_idx,
+                end_idx=end_idx,
+                tedit=tedit,
+                strength_label=params.get("strength_label"),
+                strength_scalar=params.get("strength_scalar"),
+                instruction_text=params.get("instruction_text"),
+            )
+            log = f"[season_reduce_soft] region=[{start_idx},{end_idx}], strength_label={params.get('strength_label')}, strength_scalar={params.get('strength_scalar')}"
 
         elif tool_name == "ensemble_smooth":
             edited_ts = ensemble_smooth_soft(ts=ts, start_idx=start_idx, end_idx=end_idx, tedit=tedit, n_samples=n_ensemble)
@@ -1303,6 +1319,9 @@ def season_enhance_soft(
     start_idx: int,
     end_idx: int,
     tedit: TEditWrapper,
+    strength_label: Optional[int] = None,
+    strength_scalar: Optional[float] = None,
+    instruction_text: Optional[str] = None,
     smooth_radius: float = 5.0,
 ) -> np.ndarray:
     """Intensify periodicity in region with Latent Blending.
@@ -1335,6 +1354,9 @@ def season_enhance_soft(
         ts=ts, start_idx=start_idx, end_idx=end_idx,
         src_attrs=src_attrs, tgt_attrs=tgt_attrs,
         n_samples=1, sampler="ddim", smooth_radius=smooth_radius,
+        strength_label=strength_label,
+        strength_scalar=strength_scalar,
+        instruction_text=instruction_text,
     )
 
 
@@ -1343,6 +1365,9 @@ def season_reduce_soft(
     start_idx: int,
     end_idx: int,
     tedit: TEditWrapper,
+    strength_label: Optional[int] = None,
+    strength_scalar: Optional[float] = None,
+    instruction_text: Optional[str] = None,
     smooth_radius: float = 5.0,
 ) -> np.ndarray:
     """Suppress periodicity in region with Latent Blending.
@@ -1375,6 +1400,9 @@ def season_reduce_soft(
         ts=ts, start_idx=start_idx, end_idx=end_idx,
         src_attrs=src_attrs, tgt_attrs=tgt_attrs,
         n_samples=1, sampler="ddim", smooth_radius=smooth_radius,
+        strength_label=strength_label,
+        strength_scalar=strength_scalar,
+        instruction_text=instruction_text,
     )
 
 

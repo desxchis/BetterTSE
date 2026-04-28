@@ -22,6 +22,15 @@ _PURE_EDIT_GT_TOOL_MAP = {
 }
 
 
+def _resolve_gt_tool_labels(
+    injection_operator: str,
+    injection_config: Dict[str, Any],
+) -> tuple[str, str]:
+    if injection_operator == "seasonality_injection":
+        return ("seasonality_enhance", "season_enhance")
+    return _PURE_EDIT_GT_TOOL_MAP.get(injection_operator, ("none", "none"))
+
+
 def region_to_bucket(start: int, end: int, length: int) -> str:
     total = max(1, int(length))
     start = max(0, min(int(start), total))
@@ -58,16 +67,18 @@ def extract_pure_editing_gt_labels(sample: Dict[str, Any], gt_config: Dict[str, 
     gt_end = int(gt_config.get("end_step", sample.get("gt_end", 0)) or 0)
     edit_intent = gt_config.get("edit_intent_gt") if isinstance(gt_config.get("edit_intent_gt"), dict) else {}
     injection_operator = str(gt_config.get("injection_operator", sample.get("injection_operator", "none")))
-    canonical_tool, hybrid_tool = _PURE_EDIT_GT_TOOL_MAP.get(injection_operator, ("none", "none"))
     injection_config = sample.get("injection_config", {}) if isinstance(sample.get("injection_config"), dict) else {}
+    canonical_tool, hybrid_tool = _resolve_gt_tool_labels(injection_operator, injection_config)
     parameter_label = {
         "magnitude": injection_config.get("magnitude")
         or injection_config.get("multiplier")
         or injection_config.get("trend_slope")
+        or injection_config.get("amplitude")
+        or injection_config.get("seasonal_amplitude")
         or injection_config.get("noise_std"),
         "duration_extent": max(0, gt_end - gt_start),
         "onset_style": "abrupt" if injection_operator in {"step_change", "hard_zero"} else "smooth",
-        "recovery_style": "recovering" if injection_operator in {"trend_injection", "step_change"} else "persistent",
+        "recovery_style": "recovering" if injection_operator in {"trend_injection", "step_change", "seasonality_injection"} else "persistent",
     }
     return {
         "task_type": str(sample.get("task_type", gt_config.get("task_type", "unknown"))),

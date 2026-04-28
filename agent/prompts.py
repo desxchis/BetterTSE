@@ -66,6 +66,9 @@ Disambiguation rules:
 - If the prompt says "持续承压并维持高位", "持续偏高", "维持在高位一段时间", prefer `effect_family=level` and `shape=plateau`.
 - If the prompt says "突然切换后维持", "切换到新的状态", or "跳到另一种运行水平", prefer `effect_family=level` and `shape=step`.
 - If the prompt says "杂乱跳变", "信号失真", or "无规律波动", prefer `effect_family=volatility` and `shape=irregular_noise`.
+- If the prompt mentions regular cycles, seasonal rhythm, repeated oscillation, daily/weekly periodic pattern, or rhythmic ups and downs, prefer `effect_family=seasonality` rather than `volatility`.
+- If the prompt says "周期更明显", "节律更强", "峰谷更清晰", or "重复起伏被放大", prefer `effect_family=seasonality` and `shape=periodic`.
+- If the prompt says "周期被压平", "节律减弱", "峰谷没那么明显", or "重复起伏被削弱", prefer `effect_family=seasonality` and `shape=flatten`.
 - If the prompt says "降到极低水平并维持", "停摆", or "几乎中断", prefer `effect_family=shutdown` and `shape=flatline`.
 - Use `shape=transient` only for a very short spike-like pulse, not for a medium-duration hump or flatline event.
 - Use `shape=linear` only for sustained monotonic drift, not for a step switch.
@@ -101,6 +104,8 @@ Canonical mapping guide:
 Weak-signal interpretation guide:
 - "持续承压", "持续走高", "明显偏高" -> likely `trend + up`
 - "持续承压并维持高位", "持续偏高", "高位维持一段时间" -> likely `level + plateau`
+- "周期更明显", "节律增强", "峰谷更清晰" -> likely `seasonality + periodic`
+- "周期被压平", "节律减弱", "峰谷变钝" -> likely `seasonality + flatten`
 - "持续走低", "跌到低位并维持" -> likely `trend + down` or `shutdown`
 - "短时冲高后恢复" -> likely `impulse + hump`
 - "突然切换并维持" -> likely `level + step`; prefer `step_shift`
@@ -170,6 +175,8 @@ Parameter rules:
   may include either `math_shift` or `shift_factor`
 - `season_enhance`, `season_reduce`, `ensemble_smooth`:
   region only
+- For seasonality tools, strength is represented in `intent.strength` and may be passed as `strength_label` / `strength_scalar` to the TEdit strength path when available.
+- Do not use `math_shift` or `shift_factor` for seasonality; periodic amplitude is controlled by the strength path or benchmark target amplitude.
 
 Backward compatibility requirement:
 - Ensure `execution.tool_name` is a valid current tool name from the catalog.

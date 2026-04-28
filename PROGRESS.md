@@ -2,6 +2,866 @@
 
 按时间倒序记录 pure-editing strength mainline 的关键推进，不混入 forecast-revision 主线。
 
+## [2026-04-28] - trend legacy scalar restore 最小闭环完成；R0/R1 都未穿透真实 local-path spacing blocker
+
+**本轮目标**：
+- 不改 route，不回 old `standard-route` 救援线。
+- 只验证旧主线 `scalar contract = 0 / 1 / 2` 能否单独把 `trend` 的 raw/local spacing 拉起来。
+- 若仅恢复 legacy scalar 不够，再加一组旧主线风格的中等 spacing pressure。
+
+**固定验收路径**：
+- canonical local path 仍锁定为：
+  - `edit_time_series(..., edit_mask=mask_gt)`
+  - `final_output_strength_mapping.scope = edit_region`
+- benchmark/effect/probe 全部统一到：
+  - `acceptance_route = local_path_mask_routed`
+  - `scalar_scheme = legacy_0_1_2`
+
+**代码与数据改动**：
+- 新增 trend-only legacy scalar family 构造：
+  - `test_scripts/build_tedit_strength_trend_family_dataset.py`
+  - 支持 `--scalar-scheme legacy_0_1_2`
+  - strength scalar 改为 `weak=0.0 / medium=1.0 / strong=2.0`
+- probe / effect / monotonic benchmark 全部识别并写出：
+  - `scalar_scheme = legacy_0_1_2`
+  - legacy sweep:
+    - `0.0, 0.5, 1.0, 1.5, 2.0`
+- 并行新配置：
+  - `TEdit-main/configs/synthetic/finetune_strength_trend_family_restore_legacy_scalar_r0.yaml`
+  - `TEdit-main/configs/synthetic/finetune_strength_trend_family_restore_legacy_scalar_r1.yaml`
+- 并行新数据集：
+  - `TEdit-main/datasets/discrete_strength_trend_family_restore_legacy_scalar`
+
+**数据构造与健康检查**：
+- 构造命令：
+  - `python test_scripts/build_tedit_strength_trend_family_dataset.py --csv-path data/ETTh1.csv --dataset-name ETTh1 --output-dir TEdit-main/datasets/discrete_strength_trend_family_restore_legacy_scalar --seq-len 192 --random-seed 17 --train-families 96 --valid-families 24 --test-families 24 --injection-types trend_injection --selector trend_injection --scalar-scheme legacy_0_1_2`
+- health：
+  - `python test_scripts/check_tedit_strength_discrete_benchmark.py --benchmark TEdit-main/datasets/discrete_strength_trend_family_restore_legacy_scalar/test.json --output TEdit-main/datasets/discrete_strength_trend_family_restore_legacy_scalar/test_benchmark_health.json`
+- 结果：
+  - `complete_strength_rate = 1.0`
+  - `target_monotonic_rate = 1.0`
+  - `zero_background_leak_rate = 1.0`
+  - `health_pass = true`
+
+**R0：legacy scalar restore only**
+- 训练配置：
+  - `TEdit-main/configs/synthetic/finetune_strength_trend_family_restore_legacy_scalar_r0.yaml`
+- 保存目录：
+  - `TEdit-main/save/synthetic/R0_legacy_scalar_restore`
+- 训练结论：
+  - best checkpoint 停在 `epoch 1`
+  - `best_model_selection.json`:
+    - `selection_score = 1.0648`
+    - `pred_min_adjacent_gap_mean = 0.9814`
+  - 后续 epoch 回落，所以中途截断，直接用当前 best 做验证。
+
+**R0 验证**
+- probe：
+  - `tmp/R0_legacy_scalar_restore_probe.json`
+  - projector separation 存在：
+    - `0.0000_1.0000 = 0.0126`
+    - `0.0000_2.0000 = 0.0418`
+  - final mapping 有序：
+    - `0.99286 -> 0.99994 -> 1.00703`
+  - 但单样本 raw edit gain 基本不分：
+    - `1.49984 -> 1.49981 -> 1.49919`
+- effect audit：
+  - `tmp/R0_legacy_scalar_restore_effect.json`
+  - `monotonic_hit_rate = 0.4167`
+  - `weak_le_medium_pass_rate = 0.4167`
+  - `medium_le_strong_pass_rate = 0.4583`
+  - `raw_min_adjacent_gap_mean = -0.00206`
+  - `strong_minus_weak_edit_gain_mean = -0.00332`
+  - `preservation_pass_rate = 1.0`
+- monotonic benchmark：
+  - `tmp/R0_legacy_scalar_restore_monotonic.json`
+  - `adjacent_monotonic_pass_rate = 0.3333`
+  - `weak_le_medium_pass_rate = 0.4167`
+  - `medium_le_strong_pass_rate = 0.5`
+  - `min_adjacent_gap_mean = -0.000913`
+  - `adjacent_gap_collapse_rate = 0.625`
+  - `preservation_pass_rate = 1.0`
+- bucket 结论：
+  - `short` 有一点正 spacing：
+    - `min_adjacent_gap_mean = 0.000481`
+  - `medium`、`long` 仍系统性负 gap
+
+**R1：legacy scalar + moderate spacing pressure**
+- 训练配置：
+  - `TEdit-main/configs/synthetic/finetune_strength_trend_family_restore_legacy_scalar_r1.yaml`
+- 参数只加旧主线风格中等 pressure：
+  - `strength_lr_scale = 5.0`
+  - `gain_match_loss_weight = 8.0`
+  - `family_relative_gain_loss_weight = 6.0`
+  - `constant_gain_penalty_weight = 3.0`
+  - `minimum_family_gain_std = 0.08`
+  - `monotonic_loss_weight = 0.30`
+- 保存目录：
+  - `TEdit-main/save/synthetic/R1_legacy_scalar_restore_plus_spacing_pressure`
+- 训练结论：
+  - best checkpoint 仍停在 `epoch 1`
+  - `best_model_selection.json`:
+    - `selection_score = 1.3227`
+    - `pred_min_adjacent_gap_mean = 1.2393`
+  - `epoch 2` 已明显回落，所以直接截断，用 best 做验证。
+
+**R1 验证**
+- probe：
+  - `tmp/R1_legacy_scalar_restore_plus_spacing_pressure_probe.json`
+  - projector separation 仍在，但更小：
+    - `0.0000_1.0000 = 0.00666`
+    - `0.0000_2.0000 = 0.00735`
+  - final mapping 仍有序：
+    - `0.99289 -> 0.99997 -> 1.00706`
+  - 单样本 raw edit gain 仍几乎不分：
+    - `1.50080 -> 1.50078 -> 1.49998`
+- effect audit：
+  - `tmp/R1_legacy_scalar_restore_plus_spacing_pressure_effect.json`
+  - `monotonic_hit_rate = 0.4583`
+  - `weak_le_medium_pass_rate = 0.5`
+  - `medium_le_strong_pass_rate = 0.4583`
+  - `raw_min_adjacent_gap_mean = -0.00200`
+  - `strong_minus_weak_edit_gain_mean = -0.00334`
+  - `preservation_pass_rate = 1.0`
+- monotonic benchmark：
+  - `tmp/R1_legacy_scalar_restore_plus_spacing_pressure_monotonic.json`
+  - `adjacent_monotonic_pass_rate = 0.4167`
+  - `weak_le_medium_pass_rate = 0.5`
+  - `medium_le_strong_pass_rate = 0.5`
+  - `min_adjacent_gap_mean = -0.000888`
+  - `adjacent_gap_collapse_rate = 0.5417`
+  - `preservation_pass_rate = 1.0`
+- bucket 结论：
+  - `short` 比 R0 更好：
+    - `adjacent_monotonic_pass_rate = 0.625`
+    - `weak_le_medium_pass_rate = 0.875`
+    - `medium_le_strong_pass_rate = 0.75`
+    - `min_adjacent_gap_mean = 0.000502`
+  - `medium`、`long` 仍是负 gap
+  - `long` 仍然最差：
+    - `min_adjacent_gap_mean = -0.001903`
+    - `adjacent_gap_collapse_rate = 0.75`
+
+**本轮判断**：
+- 恢复旧主线 `0 / 1 / 2` scalar contract 是有信息量的：
+  - valid-side predicted spacing 会一度明显转正
+  - `short` bucket 在真实 local-path test 上也确实比旧窄标尺更稳
+- 但这还不足以穿透当前真实 blocker：
+  - canonical local-path test 上，`edit_gain_mean` 仍几乎恒定
+  - R0:
+    - `4.7607 -> 4.7591 -> 4.7573`
+  - R1:
+    - `4.7620 -> 4.7605 -> 4.7587`
+- 所以结论不是 route 问题，也不是 background drift 问题，而是：
+  - raw/local final gain 仍然被一个几乎恒定的大 base edit 主导
+  - legacy scalar restore 和中等 spacing pressure 只改善了 `short`
+  - 还没有把 `medium/long` 的真实 spacing 拉到可用水平
+
+**下一步边界**：
+- 不再回 old `standard-route`
+- 不再继续磨 runtime-only final mapping
+- 也不能再把“legacy scalar restore”当作单独解法
+- 后续若继续修 `trend`，必须继续留在 training-side raw/local spacing-first 主线，但需要比这轮更有穿透力的训练修复
+
+## [2026-04-28] - trend spacing 第一轮重训 + A0/A1/A2 顺序预验证完成；runtime-only mapping 线收口
+
+**本轮目标**：
+- 不回旧 `standard-route` 救援线。
+- 锁定 `trend` 的 active acceptance path：
+  - `edit_time_series(..., edit_mask=mask_gt)`
+  - `final_output_strength_mapping.scope=edit_region`
+- 先看 training-side 的最小 spacing-first 重训是否能把 canonical local-path 下的相邻 spacing 立起来。
+- 再顺序跑 `A0 -> A1 -> A2`，验证 runtime-only final mapping 拉伸能不能单独解决 benchmark-facing blocker。
+
+**训练执行**：
+- 环境：
+  - `source /root/miniconda3/bin/activate tedit`
+  - `CUDA_VISIBLE_DEVICES=0`
+- 已完整跑完：
+  - `TEdit-main/configs/synthetic/finetune_strength_trend_family_spacing_t1.yaml`
+- 产物：
+  - best checkpoint:
+    - `TEdit-main/save/synthetic/finetune_strength_trend_family_spacing_t1/0/trend_injection/ckpts/model_best.pth`
+  - selection:
+    - `TEdit-main/save/synthetic/finetune_strength_trend_family_spacing_t1/0/trend_injection/best_model_selection.json`
+- 结果：
+  - best 落在 `epoch 9`
+  - `avg_loss_valid = 104.9662`
+  - predicted-spacing `selection_score = 0.6867`
+- `T3` 已启动过一轮，但前几个 epoch 明显落后 `T1`，中途停止，不继续烧 GPU：
+  - `TEdit-main/save/synthetic/finetune_strength_trend_family_spacing_t3/0/trend_injection/best_model_selection.json`
+- `T4` 本轮未启动。
+
+**T1 验证结果**：
+- `probe`：
+  - `tmp/trend_spacing_t1_probe.json`
+  - projector separation 仍在：
+    - `0.0000_0.5000 = 0.0163`
+    - `0.0000_1.0000 = 0.0256`
+  - final output mapping 仍有序：
+    - `0.99298 -> 1.00006 -> 1.00714`
+- canonical-route `effect audit`：
+  - `tmp/trend_spacing_t1_effect.json`
+  - `monotonic_hit_rate = 1.0`
+  - `weak_le_medium_pass_rate = 1.0`
+  - `medium_le_strong_pass_rate = 1.0`
+  - `strong_minus_weak_edit_gain_mean = 0.0205`
+  - `preservation_pass = true`
+- canonical-route monotonic benchmark：
+  - `tmp/trend_spacing_t1_monotonic.json`
+  - `adjacent_monotonic_pass_rate = 0.625`
+  - `weak_le_medium_pass_rate = 0.625`
+  - `medium_le_strong_pass_rate = 0.75`
+  - `min_adjacent_gap_mean = -0.00242`
+  - `adjacent_gap_collapse_rate = 0.375`
+  - `gain_range_mean = -0.00903`
+
+**A0/A1/A2 顺序预验证**：
+- 目标：
+  - 只看 runtime-only `scalar_prior_scale` 能不能把 canonical local-path 的 spacing blocker 推过线。
+- 路线统一：
+  - `generation_route = standard`
+  - `eval_mask_routed = true`
+  - `final_mapping_scope = edit_region`
+- 产物：
+  - `A0`: `tmp/trend_spacing_t1_monotonic.json`
+  - `A1`: `tmp/preval_a1/trend_spacing_t1_A1_monotonic.json`
+  - `A2`: `tmp/preval_a2/trend_spacing_t1_A2_monotonic.json`
+
+**A0/A1/A2 关键对比**：
+- `A0` baseline：
+  - `adjacent_monotonic_pass_rate = 0.625`
+  - `min_adjacent_gap_mean = -0.00242`
+  - `adjacent_gap_collapse_rate = 0.375`
+- `A1` (`scalar_prior_scale = 0.16`)：
+  - `adjacent_monotonic_pass_rate = 0.5`
+  - `min_adjacent_gap_mean = -0.00499`
+  - `adjacent_gap_collapse_rate = 0.375`
+- `A2` (`scalar_prior_scale = 0.24`)：
+  - `adjacent_monotonic_pass_rate = 0.5`
+  - `min_adjacent_gap_mean = -0.00871`
+  - `adjacent_gap_collapse_rate = 0.375`
+
+**bucket-level 结论**：
+- `long` bucket 在 `A0/A1/A2` 都是健康的：
+  - monotonic pass `= 1.0`
+  - `min_adjacent_gap_mean > 0`
+- 真正塌的是 `short / medium`：
+  - `A0` 已经是负 gap
+  - `A1/A2` 继续把负 gap 拉大
+  - `A2` 比 `A1` 更差，尤其 `medium`
+
+**本轮结论**：
+- `T1` 确实比旧 trend checkpoint 更好：
+  - internal separation 在
+  - canonical-route effect 单调
+  - locality / preservation 正常
+- 但 active benchmark gate 仍未通过：
+  - raw/local adjacent spacing 还是太小
+  - `short / medium` 仍会 collapse 或反向
+- `A0 -> A1 -> A2` 已经给出足够证据：
+  - runtime-only final mapping 拉伸不能解决当前 blocker
+  - 而且更高的 `scalar_prior_scale` 会把 benchmark-facing spacing 推得更差
+
+**当前决定**：
+- 收口 runtime-only mapping 这条线，不再继续往 `A3/A5` 扩。
+- 后续如果继续修 `trend`，重点应回到 training-side 的 raw/local spacing-first 修复，而不是继续做 runtime-only 拉伸。
+
+## [2026-04-28] - seasonality 正式版数据集 + full training 已跑通；local-route test 全量通过
+
+**本轮目标**：
+- 把 seasonality 从 smoke 规模推进到正式训练规模。
+- 沿用当前 pure-editing strength 主线，不另造新训练流程：
+  - family dataset
+  - `strength_scalar = 0 / 0.5 / 1.0`
+  - `strength_lr_scale = 10`
+  - output branch carrier + final output strength mapping
+  - local-route effect eval 统一走 `edit_region_soft`
+- 在 `cuda:0` 上跑完整 finetune，并看全量 test split 的真实编辑效果。
+
+**数据集升级**：
+- 原 `TEdit-main/datasets/discrete_strength_seasonality_family` 之前只是 smoke：
+  - train/valid/test families = `6 / 3 / 3`
+- 已重建为正式版：
+  - train/valid/test families = `96 / 24 / 24`
+  - num samples = `288 / 72 / 72`
+- 构建命令：
+  - `python test_scripts/build_tedit_strength_seasonality_family_dataset.py --csv-path data/ETTh1.csv --dataset-name ETTh1 --output-dir TEdit-main/datasets/discrete_strength_seasonality_family --seq-len 192 --random-seed 17 --train-families 96 --valid-families 24 --test-families 24`
+- health check：
+  - `python test_scripts/check_tedit_strength_discrete_benchmark.py --benchmark TEdit-main/datasets/discrete_strength_seasonality_family/test.json --output TEdit-main/datasets/discrete_strength_seasonality_family/test_benchmark_health.json`
+- health 结果：
+  - `num_families = 24`
+  - `complete_strength_rate = 1.0`
+  - `target_monotonic_rate = 1.0`
+  - `zero_background_leak_rate = 1.0`
+  - `health_pass = true`
+
+**训练设置**：
+- 环境：
+  - `source /root/miniconda3/bin/activate tedit`
+  - `CUDA_VISIBLE_DEVICES=0`
+- checkpoint / config：
+  - pretrained: `save/synthetic/pretrain_multi_weaver/0/ckpts/model_best.pth`
+  - finetune config: `TEdit-main/configs/synthetic/finetune_strength_seasonality_family.yaml`
+  - save folder: `TEdit-main/save/synthetic/finetune_strength_seasonality_family_full`
+- 训练命令：
+  - `cd TEdit-main && python run_finetune.py --pretrained_dir save/synthetic/pretrain_multi_weaver --model_config_path model_configs.yaml --pretrained_model_path ckpts/model_best.pth --finetune_config_path configs/synthetic/finetune_strength_seasonality_family.yaml --evaluate_config_path configs/synthetic/evaluate.yaml --data_folder ./datasets/discrete_strength_seasonality_family --save_folder ./save/synthetic/finetune_strength_seasonality_family_full --n_runs 1 --epochs 10 --include_self 0 --strength-diagnostics 1 --strength-diagnostics-interval 1`
+
+**训练产物**：
+- best checkpoint:
+  - `TEdit-main/save/synthetic/finetune_strength_seasonality_family_full/0/seasonality_injection/ckpts/model_best.pth`
+- runtime config:
+  - `TEdit-main/save/synthetic/finetune_strength_seasonality_family_full/0/seasonality_injection/resolved_runtime_config.json`
+- diagnostics:
+  - `TEdit-main/save/synthetic/finetune_strength_seasonality_family_full/0/seasonality_injection/strength_diagnostics.jsonl`
+  - `TEdit-main/save/synthetic/finetune_strength_seasonality_family_full/0/seasonality_injection/valid_epoch_summary.jsonl`
+  - `TEdit-main/save/synthetic/finetune_strength_seasonality_family_full/0/seasonality_injection/best_model_selection.json`
+
+**训练结果**：
+- best model selection 落在 `epoch 9`
+- `avg_loss_valid = 27.1934`
+- 训练过程中 best checkpoint 更新轨迹：
+  - `epoch 0 -> 1 -> 5 -> 7 -> 8 -> 9`
+- 说明：
+  - 这轮没有发散；
+  - valid loss 随训练总体下降；
+  - seasonality 线在正式规模数据上能稳定完成 full training。
+
+**重要限制（需要留痕）**：
+- 当前 `valid_epoch_summary.jsonl` / `best_model_selection.json` 里的 spacing summary 仍然是 target-side summary：
+  - `target_medium_minus_weak_mean`
+  - `target_strong_minus_medium_mean`
+  - `target_min_adjacent_gap_mean`
+- 这些值在 epoch 间基本不变，因此本轮 best checkpoint 的选择，本质上是：
+  - spacing score 相同
+  - 再由 `avg_loss_valid` 做 tie-break
+- 这意味着：
+  - 当前训练期 selection payload 还不能直接代表“模型真实输出的 spacing quality”；
+  - 真实效果必须靠独立的 local-route effect eval 来看。
+
+**全量 local-route effect eval**：
+- 命令：
+  - `python test_scripts/evaluate_tedit_strength_effect.py --model-path TEdit-main/save/synthetic/finetune_strength_seasonality_family_full/0/seasonality_injection/ckpts/model_best.pth --config-path TEdit-main/save/synthetic/finetune_strength_seasonality_family_full/0/seasonality_injection/resolved_runtime_config.json --dataset-folder TEdit-main/datasets/discrete_strength_seasonality_family --split test --max-samples 24 --device cuda:0 --edit-steps 10 --condition-mode both --selector seasonality_injection --final-mapping-scope edit_region --output tmp/seasonality_tedit_strength_eval_softlocal_fulltrain.json`
+- 产物：
+  - `tmp/seasonality_tedit_strength_eval_softlocal_fulltrain.json`
+
+**全量 effect 结果**：
+- `generation_route = edit_region_soft`
+- `monotonic_hit_rate = 1.0`
+- `weak_le_medium_pass_rate = 1.0`
+- `medium_le_strong_pass_rate = 1.0`
+- `strength_visible_in_final = true`
+- `preservation_pass = true`
+- `final_output_strength_mapping_by_scalar`：
+  - `0.0000 -> 0.9296`
+  - `0.5000 -> 1.0021`
+  - `1.0000 -> 1.0798`
+- `final_output_strength_mapping_transformed_scalar_by_scalar`：
+  - `0 -> 0`
+  - `0.5 -> 1`
+  - `1.0 -> 2`
+
+**全量 effect 核心数值**：
+
+| metric | value |
+|---|---:|
+| target_edit_gain_mean weak / medium / strong | `0.3601 / 0.7202 / 1.2603` |
+| final edit_gain_mean weak / medium / strong | `0.3505 / 0.4261 / 0.5094` |
+| final strong-minus-weak | `0.1589` |
+| final medium-minus-weak | `0.0756` |
+| final strong-minus-medium | `0.0832` |
+| final min adjacent gap mean | `0.0727` |
+| bg_mae_mean weak / medium / strong | `6.38e-4 / 6.63e-4 / 6.83e-4` |
+| bg_mae_strong_minus_weak | `4.52e-5` |
+| raw_to_final_monotonic_drop | `0.0` |
+| gain_calibration_mae_mean | `0.3924` |
+
+**duration bucket 结果**：
+- short:
+  - `monotonic_hit_rate = 1.0`
+  - `strong_minus_weak = 0.1194`
+  - `preservation_pass_rate = 1.0`
+- medium:
+  - `monotonic_hit_rate = 1.0`
+  - `strong_minus_weak = 0.2578`
+  - `preservation_pass_rate = 1.0`
+- long:
+  - `monotonic_hit_rate = 1.0`
+  - `strong_minus_weak = 0.0994`
+  - `preservation_pass_rate = 1.0`
+
+**阶段结论**：
+- seasonality 现在已经从“接入 + smoke 可跑”推进到：
+  - `formal-dataset trained`
+  - `full local-route test passed`
+- 它在正式版数据和 full local-route effect eval 上已经满足当前主线期望：
+  - 强度单调可见
+  - bucket 全通过
+  - 非编辑区保真稳定
+- 但还需要保留一个工程性注意点：
+  - 训练期 best-model selection 仍偏 target-side，尚不能替代独立 effect eval。
+
+## [2026-04-27] - pure-editing strength eval 正式切到 `edit_region_soft`；seasonality local-mask 路线通过，trend 旧 checkpoint 仍弱
+
+**本轮目标**：
+- 复核“当前 acceptance/local-path 定义是否真的走了 local mask 方法”。
+- 修正 pure-editing strength effect eval 的真实生成路由，避免把 `edit_time_series(..., edit_mask=...)` 和 `edit_region_soft(...)` 混为一谈。
+- 在不重训 seasonality 的前提下，确认：
+  - local-mask 路线是否真的生效；
+  - seasonality checkpoint 在真实 local route 下是否还能保持 `weak < medium < strong`；
+  - trend 旧 checkpoint 在同一路线上是否只是“没走 local mask”，还是模型本身就弱。
+
+**关键判断更新**：
+- 之前的 `evaluate_tedit_strength_effect.py` 实际走的是：
+  - `edit_time_series(..., edit_mask=...)`
+  - 这本质上仍是 standard global edit，不是 `edit_region_soft` 的 latent blending local path。
+- 因此：
+  - seasonality 那轮“背景漂移很大”的根因之一，确实是评估主线没走真正的 local mask；
+  - 先前为压住背景漂移加的 wrapper output blend 只能算临时兜底，不是这条评估主线的正确结构。
+
+**代码改动**：
+- `test_scripts/evaluate_tedit_strength_effect.py`
+  - effect eval 真实生成路由从 `edit_time_series(..., edit_mask=...)` 切到 `edit_region_soft(...)`；
+  - 使用 family 里的 `region_start / region_end` 作为局部编辑区域；
+  - 缺失 region 时从 `edit_mask` 反推；
+  - route metadata 统一改成：
+    - `generation_route = edit_region_soft`
+    - `generation_route_label = soft_local_edit_region`
+    - `acceptance_route = local_path_soft_mask`
+    - `route_statement = edit_region_soft + soft local mask + latent blending`
+- `test_scripts/test_output_branch_carrier_contract.py`
+  - 新增 contract：`evaluate_tedit_strength_effect.py` 必须调用 `edit_region_soft`，不能再回退到 `edit_time_series`；
+  - 保留原有 `edit_time_series + edit_mask` wrapper contract，不破坏其他调用链。
+
+**静态 / contract 验证**：
+- `python -m py_compile test_scripts/evaluate_tedit_strength_effect.py test_scripts/test_output_branch_carrier_contract.py`
+- `python -m unittest -v test_scripts.test_output_branch_carrier_contract`
+
+**seasonality local-route 复核**：
+- 运行：
+  - `source /root/miniconda3/bin/activate tedit`
+  - `CUDA_VISIBLE_DEVICES=0 python test_scripts/evaluate_tedit_strength_effect.py --model-path TEdit-main/save/synthetic/finetune_strength_seasonality_family/0/seasonality_injection/ckpts/model_best.pth --config-path TEdit-main/save/synthetic/finetune_strength_seasonality_family/0/seasonality_injection/resolved_runtime_config.json --dataset-folder TEdit-main/datasets/discrete_strength_seasonality_family --split test --max-samples 3 --device cuda:0 --edit-steps 10 --condition-mode both --selector seasonality_injection --final-mapping-scope edit_region --output tmp/seasonality_tedit_strength_eval_softlocal.json`
+- 产物：
+  - `tmp/seasonality_tedit_strength_eval_softlocal.json`
+- 结果：
+  - `generation_route = edit_region_soft`
+  - `monotonic_hit_rate = 1.0`
+  - `weak_le_medium_pass_rate = 1.0`
+  - `medium_le_strong_pass_rate = 1.0`
+  - `strength_visible_in_final = true`
+  - `preservation_pass = true`
+  - `final_background_mean_abs_delta` 约 `5e-4`
+  - `final_output_strength_mapping_by_scalar` 仍按 `0.0000 < 0.5000 < 1.0000` 有序
+- 当前结论：
+  - seasonality 这条线现在已经通过“真正 local mask 路由”验证；
+  - 它不再依赖 global route 或 wrapper 后融合来保背景；
+  - 当前阶段可以把 seasonality 视为已进入 `local-path verified` 状态。
+
+**trend 对照复核**：
+- 运行：
+  - `source /root/miniconda3/bin/activate tedit`
+  - `CUDA_VISIBLE_DEVICES=0 python test_scripts/evaluate_tedit_strength_effect.py --model-path TEdit-main/save/synthetic/finetune_strength_trend_family_semantic_split/0/trend_injection/ckpts/model_best.pth --config-path TEdit-main/save/synthetic/finetune_strength_trend_family_semantic_split/0/trend_injection/model_configs.yaml --dataset-folder TEdit-main/datasets/discrete_strength_trend_family --split test --max-samples 3 --device cuda:0 --edit-steps 10 --condition-mode both --selector trend_injection --final-mapping-scope edit_region --output tmp/trend_tedit_strength_eval_softlocal.json`
+- 产物：
+  - `tmp/trend_tedit_strength_eval_softlocal.json`
+- 结果：
+  - `generation_route = edit_region_soft`
+  - `preservation_pass = true`
+  - `monotonic_hit_rate = 0.3333`
+  - `medium_minus_weak_edit_gain_mean < 0`
+  - `final_output_strength_mapping_by_scalar` 为空
+- 当前结论：
+  - trend 旧 checkpoint 的弱表现，不是因为“没走 local mask”；
+  - 即使切到正确 local route，它的强度 spacing 仍然弱且不稳；
+  - 因而 trend 的活跃 blocker 继续保留为模型/训练质量，而不是 effect eval 路由定义。
+
+**阶段结论**：
+- acceptance/local-path 的正确定义现在更新为：
+  - `edit_region_soft + soft local mask + latent blending`
+- 旧的：
+  - `edit_time_series(..., edit_mask=mask_gt) + final_output_strength_mapping.scope=edit_region`
+  - 不再应被当成 pure-editing strength effect eval 的 canonical local path。
+- seasonality 当前状态：
+  - `local-path verified`
+  - 已能在真实 local route 下保持单调强度与背景保真。
+- trend 当前状态：
+  - `still weak under true local route`
+  - 后续若继续推进，应回到 checkpoint / finetune 设计，而不是再改 eval 路由。
+
+## [2026-04-22] - final-mapping-only prevalidation 完成：runtime mapping 生效，但 raw spacing 仍过小
+
+**当前所处阶段**：
+- 已按新口径完成 `final-mapping-only prevalidation`（A0–A5），基线为 `stage2_freeze_true_lr10_trend_injection`。
+- acceptance wording 保持不变：`edit_time_series(..., edit_mask=mask_gt)` + `final_output_strength_mapping.scope=edit_region`。
+- 预验证前的唯一阻塞不是模型本身，而是共享 wrapper config 损坏：`results/stage4_narrow_repair_20260422/_wrapper_model_config.yaml` 尾部多出裸字符串 `01`，导致首轮 A0–A5 全部 YAML parse fail；现已修复并成功重跑。
+
+**A0–A5 预验证设置**：
+
+| run | scope | prior | transform |
+|---|---|---:|---|
+| A0 | `edit_region` | default | none |
+| A1 | `edit_region` | 0.16 | none |
+| A2 | `edit_region` | 0.24 | none |
+| A3 | `edit_region` | 0.24 | `affine(scale=1.6, offset=0.0)` |
+| A4 | `edit_region` | 0.32 | `affine(scale=1.6, offset=0.0)` |
+| A5 | `edit_region` | 0.32 | `affine(scale=2.0, offset=0.0)` |
+
+**共同结果**：
+- A0–A5 全部 effect eval 成功跑通。
+- 结论在所有 A* 上一致：
+  - `raw_final_gap_edit_region_mean = 0.0`
+  - `preservation_attenuation_ratio_mean = 1.0`
+  - `monotonic_hit_rate = 1.0`
+  - `weak<=medium = 1.0`，`medium<=strong = 1.0`
+- 这进一步确认：当前问题不是 final stage 额外压平，而是 `raw spacing` 本身就非常小；runtime-only mapping 只能在极小 gap 上做轻微拉伸。
+
+**代表性结果（A4 / A5）**：
+
+| metric | A4 | A5 |
+|---|---:|---:|
+| prior | 0.32 | 0.32 |
+| transform | affine 1.6 | affine 2.0 |
+| raw medium-minus-weak | 0.002729 | 0.002729 |
+| raw strong-minus-medium | 0.001534 | 0.001534 |
+| raw strong-minus-weak | 0.004263 | 0.004263 |
+| final min adjacent gap | 0.001534 | 0.001534 |
+| raw→final gap | 0.0 | 0.0 |
+| attenuation ratio | 1.0 | 1.0 |
+| bg drift strong-minus-weak | 0.002204 | 0.002204 |
+| mapping transformed scalar | `0/0.8/1.6` | `0/1/2` |
+| mapping gain mean | `0.9716/0.9921/1.0120` | `0.9716/0.9987/1.0284` |
+
+**阶段结论**：
+- `final_output_strength_mapping` 的 runtime override 确实生效，尤其 A5 已把 transformed scalar 拉到 `0/1/2`，mapping gain 也按预期增大。
+- 但 benchmark-facing spacing 几乎没被实质放大：相邻 gap 仍只有 `1e-3` 量级，`strong_minus_weak` 也仅约 `4.26e-3`。
+- 因而最新判断进一步收敛为：
+  - 不是 `final mapping flattening`；
+  - 不是 acceptance route 定义错误；
+  - 当前活跃 blocker 仍是 `local-path raw spacing` 太小、太不稳。
+- 这也意味着：`更高 strength_lr_scale` 不是主解的判断继续成立；`lr10` 可保留为 baseline，`lr20` 继续只作为 negative evidence。
+
+**主线状态更新**：
+
+| 项 | 当前结论 |
+|---|---|
+| acceptance path | 保持 `local_path_mask_routed` + `scope=edit_region` |
+| archived line | `standard-route loss-only repair` 继续封存 |
+| final-stage flattening 假设 | 排除 |
+| runtime-only mapping 预验证 | 已完成，结论偏负 |
+| 当前 blocker | `raw spacing collapse / instability` |
+| 下一阶段重点 | 转向 training-side `spacing-first` 修复，而不是继续扫 freeze/lr |
+
+## [2026-04-21] - trend acceptance path 固定为 local-path spacing-stability；当前 checkpoint 仍未过线
+
+**本轮决策**：
+- 正式归档旧的 standard-route loss-only repair line，不再作为 trend promotion 的主验收路径。
+- 这里的 `local-path` 默认特指：`TEditWrapper.edit_time_series(..., edit_mask=mask_gt)` + `final_output_strength_mapping.scope=edit_region` 的 mask-routed local final-mapping 路由；它**不包含** `edit_region_soft` latent blending，也不等同于未传 `edit_mask` 的 global standard route。
+- 后续决策主指标改为 spacing metrics，而不是把 spacing 只当作附加报告项。
+- acceptance path 已明确切换到 `local-path spacing-stability`，且这个切换是正确的；但当前 checkpoint 仍未通过这条新 acceptance path。
+
+**local-path effect audit（通过）**：
+- `weak<=medium` = 1.0，`medium<=strong` = 1.0；
+- `final_min_adjacent_gap_mean` 为正，`final_adjacent_gap_collapse_rate = 0.0`；
+- `bg_mae_strong_minus_weak` 近零；
+- 说明 local-path 下强度差异可以在 edit region 内被干净兑现，不需要靠背景漂移实现。
+
+**local-path monotonic benchmark（未通过）**：
+- `weak<=medium_pass_rate = 0.5`，`medium<=strong_pass_rate = 0.5`；
+- `min_adjacent_gap_mean < 0`，`adjacent_gap_collapse_rate = 0.5`；
+- `preservation_pass_rate = 0.0`；
+- `long` bucket 直接塌掉，`short/medium` 也只到 0.6667。
+
+**当前诊断**：
+- 问题已经不再是 local-path 定义是否正确，也不再是 raw-to-final attenuation 或旧 standard-route global drift；
+- trend 线当前唯一活跃 blocker 是：`local-path spacing benchmark` 还没有稳定过线，尤其是 adjacent gap 稳定性、duration-bucket collapse 和 benchmark 条件下的 preservation。
+
+**归档结论**：
+- conditioning 已存在；
+- effect 已存在；
+- raw-to-final attenuation 不是当前 trend blocker 的主因；
+- archived standard route 主要把 strength 实现成 global drift；
+- 因此 `standard-route loss-only repair` 线正式关闭为 comparison-only evidence，不再作为未来 trend promotion 的 acceptance path。
+
+**新的主线 framing**：
+- 主线改为 `local-path spacing-stability`：
+  - 不扩 benchmark；
+  - 不引入新机制；
+  - 复用现有 probe / effect / monotonic eval；
+  - 把 weak/medium/strong 的 adjacent spacing、adjacent monotonicity、short/medium bucket stability 作为首要判据；
+  - locality 继续保底，不允许用背景漂移换 spacing。
+- `spacing metrics` 现在是后续训练/筛选配置的**一等主指标**：
+  - `medium_minus_weak`、`strong_minus_medium`、`strong_minus_weak`；
+  - `weak<=medium` 与 `medium<=strong` 分开统计；
+  - `min_adjacent_gap`、collapse/gap-balance 指标；
+  - locality safety：`bg_mae_strong_minus_weak`、preservation、edit-vs-background delta；
+  - raw vs final 对照；
+  - short / medium / long bucket split，重点看 short / medium，并显式盯住 long collapse。
+- benchmark / effect-audit / finetune diagnostics 必须统一使用同一 acceptance wording：`edit_time_series + edit_mask + final_output_strength_mapping.scope=edit_region`。
+- 后续 promotion 只看是否改善 active `local-path spacing-stability` blocker；旧 standard-route 结果只保留为 comparison-only evidence。
+
+**实现约束**：
+- repair 继续留在现有 loss surface 内：`monotonic_loss_weight`、`monotonic_margin`、`gain_match_loss_weight`、现有 background/edit-region 项。
+- 保持 trend-only、direction-aligned、`enable_strength_control: true`、family grouping 与 `duration_bucket` metadata。
+- 在新 spacing 指标落地前，不再把 standard-route rescue 作为主目标。
+
+**代码整理与训练前准备**：
+- `test_scripts/run_tedit_trend_monotonic_eval.py` 已补齐 final mapping scalar transform override parity（`scale / offset / name`），并与 effect audit 统一输出 route / acceptance / final-mapping metadata。
+- `test_scripts/evaluate_tedit_strength_effect.py` 已统一 local-path wording 与 `final_mapping_overrides` 记录，避免 benchmark / effect 口径漂移。
+- `TEdit-main/train/finetuner.py` 已把 spacing 指标接入 validation 记录与 best-checkpoint selection payload，输出 `valid_epoch_summary.jsonl` 与 `best_model_selection.json`，避免只按 `avg_loss_valid` 选点。
+- 已补训练前路径清单：`TEdit-main/configs/synthetic/finetune_strength_trend_family_stage4_preflight_paths.json`，固定推荐 finetune config、pretrain run=0、`model_configs.yaml` 与 `model_best.pth` 路径，减少 GPU 开跑前的配置/权重报错。
+
+**论文叙事决策（当前版本）**：
+- 论文正文只保留主损失，不展开工程性修补项。
+- 主损失聚合为四类目标：
+  - 局部编辑一致性（edit-region fidelity）；
+  - 非编辑区保持（out-of-region preservation）；
+  - 强度到编辑幅度的对齐（strength-to-amplitude calibration）；
+  - 跨强度级别的单调有序约束（monotonic ordering across strength levels）。
+- `family_gap_match`、`family_relative_gain`、`constant_gain_penalty`、`numeric_only`、branch / final-mapping regularizers 等项在写作上统一降级为 implementation details / training stabilizers，不作为方法主公式主体。
+- 这样写的主因不是删内容，而是把方法主张收束到一条清晰主线：统一 `strength_scalar` 作为共享控制轴，在保证局部性与保真的前提下，让强度值对应可校准、且单调可控的编辑幅度。
+
+## [2026-04-20] - T3c trend mask-local final mapping：局部性复核通过，但仍不是 promotable
+
+**本轮目标**：
+- 接 T2b 结论继续验证 trend：
+  - 不再做 scalar 合约对齐；
+  - 不扩大 benchmark；
+  - 不重训；
+  - 只验证 direction/sign 已对齐后，trend 的 final mapping 正信号能否像 non-trend family 一样局部化。
+- 严格隔离机制：
+  - `eval_mask_routed` 走 `TEditWrapper.edit_time_series(..., edit_mask=mask_gt)`；
+  - 不使用 `edit_region_soft`；
+  - 不混入 soft-boundary latent blending / state-space mixing。
+
+**代码改动**：
+- `test_scripts/run_tedit_trend_monotonic_eval.py`
+  - 增加 `--generation-route {soft_region,standard}`；
+  - 增加 `--eval-mask-routed`；
+  - 增加 final mapping runtime override：`--final-mapping-scalar-prior-scale`、`--final-mapping-gain-order-direction`、`--final-mapping-scope`；
+  - `standard` route 调用普通 `edit_time_series`，并在 mask-routed 时传入 `mask_gt`。
+- `test_scripts/probe_tedit_strength_internal.py`
+  - 增加 `--final-mapping-scope`，输出记录 `final_mapping_overrides`。
+- `test_scripts/evaluate_tedit_strength_effect.py`
+  - 增加 `--final-mapping-scope`，输出 config 记录 final mapping overrides。
+- `test_scripts/test_output_branch_carrier_contract.py`
+  - 新增 contract：trend standard mask-routed eval 必须调用 `edit_time_series(..., edit_mask=...)`，不能调用 `edit_region_soft`。
+
+**验证命令**：
+- 新增 contract 先红后绿：
+  - `python -m unittest test_scripts.test_output_branch_carrier_contract.TestOutputBranchCarrierContract.test_trend_standard_mask_routed_eval_uses_edit_time_series_not_soft_region`
+- 相关 contract 通过：
+  - `python -m unittest test_scripts.test_output_branch_carrier_contract`
+- 语法检查通过：
+  - `python -m py_compile TEdit-main/models/diffusion/diff_csdi_multipatch_weaver.py test_scripts/probe_tedit_strength_internal.py test_scripts/evaluate_tedit_strength_effect.py test_scripts/run_tedit_trend_monotonic_eval.py test_scripts/test_output_branch_carrier_contract.py`
+
+**T3c 运行设置**：
+- checkpoint:
+  - `tmp/output_final_mapping_inverse004_3epoch/0/trend_injection/ckpts/model_best.pth`
+- config:
+  - `tmp/output_final_mapping_inverse004_3epoch/0/trend_injection/resolved_runtime_config.json`
+- benchmark:
+  - `TEdit-main/datasets/discrete_strength_trend_family/test.json`
+- runtime overrides:
+  - `final_mapping_scalar_prior_scale = 0.04`
+  - `final_mapping_gain_order_direction = increasing`
+  - `final_mapping_scope = edit_region`
+  - monotonic eval: `generation_route = standard`
+  - monotonic eval: `eval_mask_routed = true`
+
+**T3c 产物**：
+- `results/strength_t3c_trend_direction_masklocal_20260420/probe_sample0.json`
+- `results/strength_t3c_trend_direction_masklocal_20260420/trend_monotonic_eval.json`
+- `results/strength_t3c_trend_direction_masklocal_20260420/effect_eval.json`
+- `results/strength_t3c_trend_direction_masklocal_20260420/_wrapper_model_config.yaml`
+
+**T3c effect 结果**：
+
+| check | T2b-B global | T3c mask-local |
+|---|---:|---:|
+| final_monotonic_hit_rate | 1.0 | 1.0 |
+| strong_minus_weak_edit_gain_mean | 5.8907e-03 | 6.4203e-03 |
+| bg_mae_strong_minus_weak | 5.7236e-03 | -1.0324e-04 |
+| abs(bg/edit) ratio | 0.9716 | 0.0161 |
+| family_spearman_rho_strength_gain_mean | 1.0 | 1.0 |
+| preservation_pass | true | true |
+
+**T3c effect duration bucket 结果**：
+
+| bucket | n | final monotonic | strong-minus-weak | bg strength leak |
+|---|---:|---:|---:|---:|
+| short | 3 | 1.0 | 6.3785e-03 | 9.8546e-06 |
+| medium | 3 | 1.0 | 6.6816e-03 | 1.1126e-05 |
+| long | 2 | 1.0 | 6.0910e-03 | -4.4441e-04 |
+
+**T3c standard-route monotonic sweep 结果**：
+
+| check | T2b-B global / soft-region | T3c standard mask-routed |
+|---|---:|---:|
+| adjacent_monotonic_pass_rate | 0.25 | 0.75 |
+| off_anchor_monotonic_pass_rate | 0.875 | 0.75 |
+| gain_range_mean | 2.6940e-02 | -1.8622e-03 |
+| family_spearman_rho_mean | 0.5125 | 0.5 |
+| preservation_pass_rate | 1.0 | 0.0 |
+
+**T3c standard-route bucket 结果**：
+
+| bucket | n | adjacent | gain_range_mean | preservation |
+|---|---:|---:|---:|---:|
+| short | 3 | 0.6667 | -2.3473e-03 | 0.0 |
+| medium | 3 | 0.6667 | -3.2795e-03 | 0.0 |
+| long | 2 | 1.0 | 9.9136e-04 | 0.0 |
+
+**阶段判断**：
+- T3c 成功回答了本轮核心问题：
+  - trend 的 T2b-B 正信号不必依赖 global final mapping 的背景同步放大；
+  - 在普通 `edit_time_series(..., edit_mask=...)` 路径下，`scope=edit_region` 保住了 effect monotonic，并把背景 strength leak 从 `5.72e-03` 压到约 `1.03e-04`。
+- 因此 trend 从 `direction-aligned promising, not promotable` 更新为：
+  - `local-trend-promising, not promotable`。
+- 仍不能 promotable：
+  - standard-route monotonic sweep 的 `gain_range_mean` 仍略负；
+  - short/medium bucket 在 sweep 里仍负；
+  - standard route 的绝对背景漂移很大，`preservation_pass_rate = 0.0`，说明旧 checkpoint 的 raw full-sequence generation 本身仍不干净；
+  - 本轮只能证明 mask-local final mapping 能解耦 strength leakage，不能证明 trend 已是稳定可发布 local family。
+
+**下一步建议**：
+- 不在旧 inverse004 checkpoint 上继续做更多 config-only localization 修补。
+- 若继续推进 trend，应进入小规模 direction-aligned + mask-local 训练/再训练，验证 raw full-sequence drift 是否能被训练修正。
+- promotable 门槛应绑定：
+  - effect 8/8 monotonic；
+  - background strength leak 低；
+  - standard-route sweep bucket 整体正向；
+  - absolute preservation 不再失败。
+
+## [2026-04-20] - T2b final-only scalar transform / direction flip：合约对齐不是修复，方向翻转有正信号但未达 promotable
+
+**本轮目标**：
+- 按 T2b stop rule 做两步最小实验：
+  - A：只在 final output strength mapping 内做 final-only scalar transform，把当前 `0 / 0.5 / 1.0` 映射到旧 smoke 的 `0 / 1 / 2`，不改变 projector/runtime 原始 scalar；
+  - B：仅当 A 证明 transform 生效但 held-out 仍失败时，再做一次 final mapping direction / prior 翻转对照。
+- 同时补可诊断字段，确保能区分：
+  - projector 仍看到原始 runtime scalar；
+  - final mapping 内部实际使用 transformed scalar；
+  - final mapping gain 是否按预期改变。
+
+**代码与诊断改动**：
+- `TEdit-main/models/diffusion/diff_csdi_multipatch_weaver.py`
+  - `final_output_strength_mapping.scalar_transform` 默认关闭；
+  - transform 只在 final output strength mapping 内使用；
+  - diagnostics 记录 `final_output_strength_mapping_transformed_scalar_by_scalar` 和 `final_output_strength_mapping_scalar_transform`。
+- `test_scripts/probe_tedit_strength_internal.py`
+  - 增加 final mapping scalar transform / prior / direction CLI override；
+  - probe summary 输出 transformed scalar 与 mapping gain。
+- `test_scripts/evaluate_tedit_strength_effect.py`
+  - 增加同样 CLI override；
+  - effect summary 输出 final mapping gain / transformed scalar diagnostics。
+- `test_scripts/test_output_branch_carrier_contract.py`
+  - 新增 contract：final-only transform 应改变 final mapping gain，但不改原始 scalar。
+
+**静态 / contract 验证**：
+- 新增 contract 先红后绿：
+  - `python -m unittest test_scripts.test_output_branch_carrier_contract.TestOutputBranchCarrierContract.test_final_output_strength_mapping_scalar_transform_is_final_only`
+- 相关 contract 通过：
+  - `python -m unittest test_scripts.test_output_branch_carrier_contract`
+- 语法检查通过：
+  - `python -m py_compile TEdit-main/models/diffusion/diff_csdi_multipatch_weaver.py test_scripts/probe_tedit_strength_internal.py test_scripts/evaluate_tedit_strength_effect.py test_scripts/test_output_branch_carrier_contract.py`
+
+**T2b-A：final-only scalar transform 对齐旧 `0 / 1 / 2` 合约**：
+- 产物：
+  - `results/strength_t2b_inverse004_scalar_aligned_20260420/probe_sample0.json`
+  - `results/strength_t2b_inverse004_scalar_aligned_20260420/trend_monotonic_eval.json`
+  - `results/strength_t2b_inverse004_scalar_aligned_20260420/effect_eval.json`
+- probe 确认 transform 生效：
+  - 原始 scalar: `0.0 / 0.5 / 1.0`
+  - final mapping transformed scalar: `0.0 / 1.0 / 2.0`
+  - final mapping gain: `1.039996 / 0.999996 / 0.959996`
+- 但 sample0 raw/final 仍非 monotonic。
+
+**T2b-A held-out 结果**：
+
+| check | value |
+|---|---:|
+| monotonic eval adjacent pass rate | 0.0 |
+| monotonic eval off-anchor pass rate | 0.375 |
+| monotonic eval gain_range_mean | -5.8398e-02 |
+| monotonic eval family_spearman_rho_mean | -0.400 |
+| monotonic eval preservation_pass_rate | 1.0 |
+| effect raw_monotonic_hit_rate | 0.0 |
+| effect final_monotonic_hit_rate | 0.0 |
+| effect strong_minus_weak_edit_gain_mean | -1.1667e-02 |
+| effect bg_mae_strong_minus_weak | -1.1328e-02 |
+| effect family_spearman_rho_strength_gain_mean | -1.0 |
+| effect preservation_pass | true |
+
+**T2b-A duration bucket 结果**：
+
+| source | bucket | n | monotonic / adjacent | strong-minus-weak / gain range | preservation |
+|---|---|---:|---:|---:|---:|
+| monotonic eval | short | 3 | 0.0 | -4.7883e-02 | 1.0 |
+| monotonic eval | medium | 3 | 0.0 | -1.0118e-01 | 1.0 |
+| monotonic eval | long | 2 | 0.0 | -9.9989e-03 | 1.0 |
+| effect eval | short | 3 | 0.0 | -1.1877e-02 | 1.0 |
+| effect eval | medium | 3 | 0.0 | -1.3497e-02 | 1.0 |
+| effect eval | long | 2 | 0.0 | -8.6057e-03 | 1.0 |
+
+**T2b-B：一次 direction / prior 翻转对照**：
+- 产物：
+  - `results/strength_t2b_inverse004_direction_flip_20260420/probe_sample0.json`
+  - `results/strength_t2b_inverse004_direction_flip_20260420/trend_monotonic_eval.json`
+  - `results/strength_t2b_inverse004_direction_flip_20260420/effect_eval.json`
+- probe sample0 转正：
+  - final mapping gain: `0.959996 / 0.979997 / 0.999996`
+  - raw/final monotonic: `true / true`
+- effect eval held-out 转正：
+  - `raw_monotonic_hit_rate = 1.0`
+  - `final_monotonic_hit_rate = 1.0`
+  - `strong_minus_weak_edit_gain_mean = 5.8907e-03`
+  - `family_spearman_rho_strength_gain_mean = 1.0`
+- 但 trend monotonic sweep 仍不全稳：
+  - adjacent pass rate 只有 `0.25`
+  - long bucket `gain_range_mean = -4.8505e-03`
+  - 背景 gap 与 edit gap 同步上升，`bg_mae_strong_minus_weak = 5.7236e-03`
+
+**T2b-B held-out 结果**：
+
+| check | value |
+|---|---:|
+| monotonic eval adjacent pass rate | 0.25 |
+| monotonic eval off-anchor pass rate | 0.875 |
+| monotonic eval gain_range_mean | 2.6940e-02 |
+| monotonic eval family_spearman_rho_mean | 0.5125 |
+| monotonic eval preservation_pass_rate | 1.0 |
+| effect raw_monotonic_hit_rate | 1.0 |
+| effect final_monotonic_hit_rate | 1.0 |
+| effect strong_minus_weak_edit_gain_mean | 5.8907e-03 |
+| effect bg_mae_strong_minus_weak | 5.7236e-03 |
+| effect family_spearman_rho_strength_gain_mean | 1.0 |
+| effect preservation_pass | true |
+
+**T2b-B duration bucket 结果**：
+
+| source | bucket | n | monotonic / adjacent | strong-minus-weak / gain range | preservation |
+|---|---|---:|---:|---:|---:|
+| monotonic eval | short | 3 | 0.3333 | 2.5892e-02 | 1.0 |
+| monotonic eval | medium | 3 | 0.3333 | 4.9182e-02 | 1.0 |
+| monotonic eval | long | 2 | 0.0 | -4.8505e-03 | 1.0 |
+| effect eval | short | 3 | 1.0 | 5.9350e-03 | 1.0 |
+| effect eval | medium | 3 | 1.0 | 6.6050e-03 | 1.0 |
+| effect eval | long | 2 | 1.0 | 4.7526e-03 | 1.0 |
+
+**阶段判断**：
+- T2b-A 证明：把当前 scalar final-only 变换回旧 `0 / 1 / 2` 合约不是正确修复；transform 路径正确生效，但 held-out trend 仍整体负向。
+- T2b-B 证明：当前 held-out effect 口径下，final mapping 的 direction/sign 翻转可以恢复 8/8 effect monotonic。
+- 但 B 不能直接升级为 promotable trend：
+  - monotonic sweep adjacent 只有 `0.25`，long bucket 仍负；
+  - 背景 gap 基本随 edit gap 同步上升，说明这还是 global final mapping 信号，不是合格的局部 trend 控制；
+  - `probe_gate_pass` 仍为 false，说明旧内部路径本身没有重新获得 strength separability。
+- 当前 trend verdict 从 `regression-only / no-regression-but-not-ready` 上调为：
+  - `direction-aligned promising, not promotable`。
+
+**下一步建议**：
+- 不继续扩大 T2b benchmark，不把 B 当作最终 trend 修复。
+- 如果继续 trend，应先做 region-local / mask-routed trend final mapping 或重新训练方向一致的 trend local family，再跑同一套 `probe -> monotonic eval -> effect eval`。
+- 若保留 B，只能作为 sign/direction diagnostic baseline，不应并入默认配置。
+
 ## [2026-04-20] - trend inverse final mapping 旧成功线复核：smoke 成功依赖旧 strength scalar 合约，T2 held-out 方向反转
 
 **本轮目标**：

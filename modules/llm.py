@@ -146,6 +146,21 @@ def _apply_explicit_prompt_hints(plan: Dict[str, Any], instruction_text: str, ts
             execution["canonical_tool"] = "impulse_spike"
             execution["tool_name"] = "spike_inject"
 
+    seasonality_enhance_hints = ("周期更明显", "周期性更强", "节律更明显", "峰谷更清晰", "增强季节性", "增强周期性")
+    seasonality_reduce_hints = ("周期减弱", "周期性减弱", "节律变弱", "峰谷被压平", "削弱季节性", "削弱周期性", "平滑周期")
+    if any(token in instruction_text for token in seasonality_enhance_hints):
+        intent["effect_family"] = "seasonality"
+        intent["direction"] = "neutral"
+        intent["shape"] = "periodic"
+        execution["canonical_tool"] = "seasonality_enhance"
+        execution["tool_name"] = "season_enhance"
+    elif any(token in instruction_text for token in seasonality_reduce_hints):
+        intent["effect_family"] = "seasonality"
+        intent["direction"] = "neutral"
+        intent["shape"] = "flatten"
+        execution["canonical_tool"] = "seasonality_reduce"
+        execution["tool_name"] = "season_reduce"
+
     plateau_hints = ("持续承压", "持续偏高", "维持高位", "高位维持", "持续处于高位")
     if any(token in instruction_text for token in plateau_hints):
         intent["effect_family"] = "level"

@@ -37,6 +37,7 @@ def _background_leakage(source_ts: np.ndarray, target_ts: np.ndarray, mask_gt: n
 
 
 def _family_metadata_signature(sample: Dict[str, Any]) -> Tuple[Any, ...]:
+    injection_config = sample.get("injection_config", {}) if isinstance(sample.get("injection_config"), dict) else {}
     return (
         sample.get("direction"),
         sample.get("tool_name"),
@@ -48,6 +49,8 @@ def _family_metadata_signature(sample: Dict[str, Any]) -> Tuple[Any, ...]:
         sample.get("family_semantic_tag"),
         sample.get("task_id"),
         sample.get("noise_subtype"),
+        injection_config.get("cycles"),
+        injection_config.get("phase"),
     )
 
 
@@ -120,7 +123,7 @@ def _canonical_tool_name(tool_name: Any, effect_family: Any) -> str:
     if family_token == "trend":
         return "trend_injection"
     if family_token == "seasonality":
-        return "seasonality"
+        return "seasonality_injection"
     if family_token == "volatility":
         return "noise_injection"
     return family_token or "unknown"
@@ -171,6 +174,8 @@ def _family_semantic_tag(tool_name: str, direction: str, attr_strategy: str) -> 
     normalized_strategy = _normalize_attr_strategy(attr_strategy)
     if normalized_tool == "trend_injection":
         return f"trend_proxy_{normalized_direction}"
+    if normalized_tool == "seasonality_injection":
+        return "seasonality_native_neutral"
     if normalized_tool == "step_change":
         return f"step_{normalized_strategy}_{normalized_direction}"
     if normalized_tool == "multiplier":
@@ -221,6 +226,27 @@ def _resolve_family_semantics(
     }
 
 
+def _attrs_for_sample(sample: Dict[str, Any]) -> Tuple[np.ndarray, np.ndarray]:
+    tool_name = _canonical_tool_name(sample.get("tool_name"), sample.get("effect_family"))
+    effect_family = str(sample.get("effect_family", "")).strip().lower()
+    if tool_name == "seasonality_injection" or effect_family == "seasonality":
+        injection_config = sample.get("injection_config", {}) if isinstance(sample.get("injection_config"), dict) else {}
+        cycles = int(injection_config.get("cycles", 2))
+        cycle_to_attr = {0: 0, 1: 1, 2: 2, 4: 3}
+        season_attr = int(cycle_to_attr.get(cycles, 2))
+        src_attrs = np.asarray([0, 0, 0], dtype=np.int64)
+        tgt_attrs = np.asarray([0, 0, season_attr], dtype=np.int64)
+        return src_attrs, tgt_attrs
+
+    semantics = _resolve_family_semantics(
+        tool_name=tool_name,
+        direction=sample.get("direction"),
+        effect_family=effect_family,
+        attr_strategy=sample.get("attr_strategy", "neutral"),
+    )
+    return semantics["src_attrs"], semantics["tgt_attrs"]
+
+
 class DiscreteStrengthFamilyDataset:
     def __init__(self, folder: str, **kwargs: Any):
         self.folder = folder
@@ -237,12 +263,6 @@ class DiscreteStrengthFamilyDataset:
         if selector is None:
             selector = Path(self.folder).name
             self.meta["selector"] = selector
-        expected_selector = str(Path(self.folder).name)
-        if str(selector) != expected_selector:
-            raise ValueError(
-                f"Discrete strength family selector mismatch: meta selector='{selector}' but folder leaf='{expected_selector}'. "
-                "Expected a dedicated family leaf <collection_root>/<selector>."
-            )
         self.attr_list = list(self.meta["attr_list"])
         self.attr_n_ops = np.asarray(self.meta["attr_n_ops"], dtype=np.int64)
         self.ctrl_attr_ids = list(self.meta["control_attr_ids"])
@@ -295,8 +315,7 @@ class DiscreteStrengthFamilySplit(Dataset):
             effect_family=family_effect_family,
             attr_strategy=family_attr_strategy,
         )
-        src_attrs = family_semantics["src_attrs"]
-        tgt_attrs = family_semantics["tgt_attrs"]
+        src_attrs, tgt_attrs = _attrs_for_sample(samples[0])
         src_x = np.asarray(samples[0]["source_ts"], dtype=np.float32)
         tp = np.arange(src_x.shape[0], dtype=np.float32)
 
@@ -318,8 +337,8 @@ class DiscreteStrengthFamilySplit(Dataset):
                 "tool_name": str(family_semantics["canonical_tool"]),
                 "effect_family": str(family_effect_family or "unknown"),
                 "direction": str(family_semantics["direction"]),
-                "attr_strategy": str(family_semantics["attr_strategy"]),
-                "family_semantic_tag": str(family_semantics["family_semantic_tag"]),
+                "attr_strategy": "native" if str(family_semantics["canonical_tool"]) == "seasonality_injection" else str(family_semantics["attr_strategy"]),
+                "family_semantic_tag": "seasonality_native_neutral" if str(family_semantics["canonical_tool"]) == "seasonality_injection" else str(family_semantics["family_semantic_tag"]),
                 "duration_bucket": str(sample.get("duration_bucket", family.get("duration_bucket", "unknown"))),
             }
             task_id = _int_metadata_value(family.get("task_id"), sample.get("task_id"))

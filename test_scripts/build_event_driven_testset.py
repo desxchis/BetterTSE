@@ -33,7 +33,22 @@ from abc import ABC, abstractmethod
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-from scipy.ndimage import gaussian_filter1d
+try:
+    from scipy.ndimage import gaussian_filter1d
+except Exception:
+    def gaussian_filter1d(array, sigma):
+        sigma = float(sigma)
+        values = np.asarray(array, dtype=np.float64)
+        if sigma <= 0.0:
+            return values
+        radius = max(1, int(round(4.0 * sigma)))
+        x = np.arange(-radius, radius + 1, dtype=np.float64)
+        kernel = np.exp(-(x ** 2) / (2.0 * sigma * sigma))
+        kernel /= np.sum(kernel)
+        full = np.convolve(values, kernel, mode="full")
+        start = (len(kernel) - 1) // 2
+        end = start + len(values)
+        return full[start:end]
 
 logging.basicConfig(
     level=logging.INFO,
@@ -116,6 +131,7 @@ class CSVDataLoader:
         self.features = []
         self.feature_to_idx = {}
         self.timestamps = []
+        self._series: Dict[str, np.ndarray] = {}
         self.domain = self.DATASET_INFO.get(dataset_name, {}).get("domain", "工业系统")
         self.feature_descriptions = self.DATASET_INFO.get(dataset_name, {}).get("features_desc", {})
         
@@ -125,25 +141,48 @@ class CSVDataLoader:
         
     def _load_data(self):
         logger.info(f"正在加载数据集: {self.csv_path}")
-        self.data = pd.read_csv(self.csv_path)
+        try:
+            frame = pd.read_csv(self.csv_path)
+        except Exception:
+            raw = np.genfromtxt(self.csv_path, delimiter=",", names=True, dtype=None, encoding="utf-8")
+            column_names = list(raw.dtype.names or [])
+            if not column_names:
+                raise
+            self.features = [column for column in column_names if column != "date"]
+            self._series = {}
+            for column in column_names:
+                values = np.asarray(raw[column])
+                if column == "date":
+                    self.timestamps = values.tolist()
+                else:
+                    self._series[column] = values.astype(np.float64)
+            self.feature_to_idx = {feat: idx for idx, feat in enumerate(self.features)}
+            self.data = np.column_stack([self._series[feat] for feat in self.features])
+            logger.info(f"数据形状: {self.data.shape}")
+            logger.info(f"特征列表 ({len(self.features)}): {self.features}")
+            return
+        else:
+            if 'date' in frame.columns:
+                self.timestamps = frame['date'].tolist()
+                frame = frame.drop(columns=['date'])
+            self.features = frame.columns.tolist()
+            self.feature_to_idx = {feat: idx for idx, feat in enumerate(self.features)}
+            self._series = {
+                feat: np.asarray(frame[feat], dtype=np.float64)
+                for feat in self.features
+            }
+            self.data = np.column_stack([self._series[feat] for feat in self.features])
         logger.info(f"数据形状: {self.data.shape}")
-        
-        if 'date' in self.data.columns:
-            self.timestamps = self.data['date'].tolist()
-            self.data = self.data.drop(columns=['date'])
-        
-        self.features = self.data.columns.tolist()
-        self.feature_to_idx = {feat: idx for idx, feat in enumerate(self.features)}
         logger.info(f"特征列表 ({len(self.features)}): {self.features}")
             
     def get_sequence(self, start_idx: int, seq_len: int, feature: str) -> Tuple[np.ndarray, List[str]]:
         end_idx = start_idx + seq_len
-        if end_idx > len(self.data):
-            end_idx = len(self.data)
+        total_length = int(self.data.shape[0]) if hasattr(self.data, "shape") else len(self.data)
+        if end_idx > total_length:
+            end_idx = total_length
             start_idx = max(0, end_idx - seq_len)
-            
-        feat_idx = self.feature_to_idx[feature]
-        sequence = self.data.iloc[start_idx:end_idx, feat_idx].values.astype(np.float64)
+        
+        sequence = np.asarray(self._series[feature][start_idx:end_idx], dtype=np.float64)
         
         timestamps = []
         if self.timestamps:
@@ -161,6 +200,7 @@ class PhysicalInjector(ABC):
         "noise_injection": "signal_corruption",
         "trend_injection": "transient_hump",
         "step_change": "regime_switch",
+        "seasonality_injection": "seasonality_shift",
     }
 
     LEGACY_TASK_TYPES = {
@@ -169,6 +209,7 @@ class PhysicalInjector(ABC):
         "noise_injection": "sensor_offline",
         "trend_injection": "market_trend",
         "step_change": "device_switch",
+        "seasonality_injection": "seasonality_shift",
     }
     
     CAUSAL_SCENARIOS = {
@@ -198,6 +239,11 @@ class PhysicalInjector(ABC):
                 "系统重置导致状态跳变",
                 "控制策略调整导致基准状态突然切换",
             ],
+            "seasonality_injection": [
+                "运行节律突然变得更强，峰谷起伏被明显放大",
+                "周期性调度让系统呈现更清晰的重复节拍",
+                "外部约束改变后，原本的周期起伏被明显压平",
+            ],
         },
         "power": {
             "multiplier": [
@@ -226,6 +272,11 @@ class PhysicalInjector(ABC):
                 "负载转移导致瞬时工作点切换",
                 "控制策略调整导致基准负荷突然变化",
             ],
+            "seasonality_injection": [
+                "分时调度信号加强后，峰谷负荷节律变得更明显",
+                "居民作息与气温共振让日内峰谷起伏更清晰",
+                "错峰干预生效后，原本明显的日内峰谷被压平了一些",
+            ],
         },
         "traffic": {
             "multiplier": [
@@ -252,6 +303,11 @@ class PhysicalInjector(ABC):
                 "匝道开闭状态切换导致通行水平突然变化",
                 "临时交通管制导致道路运行模式瞬时改变",
                 "信号配时调整导致路段基准通行状态跳变",
+            ],
+            "seasonality_injection": [
+                "通勤节律突然更集中，让早晚峰谷模式更明显",
+                "阶段性分流后，原本规律的车流峰谷被削弱了一些",
+                "节假日出行节奏变化让重复性的通行波动更突出",
             ],
         },
     }
@@ -401,6 +457,16 @@ class PhysicalInjector(ABC):
                 "onset": "abrupt",
             }
 
+        if injection_type == "seasonality_injection":
+            return {
+                "effect_family": "seasonality",
+                "shape": "periodic",
+                "direction": "neutral",
+                "duration": "medium",
+                "recovery": "smooth",
+                "onset": "smooth",
+            }
+
         return {
             "effect_family": "unknown",
             "shape": "unknown",
@@ -432,6 +498,8 @@ class PhysicalInjector(ABC):
             return "up" if injection_config.get("direction", "upward") == "upward" else "down"
         if name == "step_change":
             return injection_config.get("direction", "up")
+        if name == "seasonality_injection":
+            return "neutral"
         return "neutral"
 
 
@@ -654,6 +722,51 @@ class TrendInjector(PhysicalInjector):
         return "trend_injection"
 
 
+class SeasonalityInjector(PhysicalInjector):
+    """周期性注入器。"""
+
+    def __init__(
+        self,
+        rng: np.random.RandomState,
+        amplitude_ratio_range: Tuple[float, float] = (0.08, 0.28),
+    ):
+        super().__init__(rng)
+        self.amplitude_ratio_range = amplitude_ratio_range
+
+    def inject(self, base_ts: np.ndarray, start_step: int, duration: int) -> Tuple[np.ndarray, np.ndarray, Dict]:
+        target_ts = base_ts.copy()
+        mask_gt = np.zeros(len(base_ts))
+        end_step = min(start_step + duration, len(base_ts))
+        region_len = end_step - start_step
+        region = np.asarray(base_ts[start_step:end_step], dtype=np.float64)
+        data_range = max(float(np.max(base_ts)) - float(np.min(base_ts)), 1e-6)
+
+        cycles = int(self.rng.choice([1, 2, 4]))
+        amplitude_ratio = float(self.rng.uniform(*self.amplitude_ratio_range))
+        amplitude = data_range * amplitude_ratio
+        phase = float(self.rng.uniform(0.0, 2.0 * np.pi))
+        u = np.linspace(0.0, 1.0, region_len)
+        envelope = np.sin(np.pi * u)
+        seasonal_wave = envelope * np.sin(2.0 * np.pi * cycles * u + phase)
+        target_ts[start_step:end_step] = region + amplitude * seasonal_wave
+        config = {
+            "injection_type": "seasonality_injection",
+            "cycles": cycles,
+            "phase": round(float(phase), 4),
+            "seasonal_amplitude": round(float(amplitude), 4),
+            "seasonal_amplitude_ratio": round(float(amplitude_ratio), 4),
+            "start_step": start_step,
+            "end_step": end_step - 1,
+            "duration": duration,
+        }
+
+        mask_gt[start_step:end_step] = 1
+        return target_ts, mask_gt, config
+
+    def get_name(self) -> str:
+        return "seasonality_injection"
+
+
 class StepChangeInjector(PhysicalInjector):
     def __init__(self, rng: np.random.RandomState, step_range: Tuple[float, float] = (0.3, 0.7)):
         super().__init__(rng)
@@ -713,6 +826,7 @@ class InjectorFactory:
         "hard_zero": HardZeroInjector,
         "noise_injection": NoiseInjector,
         "trend_injection": TrendInjector,
+        "seasonality_injection": SeasonalityInjector,
         "step_change": StepChangeInjector,
     }
     
@@ -802,7 +916,11 @@ class EventDrivenPromptGenerator:
 
 【示例 4】
 输入：领域=某系统关键指标, 线索=读数杂乱跳变, 时间=在今日运行中段
-输出：请注意，在今日运行中段，相关读数会出现杂乱跳变，建议尽快核查现场情况。""",
+输出：请注意，在今日运行中段，相关读数会出现杂乱跳变，建议尽快核查现场情况。
+
+【示例 5】
+输入：领域=某系统关键指标, 线索=周期起伏突然更明显, 时间=在夜间低谷期前
+输出：请注意，在夜间低谷期前，相关运行节律会变得更明显，峰谷起伏将持续一阵。""",
 
         2: """
 【示例 1】
@@ -819,7 +937,11 @@ class EventDrivenPromptGenerator:
 
 【示例 4】
 输入：领域=某公共系统, 线索=读数杂乱跳变, 时间=从今天中午开始
-输出：监测部门通报，从今天中午开始，相关监测信号持续异常，输出表现出明显的杂乱跳变。""",
+输出：监测部门通报，从今天中午开始，相关监测信号持续异常，输出表现出明显的杂乱跳变。
+
+【示例 5】
+输入：领域=某公共系统, 线索=周期节律被压平, 时间=预计在今晚深夜
+输出：最新通报，预计在今晚深夜，相关系统原本清晰的峰谷节律会被压平，重复起伏不再像平时那样明显。""",
 
         3: """
 【示例 1】
@@ -836,13 +958,17 @@ class EventDrivenPromptGenerator:
 
 【示例 4】
 输入：领域=某公共系统, 线索=突然切换到另一种状态并维持, 时间=刚才
-输出：刚才那边像是突然换了个运行方式，后面一段时间都没再回到原来的样子。"""
+输出：刚才那边像是突然换了个运行方式，后面一段时间都没再回到原来的样子。
+
+【示例 5】
+输入：领域=某公共系统, 线索=周期起伏更明显, 时间=就快到半夜的时候
+输出：就快到半夜的时候那边一阵一阵的规律感突然特别明显，像是峰谷都被拉开了。"""
     }
     
     ROLE_DESCRIPTIONS = {
-        1: "你是一线调度员。请下达明确的定性业务指令。必须包含时间提示，并保留一个可推断的变化线索，例如持续抬升、短时冲高后回落、突然切换、杂乱跳变、跌至极低水平。禁止阿拉伯数字、倍数或百分比。",
-        2: "你是客观的新闻发言人。必须包含正式的新闻时间副词。只客观播报现实事件和运行状态，不要直接说'数据上升下降'，但必须保留一个可推断的动态锚点，例如短时冲高后恢复、持续承压、信号杂乱跳变、服务能力降到极低水平。",
-        3: "你是社交媒体上的普通市民或现场路人。使用口语化时间词。可以非常生活化，但不能只说'异常'或'不对劲'；至少要留下一个弱语义线索，让人能推断是持续抬升、突然切换、杂乱跳变、短时冲高或明显停摆。"
+        1: "你是一线调度员。请下达明确的定性业务指令。必须包含时间提示，并保留一个可推断的变化线索，例如持续抬升、短时冲高后回落、突然切换、杂乱跳变、周期起伏更明显、跌至极低水平。禁止阿拉伯数字、倍数或百分比。",
+        2: "你是客观的新闻发言人。必须包含正式的新闻时间副词。只客观播报现实事件和运行状态，不要直接说'数据上升下降'，但必须保留一个可推断的动态锚点，例如短时冲高后恢复、持续承压、信号杂乱跳变、周期节律增强或被压平、服务能力降到极低水平。",
+        3: "你是社交媒体上的普通市民或现场路人。使用口语化时间词。可以非常生活化，但不能只说'异常'或'不对劲'；至少要留下一个弱语义线索，让人能推断是持续抬升、突然切换、杂乱跳变、周期起伏变强/变弱、短时冲高或明显停摆。"
     }
 
     DOMAIN_RULES = {
@@ -870,6 +996,7 @@ class EventDrivenPromptGenerator:
             "noise_injection": "让相关监测信号持续失真并无规律波动",
             "trend_injection_up": "先把相关状态推到偏高位置，随后再慢慢恢复",
             "trend_injection_down": "先把相关状态压到偏低位置，随后再慢慢恢复",
+            "seasonality_injection": "让相关节律性起伏更明显，峰谷重复模式更清晰",
             "step_change_up": "让系统切到更高位的运行状态并维持一段时间",
             "step_change_down": "让系统切到更低位或更受限的运行状态并维持一段时间",
         },
@@ -879,6 +1006,7 @@ class EventDrivenPromptGenerator:
             "noise_injection": "让监测信号持续失真并出现无规律跳变",
             "trend_injection_up": "先把负荷压力推到偏高状态，随后再慢慢恢复",
             "trend_injection_down": "先把运行水平压到偏低状态，随后再慢慢回稳",
+            "seasonality_injection": "让负荷峰谷节律更清晰、周期起伏更明显",
             "step_change_up": "让系统切到更高负荷档位并维持一段时间",
             "step_change_down": "让系统切到更低负荷档位并维持一段时间",
         },
@@ -888,6 +1016,7 @@ class EventDrivenPromptGenerator:
             "noise_injection": "让监测信号持续失真并忽高忽低",
             "trend_injection_up": "先把通行压力推高，随后再慢慢缓解",
             "trend_injection_down": "先把通行水平压低，随后再慢慢恢复",
+            "seasonality_injection": "让通勤型峰谷更明显，重复起伏更强",
             "step_change_up": "让路段切到更高通行状态并维持一段时间",
             "step_change_down": "让路段切到更受限或更低位的通行状态并维持一段时间",
         },
@@ -896,7 +1025,7 @@ class EventDrivenPromptGenerator:
     DIRECTIONAL_ANCHOR_KEYWORDS = {
         "up": ["偏高", "承压", "冲高", "推高", "更高位", "更高负荷", "更高通行", "抬高", "高位", "持续高位", "维持高位"],
         "down": ["极低", "低位", "受限", "压低", "更低位", "更低负荷", "更低通行", "停摆", "中断"],
-        "neutral": ["跳变", "紊乱", "失真", "无规律", "忽高忽低"],
+        "neutral": ["跳变", "紊乱", "失真", "无规律", "忽高忽低", "周期", "节律", "峰谷", "起伏"],
     }
     
     def __init__(self, api_key: str, base_url: str = "https://api.deepseek.com", model_name: str = "deepseek-chat"):
@@ -1088,7 +1217,7 @@ class EventDrivenPromptGenerator:
                 if kw in text:
                     return False, f"太直接了！不要用'{kw}'来暗示变化，请只描述导致这个变化的现实场景。"
 
-        weak_signal_words = ['持续', '回落', '恢复', '维持', '切换', '跳变', '停摆', '低位', '承压', '冲高', '紊乱']
+        weak_signal_words = ['持续', '回落', '恢复', '维持', '切换', '跳变', '停摆', '低位', '承压', '冲高', '紊乱', '周期', '节律', '峰谷', '起伏']
         if not any(word in text for word in weak_signal_words):
             return False, "表达过于空泛，必须保留至少一个可推断的弱语义锚点。"
 
@@ -1112,6 +1241,7 @@ class EventDrivenPromptGenerator:
             "noise_injection": "读数变得杂乱无章，呈现持续跳变",
             "trend_injection": "先偏离常态后再回到稳定状态",
             "step_change": "突然切换到新的状态，并维持一段时间",
+            "seasonality_injection": "周期起伏突然更明显，或者原有峰谷被压平一阵",
         }
         return weak_signals.get(injection_type, "出现可辨认但间接的运行变化")
 
@@ -1126,6 +1256,8 @@ class EventDrivenPromptGenerator:
             return "up" if config.get("direction", "upward") == "upward" else "down"
         if injection_type == "step_change":
             return config.get("direction", "up")
+        if injection_type == "seasonality_injection":
+            return "neutral"
         return "neutral"
 
     def _get_directional_impact_hint(self, injection_type: str, config: Dict, domain_key: str) -> str:
@@ -1167,6 +1299,10 @@ class EventDrivenPromptGenerator:
             "step_change": (
                 f"数值瞬间{'抬升' if config.get('direction', 'up') == 'up' else '跌落'}"
                 f" {abs(config.get('magnitude', 0)):.2f} 单位并持续运行，末期渐缓恢复"
+            ),
+            "seasonality_injection": (
+                f"局部窗口中出现更明显的规律性周期起伏，"
+                f"循环数约 {config.get('cycles', 0)} 个"
             ),
         }
         return descriptions.get(injection_type, "未知变化")
@@ -1565,6 +1701,25 @@ class EventDrivenTestSetBuilder:
                 f"（放大 {t_std/max(b_std,1e-8):.2f}×，区间已失去原信号规律）"
             )
 
+        elif inj == 'seasonality_injection':
+            cycles = int(cfg.get('cycles', 1))
+            phase = float(cfg.get('phase', 0.0))
+            amplitude = float(cfg.get('seasonal_amplitude', 0.0))
+            amplitude_ratio = float(cfg.get('seasonal_amplitude_ratio', 0.0))
+            lines.append("  变化类型 : 局部周期残差注入")
+            lines.append(
+                f"  周期参数 : 区间内固定 {cycles} 个循环  初相位={phase:.2f}"
+            )
+            lines.append(
+                f"  周期幅度 : {amplitude:+.4f}"
+                f"（约为全序列范围的 {amplitude_ratio * 100:.1f}%）"
+            )
+            lines.append(
+                f"  注入后   : 均值={t_mean:.4f}（Δ={delta_mean:+.4f}）"
+                f"  标准差={t_std:.4f}（原始 {b_std:.4f}）"
+            )
+            lines.append("  边界特性 : 首尾由平滑包络压到接近 0，避免编辑区边界跳变")
+
         elif inj == 'step_change':
             mag      = cfg.get('magnitude', 0.0)
             ramp_out = cfg.get('ramp_out', 0)
@@ -1610,6 +1765,7 @@ class EventDrivenTestSetBuilder:
             'hard_zero':       '底值归零  (HardZeroInjector)',
             'noise_injection':  '杂波替换  (NoiseInjector)',
             'trend_injection':  '钟形脉冲  (TrendInjector)',
+            'seasonality_injection': '周期调制  (SeasonalityInjector)',
             'step_change':     '阶跃切换  (StepChangeInjector)',
         }
 
@@ -1663,7 +1819,7 @@ class EventDrivenTestSetBuilder:
 
             # ── 注入类型说明 ──────────────────────────────────────────
             f.write(SEP2)
-            f.write("注入类型说明（5 种物理变化）\n")
+            f.write("注入类型说明（6 种物理变化）\n")
             f.write(SEP2)
             f.write("  multiplier     乘法放大  : 区间内信号整体乘以随机倍数（2~4×），\n")
             f.write("                             起点硬跳，末端渐退\n")
@@ -1673,6 +1829,8 @@ class EventDrivenTestSetBuilder:
             f.write("                             均值近数据底部，标准差为原std的1.5~3×\n")
             f.write("  trend_injection 钟形脉冲 : 区间内叠加升余弦钟形偏移（上升或下降），\n")
             f.write("                             两端完全光滑，无任何硬边界\n")
+            f.write("  seasonality_injection 周期调制 : 区间内增强或削弱重复起伏，\n")
+            f.write("                             保持局部周期语义，支持峰谷放大与压平\n")
             f.write("  step_change    阶跃切换  : 区间起点硬跳变，主体持续偏移，\n")
             f.write("                             末端1/3区间渐进恢复\n\n")
 

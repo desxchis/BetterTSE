@@ -98,6 +98,15 @@ class _FallbackInjector:
                 "recovery": "none",
                 "onset": "abrupt",
             }
+        if self.injection_type == "seasonality_injection":
+            return {
+                "effect_family": "seasonality",
+                "shape": "periodic",
+                "direction": "neutral",
+                "duration": "medium",
+                "recovery": "smooth",
+                "onset": "smooth",
+            }
         return {
             "effect_family": "unknown",
             "shape": "unknown",
@@ -142,6 +151,7 @@ def _ensure_region_fields(sample_payload: Dict[str, Any], start_step: int, end_s
 
 DEFAULT_INJECTION_TYPES = [
     "trend_injection",
+    "seasonality_injection",
     "step_change",
     "multiplier",
     "hard_zero",
@@ -178,6 +188,11 @@ STRENGTH_PARAMETER_SPECS = {
         "medium": {"amplitude_ratio": 0.24},
         "strong": {"amplitude_ratio": 0.36},
     },
+    "seasonality_injection": {
+        "weak": {"seasonal_amplitude_ratio": 0.08},
+        "medium": {"seasonal_amplitude_ratio": 0.16},
+        "strong": {"seasonal_amplitude_ratio": 0.28},
+    },
     "step_change": {
         "weak": {"magnitude_ratio": 0.18},
         "medium": {"magnitude_ratio": 0.36},
@@ -207,12 +222,13 @@ HARD_ZERO_MAX_RESAMPLE_ATTEMPTS = 256
 TASK_NAME_TO_ID = {
     "trend_up": 0,
     "trend_down": 1,
-    "step_up": 2,
-    "step_down": 3,
-    "multiplier": 4,
-    "hard_zero": 5,
-    "noise_injection": 6,
-    "mixed_neutral": 7,
+    "seasonality_neutral": 2,
+    "step_up": 3,
+    "step_down": 4,
+    "multiplier": 5,
+    "hard_zero": 6,
+    "noise_injection": 7,
+    "mixed_neutral": 8,
 }
 
 FAMILY_SEMANTIC_RULES = {
@@ -231,6 +247,10 @@ FAMILY_SEMANTIC_RULES = {
             "downward": "step_down",
             "neutral": "step_up",
         },
+    },
+    "seasonality_injection": {
+        "attr_strategy": "native",
+        "task_name": "seasonality_neutral",
     },
     "multiplier": {
         "attr_strategy": "neutral",
@@ -253,6 +273,7 @@ STEP_CHANGE_PROXY_MAP = {
 
 FAMILY_TAG_TEMPLATES = {
     "trend_injection": "trend_proxy_{direction}",
+    "seasonality_injection": "seasonality_{attr_strategy}_{direction}",
     "step_change": "step_{attr_strategy}_{direction}",
     "multiplier": "multiplier_neutral",
     "hard_zero": "hard_zero_neutral",
@@ -261,6 +282,7 @@ FAMILY_TAG_TEMPLATES = {
 
 INSTRUCTION_TEMPLATES = {
     "trend_injection": "请把{feature_desc}在一个{duration_bucket}窗口里做{strength_zh}的trend/hump局部变化，保持显式趋势方向为{direction_label}，只改那一段，非编辑区尽量保持不变。",
+    "seasonality_injection": "请把{feature_desc}在一个{duration_bucket}窗口里{seasonality_prompt}，只改那一段，非编辑区尽量保持不变。",
     "step_change": "请把{feature_desc}在一个{duration_bucket}窗口里做{strength_zh}的step/level局部变化，保持显式台阶方向为{direction_label}，只改那一段，非编辑区尽量保持不变。",
     "multiplier": "请把{feature_desc}在一个{duration_bucket}窗口里做{strength_zh}的乘性放大（multiplier）局部变化，明确体现按倍数抬升的语义，只改那一段，非编辑区尽量保持不变。",
     "hard_zero": "请把{feature_desc}在一个{duration_bucket}窗口里做{strength_zh}的归零/贴地（hard zero, flatline）局部变化，明确体现关停贴地语义，只改那一段，非编辑区尽量保持不变。",
@@ -326,6 +348,11 @@ def _prompt_text(
         effect_family=effect_family,
         shape=shape,
         direction_label=_normalize_direction(direction),
+        seasonality_prompt={
+            "weak": "加入轻微的规律性周期起伏",
+            "medium": "加入中等强度的周期性波动",
+            "strong": "加入明显的周期性起伏",
+        }[strength_text],
     )
 
 
@@ -489,6 +516,40 @@ def _build_trend_target(base_ts: np.ndarray, start_step: int, duration: int, amp
     }
 
 
+def _build_seasonality_target(
+    base_ts: np.ndarray,
+    start_step: int,
+    duration: int,
+    cycles: int,
+    phase: float,
+    seasonal_amplitude_ratio: float,
+) -> tuple[np.ndarray, np.ndarray, Dict[str, Any]]:
+    target_ts = base_ts.copy()
+    mask_gt = np.zeros(len(base_ts), dtype=np.int64)
+    end_step = min(start_step + duration, len(base_ts))
+    region_len = end_step - start_step
+    base_region = np.asarray(base_ts[start_step:end_step], dtype=np.float64)
+    data_range = max(float(np.max(base_ts)) - float(np.min(base_ts)), 1e-6)
+    amplitude = data_range * float(seasonal_amplitude_ratio)
+    u = np.linspace(0.0, 1.0, region_len)
+    envelope = np.sin(np.pi * u)
+    seasonal_wave = envelope * np.sin(2.0 * np.pi * int(cycles) * u + float(phase))
+    target_ts[start_step:end_step] = base_region + amplitude * seasonal_wave
+    config = {
+        "injection_type": "seasonality_injection",
+        "cycles": int(cycles),
+        "phase": float(phase),
+        "seasonal_amplitude": float(amplitude),
+        "seasonal_amplitude_ratio": float(seasonal_amplitude_ratio),
+        "start_step": int(start_step),
+        "end_step": int(end_step),
+        "duration": int(duration),
+    }
+
+    mask_gt[start_step:end_step] = 1
+    return target_ts, mask_gt, config
+
+
 def _build_step_target(base_ts: np.ndarray, start_step: int, duration: int, magnitude_ratio: float, direction: str) -> tuple[np.ndarray, np.ndarray, Dict[str, Any]]:
     target_ts = base_ts.copy()
     mask_gt = np.zeros(len(base_ts), dtype=np.int64)
@@ -547,6 +608,15 @@ def _build_family_variant(
             amplitude_ratio=spec["amplitude_ratio"],
             direction=str(shared_state["direction"]),
         )
+    if injection_type == "seasonality_injection":
+        return _build_seasonality_target(
+            base_ts,
+            start_step,
+            duration,
+            cycles=int(shared_state["cycles"]),
+            phase=float(shared_state["phase"]),
+            seasonal_amplitude_ratio=float(spec["seasonal_amplitude_ratio"]),
+        )
     if injection_type == "step_change":
         return _build_step_target(
             base_ts,
@@ -595,6 +665,9 @@ def build_discrete_benchmark(
             shared_state: Dict[str, Any] = {}
             if injection_type == "trend_injection":
                 shared_state["direction"] = str(rng.choice(["upward", "downward"]))
+            elif injection_type == "seasonality_injection":
+                shared_state["cycles"] = int(rng.choice([1, 2, 4]))
+                shared_state["phase"] = float(rng.uniform(0.0, 2.0 * np.pi))
             elif injection_type == "step_change":
                 shared_state["direction"] = str(rng.choice(["upward", "downward"]))
             elif injection_type == "noise_injection":
@@ -602,7 +675,7 @@ def build_discrete_benchmark(
                 shared_state["family_noise"] = rng.normal(loc=0.0, scale=1.0, size=duration)
                 shared_state["noise_subtype"] = str(rng.choice(["uniform_variance", "local_burst"]))
 
-            injector = injector_factory.create_injector(injection_type)
+            injector = None if injection_type == "seasonality_injection" else injector_factory.create_injector(injection_type)
             feature_desc = data_loader.feature_descriptions.get(feature, injector_factory.get_feature_description(feature))
 
             family_samples = []
@@ -615,7 +688,18 @@ def build_discrete_benchmark(
                     duration=duration,
                     shared_state=shared_state,
                 )
-                intent = injector.get_edit_intent(injection_config)
+                if injection_type == "seasonality_injection":
+                    intent = {
+                        "effect_family": "seasonality",
+                        "shape": "periodic",
+                        "direction": "neutral",
+                        "duration": duration_bucket,
+                        "strength": strength_text,
+                        "recovery": "smooth",
+                        "onset": "smooth",
+                    }
+                else:
+                    intent = injector.get_edit_intent(injection_config)
                 normalized_direction = _normalize_direction(intent.get("direction", "neutral"))
                 attr_strategy = _resolve_attr_strategy(injection_type, normalized_direction)
                 family_semantic_tag = _family_semantic_tag(injection_type, normalized_direction, attr_strategy)
@@ -739,7 +823,7 @@ def build_discrete_benchmark(
         "## Strength Families",
         "",
         "- each family fixes source/tool/region/shape template and varies only weak/medium/strong",
-        "- non-trend families keep neutral attrs and rely on explicit instruction_text, with task_id available as a gated auxiliary channel",
+        "- non-trend/non-seasonality families keep neutral attrs and rely on explicit instruction_text, with task_id available as a gated auxiliary channel",
     ]
     summary_path.write_text("\n".join(summary_lines) + "\n", encoding="utf-8")
     return {

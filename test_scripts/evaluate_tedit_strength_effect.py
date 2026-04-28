@@ -51,11 +51,72 @@ def _load_wrapper_config(config_path: str) -> dict[str, Any]:
     raise ValueError(f"Unsupported TEdit wrapper config structure: {config_file}")
 
 
+def _apply_final_mapping_overrides(
+    wrapper_config: dict[str, Any],
+    *,
+    scalar_transform_scale: float | None = None,
+    scalar_transform_offset: float | None = None,
+    scalar_transform_name: str | None = None,
+    scalar_prior_scale: float | None = None,
+    gain_order_direction: str | None = None,
+    scope: str | None = None,
+) -> dict[str, Any]:
+    diffusion_cfg = wrapper_config.setdefault("diffusion", {})
+    strength_cfg = diffusion_cfg.setdefault("strength_control", {})
+    mapping_cfg = strength_cfg.setdefault("final_output_strength_mapping", {})
+    if scalar_prior_scale is not None:
+        mapping_cfg["scalar_prior_scale"] = float(scalar_prior_scale)
+    if gain_order_direction:
+        mapping_cfg["gain_order_direction"] = str(gain_order_direction)
+    if scope:
+        mapping_cfg["scope"] = str(scope)
+    if scalar_transform_scale is not None or scalar_transform_offset is not None or scalar_transform_name:
+        transform_cfg = mapping_cfg.setdefault("scalar_transform", {})
+        transform_cfg["enabled"] = True
+        if scalar_transform_scale is not None:
+            transform_cfg["scale"] = float(scalar_transform_scale)
+        if scalar_transform_offset is not None:
+            transform_cfg["offset"] = float(scalar_transform_offset)
+        if scalar_transform_name:
+            transform_cfg["name"] = str(scalar_transform_name)
+    return wrapper_config
+
+
 DEFAULT_STRENGTH_CONTROLS = [
     {"strength_label": 0, "strength_scalar": 0.0, "strength_text": "weak"},
     {"strength_label": 1, "strength_scalar": 0.5, "strength_text": "medium"},
     {"strength_label": 2, "strength_scalar": 1.0, "strength_text": "strong"},
 ]
+LEGACY_STRENGTH_CONTROLS = [
+    {"strength_label": 0, "strength_scalar": 0.0, "strength_text": "weak"},
+    {"strength_label": 1, "strength_scalar": 1.0, "strength_text": "medium"},
+    {"strength_label": 2, "strength_scalar": 2.0, "strength_text": "strong"},
+]
+
+
+def _resolve_strength_controls_from_meta(meta: dict[str, Any] | None) -> tuple[list[dict[str, Any]], str]:
+    if not isinstance(meta, dict):
+        return list(DEFAULT_STRENGTH_CONTROLS), "default_0_0p5_1"
+    scalar_scheme = str(meta.get("scalar_scheme", "")).strip() or "default_0_0p5_1"
+    strength_axis = meta.get("strength_axis")
+    if isinstance(strength_axis, dict):
+        anchor_mapping = strength_axis.get("anchor_mapping")
+        if isinstance(anchor_mapping, dict):
+            controls = []
+            for label, strength_text in enumerate(["weak", "medium", "strong"]):
+                if strength_text in anchor_mapping:
+                    controls.append(
+                        {
+                            "strength_label": label,
+                            "strength_scalar": float(anchor_mapping[strength_text]),
+                            "strength_text": strength_text,
+                        }
+                    )
+            if len(controls) == 3:
+                return controls, scalar_scheme
+    if scalar_scheme == "legacy_0_1_2":
+        return list(LEGACY_STRENGTH_CONTROLS), scalar_scheme
+    return list(DEFAULT_STRENGTH_CONTROLS), scalar_scheme
 
 
 def resolve_dataset_folder(dataset_folder: str, selector: str | None = None) -> str:
@@ -75,6 +136,8 @@ def _load_eval_records(dataset_folder: str, split: str, max_samples: int) -> tup
     root = Path(dataset_folder)
     meta_path = root / "meta.json"
     if meta_path.exists():
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        default_controls, scalar_scheme = _resolve_strength_controls_from_meta(meta)
         from data.discrete_strength_family import DiscreteStrengthFamilyDataset
 
         dataset = DiscreteStrengthFamilyDataset(str(root))
@@ -109,6 +172,7 @@ def _load_eval_records(dataset_folder: str, split: str, max_samples: int) -> tup
                     "family_semantic_tag": str(per_strength[0].get("family_semantic_tag", "unknown")),
                     "duration_bucket": str(per_strength[0].get("duration_bucket", family.get("duration_bucket", "unknown"))),
                     "task_id": per_strength[0].get("task_id"),
+                    "scalar_scheme": scalar_scheme,
                     "region_start": region_start,
                     "region_end": region_end,
                     "region_len": None if region_start is None or region_end is None else int(region_end - region_start),
@@ -145,6 +209,7 @@ def _load_eval_records(dataset_folder: str, split: str, max_samples: int) -> tup
         records.append(
             {
                 "sample_idx": int(idx),
+                "scalar_scheme": "default_0_0p5_1",
                 "base": split_ds.ts[idx, 0].astype(np.float32),
                 "src_attrs": split_ds.attrs[idx, 0].astype(np.int64),
                 "tgt_attrs": split_ds.attrs[idx, 1].astype(np.int64),
@@ -263,8 +328,64 @@ def _gap_sequence(values: list[float | None]) -> list[float | None]:
     return gaps
 
 
+def _collapse_indicator(gap_a: float | None, gap_b: float | None, tol: float = 1.0e-6) -> float | None:
+    valid = [float(gap) for gap in (gap_a, gap_b) if gap is not None]
+    if not valid:
+        return None
+    return float(min(valid) <= tol)
+
+
+def _gap_balance_ratio(gap_a: float | None, gap_b: float | None, tol: float = 1.0e-6) -> float | None:
+    if gap_a is None or gap_b is None:
+        return None
+    denom = max(abs(float(gap_a)), abs(float(gap_b)), tol)
+    return float(min(abs(float(gap_a)), abs(float(gap_b))) / denom)
+
+
 def _none_or_float(value: float | None) -> float | None:
     return None if value is None else float(value)
+
+
+def _canonical_local_path_metadata(
+    *,
+    generation_route: str,
+    eval_mask_routed: bool,
+    condition_mode: str,
+    final_mapping_scope: str,
+    final_mapping_overrides: dict[str, Any],
+) -> dict[str, Any]:
+    if generation_route == "standard":
+        route_statement = "edit_time_series + edit_mask + final_output_strength_mapping.scope=edit_region"
+        generation_route_label = "standard_edit_time_series"
+        acceptance_route = "local_path_mask_routed" if eval_mask_routed and final_mapping_scope == "edit_region" else None
+        local_path_route_active = bool(eval_mask_routed and final_mapping_scope == "edit_region")
+        local_path_route_exclusions = [
+            "edit_region_soft latent blending",
+            "unmasked global standard route",
+        ]
+    elif generation_route == "soft_region":
+        route_statement = "edit_region_soft + soft local mask + latent blending"
+        generation_route_label = "soft_local_edit_region"
+        acceptance_route = "local_path_soft_mask" if final_mapping_scope == "edit_region" else None
+        local_path_route_active = True
+        local_path_route_exclusions = [
+            "edit_time_series + edit_mask output blend",
+            "unmasked global standard route",
+        ]
+    else:
+        raise ValueError(f"Unsupported generation_route={generation_route}")
+    return {
+        "route_statement": route_statement,
+        "generation_route": str(generation_route),
+        "generation_route_label": generation_route_label,
+        "acceptance_route": acceptance_route,
+        "eval_mask_routed": bool(eval_mask_routed),
+        "local_path_route_active": local_path_route_active,
+        "local_path_route_exclusions": local_path_route_exclusions,
+        "strength_label_mode": "semantic_weak_medium_strong",
+        "condition_mode": str(condition_mode),
+        "final_mapping_overrides": final_mapping_overrides,
+    }
 
 
 def _aggregate_mean(values: list[float | None]) -> float | None:
@@ -378,11 +499,28 @@ def main() -> None:
     parser.add_argument("--condition-mode", default="both", choices=["both", "label_only", "text_only"], help="ablate whether strength comes from numeric label, text, or both")
     parser.add_argument("--enable-strength-diagnostics", type=int, default=1)
     parser.add_argument("--selector", default="")
+    parser.add_argument("--final-mapping-scalar-transform-scale", type=float, default=None)
+    parser.add_argument("--final-mapping-scalar-transform-offset", type=float, default=None)
+    parser.add_argument("--final-mapping-scalar-transform-name", default="")
+    parser.add_argument("--final-mapping-scalar-prior-scale", type=float, default=None)
+    parser.add_argument("--final-mapping-gain-order-direction", default="", choices=["", "increasing", "decreasing"])
+    parser.add_argument("--final-mapping-scope", default="", choices=["", "global", "edit_region"])
+    parser.add_argument("--generation-route", default="soft_region", choices=["soft_region", "standard"])
+    parser.add_argument("--eval-mask-routed", type=int, default=0, choices=[0, 1])
     parser.add_argument("--output", required=True)
     args = parser.parse_args()
 
     runtime_config_path = _resolve_runtime_config_path(args.model_path, args.config_path)
     wrapper_config = _load_wrapper_config(runtime_config_path)
+    wrapper_config = _apply_final_mapping_overrides(
+        wrapper_config,
+        scalar_transform_scale=args.final_mapping_scalar_transform_scale,
+        scalar_transform_offset=args.final_mapping_scalar_transform_offset,
+        scalar_transform_name=args.final_mapping_scalar_transform_name.strip() or None,
+        scalar_prior_scale=args.final_mapping_scalar_prior_scale,
+        gain_order_direction=args.final_mapping_gain_order_direction.strip() or None,
+        scope=args.final_mapping_scope.strip() or None,
+    )
     resolved_dataset_folder = resolve_dataset_folder(args.dataset_folder, args.selector.strip() or None)
     eval_records, attr_list = _load_eval_records(resolved_dataset_folder, args.split, args.max_samples)
     if not eval_records:
@@ -392,6 +530,7 @@ def main() -> None:
     wrapper_config_path = Path(args.output).resolve().parent / "_wrapper_model_config.yaml"
     wrapper_config_path.write_text(yaml.safe_dump(wrapper_config, allow_unicode=True, sort_keys=False), encoding="utf-8")
     wrapper.load_model(model_path=args.model_path, config_path=str(wrapper_config_path))
+    wrapper.set_edit_steps(args.edit_steps)
 
     strength_rows: dict[str, list[dict[str, Any]]] = {}
     pairwise_rows: list[dict[str, Any]] = []
@@ -404,6 +543,7 @@ def main() -> None:
         tgt_attrs = np.asarray(record["tgt_attrs"], dtype=np.int64)
         edit_mask = np.asarray(record["edit_mask"], dtype=bool)
         family_id = str(record.get("family_id", sample_idx))
+        scalar_scheme = str(record.get("scalar_scheme", "default_0_0p5_1"))
         tool_name = str(record.get("tool_name", "unknown"))
         family_semantic_tag = str(record.get("family_semantic_tag", "unknown"))
         duration_bucket = str(record.get("duration_bucket", "unknown"))
@@ -416,6 +556,13 @@ def main() -> None:
         if not np.any(edit_mask):
             strongest_target = np.asarray(controls[-1]["target"], dtype=np.float32)
             edit_mask = np.abs(strongest_target - base) > float(args.mask_threshold)
+        if region_start is None or region_end is None:
+            edit_indices = np.flatnonzero(edit_mask)
+            if edit_indices.size <= 0:
+                raise ValueError(f"Evaluation record {sample_idx} does not contain a valid local edit region.")
+            region_start = int(edit_indices[0])
+            region_end = int(edit_indices[-1] + 1)
+            region_len = int(region_end - region_start)
 
         controls = sorted(controls, key=lambda row: float(row["strength_scalar"]))
         if not controls:
@@ -451,24 +598,41 @@ def main() -> None:
         torch.manual_seed(args.seed + eval_idx)
         np.random.seed(args.seed + eval_idx)
         try:
-            edited_batch, diagnostics = wrapper.edit_time_series(
-                ts=np.repeat(base.reshape(1, -1), batch_size, axis=0),
-                src_attrs=src_attrs,
-                tgt_attrs=tgt_attrs,
-                n_samples=1,
-                sampler="ddim",
-                edit_steps=args.edit_steps,
-                strength_label=run_strength_labels,
-                strength_scalar=run_strength_scalars,
-                task_id=None if args.task_id < 0 else [int(args.task_id)] * batch_size,
-                instruction_text=instruction_texts,
-                edit_mask=edit_mask.astype(np.float32),
-                return_diagnostics=True,
-                enable_strength_diagnostics=bool(args.enable_strength_diagnostics),
-            )
+            if args.generation_route == "standard":
+                edited_batch, diagnostics = wrapper.edit_time_series(
+                    ts=np.repeat(base.reshape(1, -1), batch_size, axis=0),
+                    src_attrs=src_attrs,
+                    tgt_attrs=tgt_attrs,
+                    n_samples=1,
+                    sampler="ddim",
+                    edit_steps=args.edit_steps,
+                    strength_label=run_strength_labels,
+                    strength_scalar=run_strength_scalars,
+                    task_id=None if args.task_id < 0 else [int(args.task_id)] * batch_size,
+                    instruction_text=instruction_texts,
+                    edit_mask=edit_mask.astype(np.float32) if bool(args.eval_mask_routed) else None,
+                    return_diagnostics=True,
+                    enable_strength_diagnostics=bool(args.enable_strength_diagnostics),
+                )
+            else:
+                edited_batch, diagnostics = wrapper.edit_region_soft(
+                    ts=np.repeat(base.reshape(1, -1), batch_size, axis=0),
+                    start_idx=int(region_start),
+                    end_idx=int(region_end),
+                    src_attrs=src_attrs,
+                    tgt_attrs=tgt_attrs,
+                    n_samples=1,
+                    sampler="ddim",
+                    strength_label=run_strength_labels,
+                    strength_scalar=run_strength_scalars,
+                    task_id=None if args.task_id < 0 else [int(args.task_id)] * batch_size,
+                    instruction_text=instruction_texts,
+                    return_diagnostics=True,
+                    enable_strength_diagnostics=bool(args.enable_strength_diagnostics),
+                )
         except Exception as exc:
             raise RuntimeError(
-                f"Strength eval failed at sample_idx={sample_idx}, eval_idx={eval_idx}, condition_mode={args.condition_mode}, model_path={args.model_path}, config_path={runtime_config_path}"
+                f"Strength eval failed at sample_idx={sample_idx}, eval_idx={eval_idx}, condition_mode={args.condition_mode}, generation_route={args.generation_route}, model_path={args.model_path}, config_path={runtime_config_path}"
             ) from exc
         model_diag = diagnostics["model"][0] if diagnostics.get("model") else {}
         raw_reverse_output = model_diag.get("raw_reverse_output")
@@ -493,6 +657,23 @@ def main() -> None:
         modulation_beta_pairwise = _aggregate_nested_numeric_dict(
             (diagnostics.get("modulation_base") or []) + (diagnostics.get("modulation_weaver") or []),
             ["delta_beta_pairwise_l2_by_scalar", "delta_beta_pairwise_l2"],
+        )
+        modulation_records = (diagnostics.get("modulation_base") or []) + (diagnostics.get("modulation_weaver") or [])
+        final_mapping_by_scalar = _aggregate_nested_metric_by_strength(
+            modulation_records,
+            ["final_output_strength_mapping_by_scalar"],
+        )
+        final_mapping_transformed_scalar_by_scalar = _aggregate_nested_metric_by_strength(
+            modulation_records,
+            ["final_output_strength_mapping_transformed_scalar_by_scalar"],
+        )
+        final_mapping_scalar_transform = next(
+            (
+                record.get("final_output_strength_mapping_scalar_transform")
+                for record in modulation_records
+                if isinstance(record, dict) and isinstance(record.get("final_output_strength_mapping_scalar_transform"), dict)
+            ),
+            None,
         )
 
         per_strength: dict[str, dict[str, Any]] = {}
@@ -528,6 +709,7 @@ def main() -> None:
                 "sample_idx": int(sample_idx),
                 "family_id": family_id,
                 "tool_name": tool_name,
+                "scalar_scheme": scalar_scheme,
                 "family_semantic_tag": family_semantic_tag,
                 "duration_bucket": duration_bucket,
                 "task_id": task_id,
@@ -566,6 +748,9 @@ def main() -> None:
                 "projector_mean_norm_by_scalar": projector_mean_norm_by_scalar,
                 "modulation_delta_gamma_pairwise_l2": modulation_gamma_pairwise,
                 "modulation_delta_beta_pairwise_l2": modulation_beta_pairwise,
+                "final_output_strength_mapping_by_scalar": final_mapping_by_scalar,
+                "final_output_strength_mapping_transformed_scalar_by_scalar": final_mapping_transformed_scalar_by_scalar,
+                "final_output_strength_mapping_scalar_transform": final_mapping_scalar_transform,
             }
             row["raw_final_gap_edit_region"] = _safe_diff(
                 row["raw_edit_region_mean_abs_delta"],
@@ -629,11 +814,20 @@ def main() -> None:
         local_std_gap_seq = _gap_sequence(pred_local_std_seq)
         local_energy_gap_seq = _gap_sequence(pred_local_energy_seq)
         local_roughness_gap_seq = _gap_sequence(pred_local_roughness_seq)
+        medium_minus_weak_edit_gain = None if len(edit_gains) < 2 or edit_gains[0] is None or edit_gains[1] is None else float(edit_gains[1] - edit_gains[0])
+        strong_minus_medium_edit_gain = None if len(edit_gains) < 3 or edit_gains[1] is None or edit_gains[2] is None else float(edit_gains[2] - edit_gains[1])
+        raw_medium_minus_weak = None if len(raw_gains) < 2 or raw_gains[0] is None or raw_gains[1] is None else float(raw_gains[1] - raw_gains[0])
+        raw_strong_minus_medium = None if len(raw_gains) < 3 or raw_gains[1] is None or raw_gains[2] is None else float(raw_gains[2] - raw_gains[1])
+        final_medium_minus_weak = None if len(final_gains) < 2 or final_gains[0] is None or final_gains[1] is None else float(final_gains[1] - final_gains[0])
+        final_strong_minus_medium = None if len(final_gains) < 3 or final_gains[1] is None or final_gains[2] is None else float(final_gains[2] - final_gains[1])
+        raw_min_adjacent_gap = None if len(raw_gains) < 2 else min(gap for gap in (raw_medium_minus_weak, raw_strong_minus_medium) if gap is not None)
+        final_min_adjacent_gap = None if len(final_gains) < 2 else min(gap for gap in (final_medium_minus_weak, final_strong_minus_medium) if gap is not None)
         pairwise_rows.append(
             {
                 "sample_idx": int(sample_idx),
                 "family_id": family_id,
                 "tool_name": tool_name,
+                "scalar_scheme": scalar_scheme,
                 "family_semantic_tag": family_semantic_tag,
                 "duration_bucket": duration_bucket,
                 "task_id": task_id,
@@ -650,6 +844,12 @@ def main() -> None:
                 "mid_strength_scalar": float(ordered_numeric_scalars[len(ordered_numeric_scalars) // 2]),
                 "max_strength_scalar": float(ordered_numeric_scalars[-1]),
                 "strength_scalar_seq": [float(value) for value in ordered_numeric_scalars],
+                "spacing_metrics_primary": True,
+                "local_path_default_definition": (
+                    "edit_time_series + edit_mask + final_output_strength_mapping.scope=edit_region"
+                    if args.generation_route == "standard"
+                    else "edit_region_soft + soft local mask + latent blending"
+                ),
                 "target_gain_by_strength": [_none_or_float(value) for value in target_gain_seq],
                 "pred_gain_by_strength": [_none_or_float(value) for value in pred_gain_seq],
                 "pred_minus_target_seq": [_none_or_float(value) for value in pred_minus_target_seq],
@@ -676,7 +876,27 @@ def main() -> None:
                 "min_final_edit_region_mean_abs_delta": final_gains[0],
                 "mid_final_edit_region_mean_abs_delta": final_gains[len(final_gains) // 2],
                 "max_final_edit_region_mean_abs_delta": final_gains[-1],
+                "weak_le_medium_pass": bool(len(edit_gains) >= 2 and edit_gains[0] is not None and edit_gains[1] is not None and edit_gains[1] > edit_gains[0]),
+                "medium_le_strong_pass": bool(len(edit_gains) >= 3 and edit_gains[1] is not None and edit_gains[2] is not None and edit_gains[2] > edit_gains[1]),
+                "medium_minus_weak_edit_gain": medium_minus_weak_edit_gain,
+                "strong_minus_medium_edit_gain": strong_minus_medium_edit_gain,
                 "strong_minus_weak_edit_gain": None if edit_gains[0] is None or edit_gains[-1] is None else float(edit_gains[-1] - edit_gains[0]),
+                "raw_weak_le_medium_pass": bool(len(raw_gains) >= 2 and raw_gains[0] is not None and raw_gains[1] is not None and raw_gains[1] > raw_gains[0]),
+                "raw_medium_le_strong_pass": bool(len(raw_gains) >= 3 and raw_gains[1] is not None and raw_gains[2] is not None and raw_gains[2] > raw_gains[1]),
+                "raw_medium_minus_weak": raw_medium_minus_weak,
+                "raw_strong_minus_medium": raw_strong_minus_medium,
+                "raw_strong_minus_weak": None if raw_gains[0] is None or raw_gains[-1] is None else float(raw_gains[-1] - raw_gains[0]),
+                "raw_min_adjacent_gap": raw_min_adjacent_gap,
+                "raw_gap_balance_ratio": _gap_balance_ratio(raw_medium_minus_weak, raw_strong_minus_medium),
+                "raw_adjacent_gap_collapse": _collapse_indicator(raw_medium_minus_weak, raw_strong_minus_medium),
+                "final_weak_le_medium_pass": bool(len(final_gains) >= 2 and final_gains[0] is not None and final_gains[1] is not None and final_gains[1] > final_gains[0]),
+                "final_medium_le_strong_pass": bool(len(final_gains) >= 3 and final_gains[1] is not None and final_gains[2] is not None and final_gains[2] > final_gains[1]),
+                "final_medium_minus_weak": final_medium_minus_weak,
+                "final_strong_minus_medium": final_strong_minus_medium,
+                "final_strong_minus_weak": None if final_gains[0] is None or final_gains[-1] is None else float(final_gains[-1] - final_gains[0]),
+                "final_min_adjacent_gap": final_min_adjacent_gap,
+                "final_gap_balance_ratio": _gap_balance_ratio(final_medium_minus_weak, final_strong_minus_medium),
+                "final_adjacent_gap_collapse": _collapse_indicator(final_medium_minus_weak, final_strong_minus_medium),
                 "local_std_strong_minus_weak": None if pred_local_std_seq[0] is None or pred_local_std_seq[-1] is None else float(pred_local_std_seq[-1] - pred_local_std_seq[0]),
                 "local_energy_strong_minus_weak": None if pred_local_energy_seq[0] is None or pred_local_energy_seq[-1] is None else float(pred_local_energy_seq[-1] - pred_local_energy_seq[0]),
                 "local_roughness_strong_minus_weak": None if pred_local_roughness_seq[0] is None or pred_local_roughness_seq[-1] is None else float(pred_local_roughness_seq[-1] - pred_local_roughness_seq[0]),
@@ -697,9 +917,47 @@ def main() -> None:
     for row in pairwise_rows:
         duration_bucket_rows.setdefault(str(row.get("duration_bucket", "unknown")), []).append(row)
 
+    final_mapping_overrides = {
+        "scalar_transform": {
+            "scale": None if args.final_mapping_scalar_transform_scale is None else float(args.final_mapping_scalar_transform_scale),
+            "offset": None if args.final_mapping_scalar_transform_offset is None else float(args.final_mapping_scalar_transform_offset),
+            "name": None if not args.final_mapping_scalar_transform_name.strip() else str(args.final_mapping_scalar_transform_name.strip()),
+        },
+        "scalar_prior_scale": None if args.final_mapping_scalar_prior_scale is None else float(args.final_mapping_scalar_prior_scale),
+        "gain_order_direction": None if not args.final_mapping_gain_order_direction.strip() else str(args.final_mapping_gain_order_direction.strip()),
+        "scope": None if not args.final_mapping_scope.strip() else str(args.final_mapping_scope.strip()),
+    }
+    route_metadata = _canonical_local_path_metadata(
+        generation_route=args.generation_route,
+        eval_mask_routed=bool(args.eval_mask_routed),
+        condition_mode=args.condition_mode,
+        final_mapping_scope=(args.final_mapping_scope.strip() or "edit_region"),
+        final_mapping_overrides={
+            "scalar_transform": {
+                "scale": None if args.final_mapping_scalar_transform_scale is None else float(args.final_mapping_scalar_transform_scale),
+                "offset": None if args.final_mapping_scalar_transform_offset is None else float(args.final_mapping_scalar_transform_offset),
+                "name": args.final_mapping_scalar_transform_name.strip() or None,
+            },
+            "scalar_prior_scale": None if args.final_mapping_scalar_prior_scale is None else float(args.final_mapping_scalar_prior_scale),
+            "gain_order_direction": args.final_mapping_gain_order_direction.strip() or None,
+            "scope": args.final_mapping_scope.strip() or "edit_region",
+        },
+    )
     summary = {
         "condition_mode": args.condition_mode,
         "n_samples": len(eval_records),
+        "scalar_scheme": str(eval_records[0].get("scalar_scheme", "default_0_0p5_1")) if eval_records else "default_0_0p5_1",
+        "route_statement": route_metadata["route_statement"],
+        "generation_route": route_metadata["generation_route"],
+        "generation_route_label": route_metadata["generation_route_label"],
+        "acceptance_route": route_metadata["acceptance_route"],
+        "eval_mask_routed": route_metadata["eval_mask_routed"],
+        "local_path_route_active": route_metadata["local_path_route_active"],
+        "local_path_route_exclusions": route_metadata["local_path_route_exclusions"],
+        "strength_label_mode": route_metadata["strength_label_mode"],
+        "final_mapping_overrides": route_metadata["final_mapping_overrides"],
+        "spacing_metrics_primary": True,
+        "local_path_default_definition": route_metadata["route_statement"],
         "strength_scalars": scalar_keys,
         "edit_gain_mean": {
             key: _aggregate_metric(strength_rows[key], "edit_gain")
@@ -777,13 +1035,55 @@ def main() -> None:
             [row for rows in strength_rows.values() for row in rows],
             ["modulation_delta_beta_pairwise_l2"],
         ),
+        "final_output_strength_mapping_by_scalar": _aggregate_nested_metric_by_strength(
+            [row for rows in strength_rows.values() for row in rows],
+            ["final_output_strength_mapping_by_scalar"],
+        ),
+        "final_output_strength_mapping_transformed_scalar_by_scalar": _aggregate_nested_metric_by_strength(
+            [row for rows in strength_rows.values() for row in rows],
+            ["final_output_strength_mapping_transformed_scalar_by_scalar"],
+        ),
+        "final_output_strength_mapping_scalar_transform": next(
+            (
+                row.get("final_output_strength_mapping_scalar_transform")
+                for rows in strength_rows.values()
+                for row in rows
+                if isinstance(row.get("final_output_strength_mapping_scalar_transform"), dict)
+            ),
+            None,
+        ),
         "monotonic_hit_rate": float(np.mean([float(row["monotonic_hit"]) for row in pairwise_rows])),
         "raw_monotonic_hit_rate": float(np.mean([float(row["raw_monotonic_hit"]) for row in pairwise_rows])),
         "final_monotonic_hit_rate": float(np.mean([float(row["final_monotonic_hit"]) for row in pairwise_rows])),
+        "spacing_metrics_primary": True,
+        "local_path_default_definition": route_metadata["route_statement"],
+        "generation_route_label": route_metadata["generation_route_label"],
+        "acceptance_route": route_metadata["acceptance_route"],
+        "local_path_route_active": route_metadata["local_path_route_active"],
+        "local_path_route_exclusions": route_metadata["local_path_route_exclusions"],
+        "final_mapping_overrides": route_metadata["final_mapping_overrides"],
+        "weak_le_medium_pass_rate": float(np.mean([float(row["weak_le_medium_pass"]) for row in pairwise_rows])),
+        "medium_le_strong_pass_rate": float(np.mean([float(row["medium_le_strong_pass"]) for row in pairwise_rows])),
+        "raw_weak_le_medium_pass_rate": float(np.mean([float(row["raw_weak_le_medium_pass"]) for row in pairwise_rows])),
+        "raw_medium_le_strong_pass_rate": float(np.mean([float(row["raw_medium_le_strong_pass"]) for row in pairwise_rows])),
+        "final_weak_le_medium_pass_rate": float(np.mean([float(row["final_weak_le_medium_pass"]) for row in pairwise_rows])),
+        "final_medium_le_strong_pass_rate": float(np.mean([float(row["final_medium_le_strong_pass"]) for row in pairwise_rows])),
         "attenuation_suspected_rate": float(np.mean([float(row["attenuation_suspected"]) for row in pairwise_rows])),
+        "medium_minus_weak_edit_gain_mean": _aggregate_mean([row["medium_minus_weak_edit_gain"] for row in pairwise_rows]),
+        "strong_minus_medium_edit_gain_mean": _aggregate_mean([row["strong_minus_medium_edit_gain"] for row in pairwise_rows]),
         "strong_minus_weak_edit_gain_mean": _aggregate_mean(
             [row["strong_minus_weak_edit_gain"] for row in pairwise_rows]
         ),
+        "raw_medium_minus_weak_mean": _aggregate_mean([row["raw_medium_minus_weak"] for row in pairwise_rows]),
+        "raw_strong_minus_medium_mean": _aggregate_mean([row["raw_strong_minus_medium"] for row in pairwise_rows]),
+        "raw_min_adjacent_gap_mean": _aggregate_mean([row["raw_min_adjacent_gap"] for row in pairwise_rows]),
+        "raw_gap_balance_ratio_mean": _aggregate_mean([row["raw_gap_balance_ratio"] for row in pairwise_rows]),
+        "raw_adjacent_gap_collapse_rate": float(np.mean([float(row["raw_adjacent_gap_collapse"]) for row in pairwise_rows])),
+        "final_medium_minus_weak_mean": _aggregate_mean([row["final_medium_minus_weak"] for row in pairwise_rows]),
+        "final_strong_minus_medium_mean": _aggregate_mean([row["final_strong_minus_medium"] for row in pairwise_rows]),
+        "final_min_adjacent_gap_mean": _aggregate_mean([row["final_min_adjacent_gap"] for row in pairwise_rows]),
+        "final_gap_balance_ratio_mean": _aggregate_mean([row["final_gap_balance_ratio"] for row in pairwise_rows]),
+        "final_adjacent_gap_collapse_rate": float(np.mean([float(row["final_adjacent_gap_collapse"]) for row in pairwise_rows])),
         "local_std_strong_minus_weak_mean": _aggregate_mean(
             [row["local_std_strong_minus_weak"] for row in pairwise_rows]
         ),
@@ -813,10 +1113,29 @@ def main() -> None:
         "duration_bucket_summary": {
             bucket: {
                 "n_samples": len(bucket_rows),
+                "spacing_metrics_primary": True,
                 "monotonic_hit_rate": float(np.mean([float(row["monotonic_hit"]) for row in bucket_rows])),
                 "raw_monotonic_hit_rate": float(np.mean([float(row["raw_monotonic_hit"]) for row in bucket_rows])),
                 "final_monotonic_hit_rate": float(np.mean([float(row["final_monotonic_hit"]) for row in bucket_rows])),
+                "weak_le_medium_pass_rate": float(np.mean([float(row["weak_le_medium_pass"]) for row in bucket_rows])),
+                "medium_le_strong_pass_rate": float(np.mean([float(row["medium_le_strong_pass"]) for row in bucket_rows])),
+                "raw_weak_le_medium_pass_rate": float(np.mean([float(row["raw_weak_le_medium_pass"]) for row in bucket_rows])),
+                "raw_medium_le_strong_pass_rate": float(np.mean([float(row["raw_medium_le_strong_pass"]) for row in bucket_rows])),
+                "final_weak_le_medium_pass_rate": float(np.mean([float(row["final_weak_le_medium_pass"]) for row in bucket_rows])),
+                "final_medium_le_strong_pass_rate": float(np.mean([float(row["final_medium_le_strong_pass"]) for row in bucket_rows])),
+                "medium_minus_weak_edit_gain_mean": _aggregate_mean([row["medium_minus_weak_edit_gain"] for row in bucket_rows]),
+                "strong_minus_medium_edit_gain_mean": _aggregate_mean([row["strong_minus_medium_edit_gain"] for row in bucket_rows]),
                 "strong_minus_weak_edit_gain_mean": _aggregate_mean([row["strong_minus_weak_edit_gain"] for row in bucket_rows]),
+                "raw_medium_minus_weak_mean": _aggregate_mean([row["raw_medium_minus_weak"] for row in bucket_rows]),
+                "raw_strong_minus_medium_mean": _aggregate_mean([row["raw_strong_minus_medium"] for row in bucket_rows]),
+                "raw_min_adjacent_gap_mean": _aggregate_mean([row["raw_min_adjacent_gap"] for row in bucket_rows]),
+                "raw_gap_balance_ratio_mean": _aggregate_mean([row["raw_gap_balance_ratio"] for row in bucket_rows]),
+                "raw_adjacent_gap_collapse_rate": float(np.mean([float(row["raw_adjacent_gap_collapse"]) for row in bucket_rows])),
+                "final_medium_minus_weak_mean": _aggregate_mean([row["final_medium_minus_weak"] for row in bucket_rows]),
+                "final_strong_minus_medium_mean": _aggregate_mean([row["final_strong_minus_medium"] for row in bucket_rows]),
+                "final_min_adjacent_gap_mean": _aggregate_mean([row["final_min_adjacent_gap"] for row in bucket_rows]),
+                "final_gap_balance_ratio_mean": _aggregate_mean([row["final_gap_balance_ratio"] for row in bucket_rows]),
+                "final_adjacent_gap_collapse_rate": float(np.mean([float(row["final_adjacent_gap_collapse"]) for row in bucket_rows])),
                 "local_std_strong_minus_weak_mean": _aggregate_mean([row["local_std_strong_minus_weak"] for row in bucket_rows]),
                 "local_energy_strong_minus_weak_mean": _aggregate_mean([row["local_energy_strong_minus_weak"] for row in bucket_rows]),
                 "local_roughness_strong_minus_weak_mean": _aggregate_mean([row["local_roughness_strong_minus_weak"] for row in bucket_rows]),
@@ -849,12 +1168,12 @@ def main() -> None:
         and summary["final_strong_minus_weak_mean"] is not None
         and summary["final_strong_minus_weak_mean"] > 0.0
     )
-    summary["runtime_condition_interpretation"] = {
+    summary["condition_mode_interpretation"] = {
         "both": "numeric scalar control and instruction text both active" if args.condition_mode == "both" else False,
         "label_only": "instruction text removed; numeric scalar control active" if args.condition_mode == "label_only" else False,
         "text_only": "numeric control fixed to weakest anchor; text varies by requested strength" if args.condition_mode == "text_only" else False,
     }
-    summary["output_path_diagnosis"] = {
+    summary["canonical_local_path_diagnosis"] = {
         "raw_separable": bool(summary["raw_monotonic_hit_rate"] > 0.0),
         "final_separable": bool(summary["final_monotonic_hit_rate"] > 0.0),
         "attenuation_suspected": bool(summary["attenuation_suspected_rate"] > 0.0),
@@ -912,6 +1231,17 @@ def main() -> None:
             "mask_threshold": float(args.mask_threshold),
             "bg_drift_threshold": float(args.bg_drift_threshold),
             "task_id": None if args.task_id < 0 else int(args.task_id),
+            "generation_route": route_metadata["generation_route"],
+            "generation_route_label": route_metadata["generation_route_label"],
+            "acceptance_route": route_metadata["acceptance_route"],
+            "eval_mask_routed": route_metadata["eval_mask_routed"],
+            "final_mapping_scalar_transform_scale": args.final_mapping_scalar_transform_scale,
+            "final_mapping_scalar_transform_offset": args.final_mapping_scalar_transform_offset,
+            "final_mapping_scalar_transform_name": args.final_mapping_scalar_transform_name.strip() or None,
+            "final_mapping_scalar_prior_scale": args.final_mapping_scalar_prior_scale,
+            "final_mapping_gain_order_direction": args.final_mapping_gain_order_direction.strip() or None,
+            "final_mapping_scope": args.final_mapping_scope.strip() or None,
+            "final_mapping_overrides": final_mapping_overrides,
         },
         "summary": summary,
         "per_sample": pairwise_rows,
