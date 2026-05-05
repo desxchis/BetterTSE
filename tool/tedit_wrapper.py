@@ -251,12 +251,28 @@ class TEditWrapper:
     def _normalize_numeric_control(self, value: Optional[int | float | List[int] | List[float] | np.ndarray], batch_size: int, *, dtype: torch.dtype, name: str) -> Optional[torch.Tensor]:
         if value is None:
             return None
+        if isinstance(value, str):
+            try:
+                value = float(value)
+            except ValueError as exc:
+                raise ValueError(f"{name} must be numeric, got string value {value!r}") from exc
         if np.isscalar(value):
             return torch.full((batch_size,), value, device=self.device, dtype=dtype)
         values = np.asarray(value)
         if values.ndim == 0:
-            return torch.full((batch_size,), values.item(), device=self.device, dtype=dtype)
+            scalar_value = values.item()
+            if isinstance(scalar_value, str):
+                try:
+                    scalar_value = float(scalar_value)
+                except ValueError as exc:
+                    raise ValueError(f"{name} must be numeric, got string value {scalar_value!r}") from exc
+            return torch.full((batch_size,), scalar_value, device=self.device, dtype=dtype)
         values = values.reshape(-1)
+        if values.dtype.kind in {"U", "S", "O"}:
+            try:
+                values = values.astype(np.float32)
+            except ValueError as exc:
+                raise ValueError(f"{name} must be numeric, got values={values.tolist()}") from exc
         if values.shape[0] != batch_size:
             raise ValueError(f"{name} length must match batch size {batch_size}, got {values.shape[0]}")
         return torch.as_tensor(values, device=self.device, dtype=dtype)
@@ -289,7 +305,9 @@ class TEditWrapper:
             output = output[0]
         if input_was_vector and output.ndim == 3 and output.shape[1] == 1:
             output = output[:, 0, :]
-        return output
+        # Return a plain float32 ndarray to shield downstream editors from
+        # environment-specific NumPy/Torch view issues during arithmetic.
+        return np.array(output, dtype=np.float32, copy=True)
 
     def _normalize_edit_mask_array(self, edit_mask: Optional[np.ndarray], *, batch_size: int, seq_len: int) -> Optional[np.ndarray]:
         if edit_mask is None:

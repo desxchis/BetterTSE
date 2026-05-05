@@ -369,6 +369,7 @@ def collate_discrete_strength_families(batch: List[Dict[str, Any]]) -> Dict[str,
     attr_strategy = [str(sample.get("attr_strategy", "neutral")) for sample in flat_samples]
     family_semantic_tag = [str(sample.get("family_semantic_tag", "unknown")) for sample in flat_samples]
     tool_name = [str(sample.get("tool_name", "unknown")) for sample in flat_samples]
+    duration_bucket = [str(sample.get("duration_bucket", "unknown")) for sample in flat_samples]
 
     family_valid = all(size >= 2 for size in family_sizes)
     family_order_valid = all(
@@ -393,6 +394,7 @@ def collate_discrete_strength_families(batch: List[Dict[str, Any]]) -> Dict[str,
         "attr_strategy": attr_strategy,
         "family_semantic_tag": family_semantic_tag,
         "tool_name": tool_name,
+        "duration_bucket": duration_bucket,
         "family_sizes": torch.as_tensor(family_sizes, dtype=torch.long),
         "family_ids": family_ids,
         "family_valid": bool(family_valid),

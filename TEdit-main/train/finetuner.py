@@ -27,6 +27,7 @@ class Finetuner:
         self._init_eval(eval_configs, c_mean)
         self._best_valid_loss = 1e10
         self._best_valid_score = float("-inf")
+        self._best_valid_collapse = None
         self._best_valid_selection = None
 
         self.tf_writer = SummaryWriter(log_dir=self.output_folder)
@@ -67,6 +68,14 @@ class Finetuner:
         self.conditioning_composition_numeric_only_ratio = float(self.conditioning_composition.get("numeric_only_ratio", 0.0))
         self.conditioning_composition_both_ratio = float(self.conditioning_composition.get("both_ratio", max(0.0, 1.0 - self.conditioning_composition_numeric_only_ratio)))
         self.run_generation_eval = bool(self.configs.get("run_generation_eval", True))
+        self.spacing_early_stop_enabled = bool(self.configs.get("spacing_early_stop_enabled", False))
+        self.spacing_early_stop_patience = int(self.configs.get("spacing_early_stop_patience", 2))
+        self.spacing_best_window_require_positive_score = bool(
+            self.configs.get("spacing_best_window_require_positive_score", True)
+        )
+        self.spacing_best_window_require_positive_medium_long_gap = bool(
+            self.configs.get("spacing_best_window_require_positive_medium_long_gap", True)
+        )
 
         self.include_self = self.configs["include_self"]
 
@@ -215,7 +224,19 @@ class Finetuner:
 
     def _reset_train(self):
         self._best_valid_loss = 1e10
+        self._best_valid_collapse = None
+        self._best_valid_score = float("-inf")
+        self._best_valid_selection = None
         self._global_batch_no = 0
+        self._spacing_early_stop_state = {
+            "enabled": bool(self.spacing_early_stop_enabled),
+            "patience": int(max(1, self.spacing_early_stop_patience)),
+            "best_window_active": False,
+            "best_window_enter_epoch": None,
+            "no_improve_count": 0,
+            "triggered": False,
+            "trigger_epoch": None,
+        }
         if self.strength_diagnostics_enabled and os.path.exists(self.strength_diag_path):
             os.remove(self.strength_diag_path)
         if self.strength_diagnostics_enabled:
@@ -540,6 +561,31 @@ class Finetuner:
             "final_mapping_scope": scope,
         }
 
+    def _summarize_family_spacing_rows(self, rows, prefix, duration_bucket_rows=None):
+        summary = {"spacing_metrics_primary": True}
+        if not rows:
+            return summary
+        summary[f"{prefix}_weak_le_medium_pass_rate"] = float(sum(row["weak_le_medium_pass"] for row in rows) / len(rows))
+        summary[f"{prefix}_medium_le_strong_pass_rate"] = float(sum(row["medium_le_strong_pass"] for row in rows) / len(rows))
+        for metric_name in ("medium_minus_weak", "strong_minus_medium", "strong_minus_weak", "min_adjacent_gap", "gap_balance_ratio", "adjacent_gap_collapse"):
+            values = [row[metric_name] for row in rows if row[metric_name] is not None]
+            if values:
+                summary[f"{prefix}_{metric_name}_mean"] = float(sum(float(value) for value in values) / len(values))
+        summary[f"{prefix}_duration_bucket_spacing"] = {}
+        if isinstance(duration_bucket_rows, dict):
+            for bucket, bucket_rows in sorted(duration_bucket_rows.items()):
+                bucket_summary = {
+                    "num_families": int(len(bucket_rows)),
+                    "weak_le_medium_pass_rate": float(sum(row["weak_le_medium_pass"] for row in bucket_rows) / len(bucket_rows)),
+                    "medium_le_strong_pass_rate": float(sum(row["medium_le_strong_pass"] for row in bucket_rows) / len(bucket_rows)),
+                }
+                for metric_name in ("medium_minus_weak", "strong_minus_medium", "strong_minus_weak", "min_adjacent_gap", "gap_balance_ratio", "adjacent_gap_collapse"):
+                    values = [row[metric_name] for row in bucket_rows if row[metric_name] is not None]
+                    if values:
+                        bucket_summary[f"{metric_name}_mean"] = float(sum(float(value) for value in values) / len(values))
+                summary[f"{prefix}_duration_bucket_spacing"][bucket] = bucket_summary
+        return summary
+
     def _prediction_family_gain_summaries(self, batch, pred_x):
         src_x = batch.get("src_x")
         mask_gt = batch.get("mask_gt")
@@ -560,86 +606,108 @@ class Finetuner:
         if mask.dim() == 2:
             mask = mask.unsqueeze(1)
         denom = torch.clamp(mask.sum(dim=(1, 2)), min=1.0)
-        gains = (torch.abs(pred - src) * mask).sum(dim=(1, 2)) / denom
+        final_pred = src * (1.0 - mask) + pred * mask
+        raw_gains = (torch.abs(pred - src) * mask).sum(dim=(1, 2)) / denom
+        final_gains = (torch.abs(final_pred - src) * mask).sum(dim=(1, 2)) / denom
         scalar_values = strength_scalar.detach().cpu().float().view(-1)
         summary = {"spacing_metrics_primary": True}
         route_metadata = self._canonical_predicted_route_metadata()
         summary["local_path_default_definition"] = route_metadata["route_statement"]
         start = 0
-        hits = []
-        family_rhos = []
-        adjacent_gap_rows = []
-        duration_bucket_rows = defaultdict(list)
+        raw_hits = []
+        final_hits = []
+        raw_family_rhos = []
+        final_family_rhos = []
+        raw_adjacent_gap_rows = []
+        final_adjacent_gap_rows = []
+        raw_duration_bucket_rows = defaultdict(list)
+        final_duration_bucket_rows = defaultdict(list)
         duration_bucket_values = batch.get("duration_bucket")
         duration_bucket_list = None
         if isinstance(duration_bucket_values, (list, tuple)):
             duration_bucket_list = [str(value) for value in duration_bucket_values]
         for size_idx, size in enumerate(family_sizes.detach().cpu().tolist()):
             size = int(size)
-            family_gains = gains[start:start + size]
+            family_raw_gains = raw_gains[start:start + size]
+            family_final_gains = final_gains[start:start + size]
             family_scalar = scalar_values[start:start + size]
             family_bucket = None
             if duration_bucket_list is not None and start < len(duration_bucket_list):
                 family_bucket = str(duration_bucket_list[start])
             start += size
-            if family_gains.numel() < 2:
+            if family_raw_gains.numel() < 2:
                 continue
             order = torch.argsort(family_scalar)
-            family_gains = family_gains[order]
+            family_raw_gains = family_raw_gains[order]
+            family_final_gains = family_final_gains[order]
             family_scalar = family_scalar[order]
-            hits.append(float(all(
-                float(family_gains[idx + 1].item()) + 1.0e-6 >= float(family_gains[idx].item())
-                for idx in range(family_gains.numel() - 1)
+            raw_hits.append(float(all(
+                float(family_raw_gains[idx + 1].item()) + 1.0e-6 >= float(family_raw_gains[idx].item())
+                for idx in range(family_raw_gains.numel() - 1)
             )))
-            rho = self._safe_spearman(family_scalar.tolist(), family_gains.tolist())
-            if rho is not None:
-                family_rhos.append(float(rho))
-            medium_minus_weak = None if family_gains.numel() < 2 else self._safe_diff(family_gains[1].item(), family_gains[0].item())
-            strong_minus_medium = None if family_gains.numel() < 3 else self._safe_diff(family_gains[2].item(), family_gains[1].item())
-            strong_minus_weak = None if family_gains.numel() < 2 else self._safe_diff(family_gains[-1].item(), family_gains[0].item())
-            weak_le_medium_pass = bool(family_gains.numel() >= 2 and float(family_gains[1].item()) + 1.0e-6 >= float(family_gains[0].item()))
-            medium_le_strong_pass = bool(family_gains.numel() >= 3 and float(family_gains[2].item()) + 1.0e-6 >= float(family_gains[1].item()))
-            min_adjacent_gap = None
-            if family_gains.numel() >= 2:
-                min_adjacent_gap = min(gap for gap in (medium_minus_weak, strong_minus_medium) if gap is not None)
-            gap_row = {
-                "family_index": int(size_idx),
-                "duration_bucket": family_bucket,
-                "weak_le_medium_pass": float(weak_le_medium_pass),
-                "medium_le_strong_pass": float(medium_le_strong_pass),
-                "medium_minus_weak": medium_minus_weak,
-                "strong_minus_medium": strong_minus_medium,
-                "strong_minus_weak": strong_minus_weak,
-                "min_adjacent_gap": min_adjacent_gap,
-                "gap_balance_ratio": self._gap_balance_ratio(medium_minus_weak, strong_minus_medium),
-                "adjacent_gap_collapse": self._collapse_indicator(medium_minus_weak, strong_minus_medium),
-            }
-            adjacent_gap_rows.append(gap_row)
-            if family_bucket:
-                duration_bucket_rows[family_bucket].append(gap_row)
-        if hits:
-            summary["family_monotonic_pred_hit_rate"] = float(sum(hits) / len(hits))
-        if family_rhos:
-            summary["family_pred_gain_spearman_mean"] = float(sum(family_rhos) / len(family_rhos))
-        if adjacent_gap_rows:
-            summary["pred_weak_le_medium_pass_rate"] = float(sum(row["weak_le_medium_pass"] for row in adjacent_gap_rows) / len(adjacent_gap_rows))
-            summary["pred_medium_le_strong_pass_rate"] = float(sum(row["medium_le_strong_pass"] for row in adjacent_gap_rows) / len(adjacent_gap_rows))
-            for metric_name in ("medium_minus_weak", "strong_minus_medium", "strong_minus_weak", "min_adjacent_gap", "gap_balance_ratio", "adjacent_gap_collapse"):
-                values = [row[metric_name] for row in adjacent_gap_rows if row[metric_name] is not None]
-                if values:
-                    summary[f"pred_{metric_name}_mean"] = float(sum(float(value) for value in values) / len(values))
-            summary["pred_duration_bucket_spacing"] = {}
-            for bucket, bucket_rows in sorted(duration_bucket_rows.items()):
-                bucket_summary = {
-                    "num_families": int(len(bucket_rows)),
-                    "weak_le_medium_pass_rate": float(sum(row["weak_le_medium_pass"] for row in bucket_rows) / len(bucket_rows)),
-                    "medium_le_strong_pass_rate": float(sum(row["medium_le_strong_pass"] for row in bucket_rows) / len(bucket_rows)),
+            final_hits.append(float(all(
+                float(family_final_gains[idx + 1].item()) + 1.0e-6 >= float(family_final_gains[idx].item())
+                for idx in range(family_final_gains.numel() - 1)
+            )))
+            raw_rho = self._safe_spearman(family_scalar.tolist(), family_raw_gains.tolist())
+            if raw_rho is not None:
+                raw_family_rhos.append(float(raw_rho))
+            final_rho = self._safe_spearman(family_scalar.tolist(), family_final_gains.tolist())
+            if final_rho is not None:
+                final_family_rhos.append(float(final_rho))
+            for gains_seq, rows_sink, bucket_sink in (
+                (family_raw_gains, raw_adjacent_gap_rows, raw_duration_bucket_rows),
+                (family_final_gains, final_adjacent_gap_rows, final_duration_bucket_rows),
+            ):
+                medium_minus_weak = None if gains_seq.numel() < 2 else self._safe_diff(gains_seq[1].item(), gains_seq[0].item())
+                strong_minus_medium = None if gains_seq.numel() < 3 else self._safe_diff(gains_seq[2].item(), gains_seq[1].item())
+                strong_minus_weak = None if gains_seq.numel() < 2 else self._safe_diff(gains_seq[-1].item(), gains_seq[0].item())
+                weak_le_medium_pass = bool(gains_seq.numel() >= 2 and float(gains_seq[1].item()) + 1.0e-6 >= float(gains_seq[0].item()))
+                medium_le_strong_pass = bool(gains_seq.numel() >= 3 and float(gains_seq[2].item()) + 1.0e-6 >= float(gains_seq[1].item()))
+                min_adjacent_gap = None
+                if gains_seq.numel() >= 2:
+                    min_adjacent_gap = min(gap for gap in (medium_minus_weak, strong_minus_medium) if gap is not None)
+                gap_row = {
+                    "family_index": int(size_idx),
+                    "duration_bucket": family_bucket,
+                    "weak_le_medium_pass": float(weak_le_medium_pass),
+                    "medium_le_strong_pass": float(medium_le_strong_pass),
+                    "medium_minus_weak": medium_minus_weak,
+                    "strong_minus_medium": strong_minus_medium,
+                    "strong_minus_weak": strong_minus_weak,
+                    "min_adjacent_gap": min_adjacent_gap,
+                    "gap_balance_ratio": self._gap_balance_ratio(medium_minus_weak, strong_minus_medium),
+                    "adjacent_gap_collapse": self._collapse_indicator(medium_minus_weak, strong_minus_medium),
                 }
-                for metric_name in ("medium_minus_weak", "strong_minus_medium", "strong_minus_weak", "min_adjacent_gap", "gap_balance_ratio", "adjacent_gap_collapse"):
-                    values = [row[metric_name] for row in bucket_rows if row[metric_name] is not None]
-                    if values:
-                        bucket_summary[f"{metric_name}_mean"] = float(sum(float(value) for value in values) / len(values))
-                summary["pred_duration_bucket_spacing"][bucket] = bucket_summary
+                rows_sink.append(gap_row)
+                if family_bucket:
+                    bucket_sink[family_bucket].append(gap_row)
+        if raw_hits:
+            summary["family_monotonic_pred_hit_rate"] = float(sum(raw_hits) / len(raw_hits))
+            summary["family_monotonic_raw_hit_rate"] = float(sum(raw_hits) / len(raw_hits))
+        if final_hits:
+            summary["family_monotonic_final_hit_rate"] = float(sum(final_hits) / len(final_hits))
+        if raw_family_rhos:
+            summary["family_pred_gain_spearman_mean"] = float(sum(raw_family_rhos) / len(raw_family_rhos))
+            summary["family_raw_gain_spearman_mean"] = float(sum(raw_family_rhos) / len(raw_family_rhos))
+        if final_family_rhos:
+            summary["family_final_gain_spearman_mean"] = float(sum(final_family_rhos) / len(final_family_rhos))
+        summary.update(self._summarize_family_spacing_rows(raw_adjacent_gap_rows, "raw", raw_duration_bucket_rows))
+        summary.update(self._summarize_family_spacing_rows(final_adjacent_gap_rows, "final", final_duration_bucket_rows))
+        for metric_name in (
+            "weak_le_medium_pass_rate",
+            "medium_le_strong_pass_rate",
+            "medium_minus_weak_mean",
+            "strong_minus_medium_mean",
+            "strong_minus_weak_mean",
+            "min_adjacent_gap_mean",
+            "gap_balance_ratio_mean",
+            "adjacent_gap_collapse_mean",
+            "duration_bucket_spacing",
+        ):
+            raw_key = f"raw_{metric_name}"
+            if raw_key in summary:
+                summary[f"pred_{metric_name}"] = summary[raw_key]
         return summary
 
     def _aggregate_duration_bucket_spacing(self, records, key):
@@ -671,6 +739,14 @@ class Finetuner:
             summary[bucket_name] = bucket_summary
         return summary
 
+    def _bucket_metric(self, duration_spacing, bucket_name, metric_name):
+        if not isinstance(duration_spacing, dict):
+            return None
+        bucket_payload = duration_spacing.get(str(bucket_name))
+        if not isinstance(bucket_payload, dict):
+            return None
+        return bucket_payload.get(metric_name)
+
     def _extract_spacing_summary(self, summary, prefix):
         duration_key = f"{prefix}_duration_bucket_spacing"
         duration_spacing = summary.get(duration_key)
@@ -684,30 +760,49 @@ class Finetuner:
             "gap_balance_ratio_mean": summary.get(f"{prefix}_gap_balance_ratio_mean"),
             "adjacent_gap_collapse_rate": summary.get(f"{prefix}_adjacent_gap_collapse_mean"),
             "duration_bucket_spacing": duration_spacing,
-            "long_bucket_min_adjacent_gap_mean": None if not isinstance(duration_spacing, dict) else duration_spacing.get("long", {}).get("min_adjacent_gap_mean"),
-            "long_bucket_adjacent_gap_collapse_rate": None if not isinstance(duration_spacing, dict) else duration_spacing.get("long", {}).get("adjacent_gap_collapse_mean"),
+            "medium_bucket_min_adjacent_gap_mean": self._bucket_metric(duration_spacing, "medium", "min_adjacent_gap_mean"),
+            "medium_bucket_adjacent_gap_collapse_rate": self._bucket_metric(duration_spacing, "medium", "adjacent_gap_collapse_mean"),
+            "long_bucket_min_adjacent_gap_mean": self._bucket_metric(duration_spacing, "long", "min_adjacent_gap_mean"),
+            "long_bucket_adjacent_gap_collapse_rate": self._bucket_metric(duration_spacing, "long", "adjacent_gap_collapse_mean"),
         }
 
     def _selection_score_from_summary(self, summary):
         if not isinstance(summary, dict):
             return None
-        min_gap = summary.get("pred_min_adjacent_gap_mean")
-        collapse = summary.get("pred_adjacent_gap_collapse_mean")
-        weak_pass = summary.get("pred_weak_le_medium_pass_rate")
-        medium_pass = summary.get("pred_medium_le_strong_pass_rate")
-        if any(value is None for value in (min_gap, collapse, weak_pass, medium_pass)):
+        min_gap = summary.get("raw_min_adjacent_gap_mean")
+        collapse = summary.get("raw_adjacent_gap_collapse_mean")
+        weak_pass = summary.get("raw_weak_le_medium_pass_rate")
+        medium_pass = summary.get("raw_medium_le_strong_pass_rate")
+        duration_spacing = summary.get("raw_duration_bucket_spacing")
+        medium_bucket_min_gap = self._bucket_metric(duration_spacing, "medium", "min_adjacent_gap_mean")
+        long_bucket_min_gap = self._bucket_metric(duration_spacing, "long", "min_adjacent_gap_mean")
+        if any(value is None for value in (min_gap, collapse, weak_pass, medium_pass, medium_bucket_min_gap, long_bucket_min_gap)):
             return None
-        return float(min_gap) - float(collapse) + 0.5 * (float(weak_pass) + float(medium_pass))
+        return (
+            1.5 * float(min_gap)
+            - 1.0 * float(collapse)
+            + 0.5 * float(weak_pass)
+            + 0.5 * float(medium_pass)
+            + 0.75 * float(medium_bucket_min_gap)
+            + 1.0 * float(long_bucket_min_gap)
+        )
 
-    def _is_better_selection(self, candidate_score, candidate_loss, best_score, best_loss):
+    def _is_better_selection(self, candidate_score, candidate_loss, best_score, best_loss, candidate_collapse=None, best_collapse=None):
         if candidate_score is not None:
             if best_score is None:
                 return True
             score_delta = float(candidate_score) - float(best_score)
             if score_delta > 1.0e-8:
                 return True
-            if abs(score_delta) <= 1.0e-8 and candidate_loss is not None and best_loss is not None:
-                return float(candidate_loss) < float(best_loss)
+            if abs(score_delta) <= 1.0e-8:
+                if candidate_collapse is not None and best_collapse is not None:
+                    collapse_delta = float(best_collapse) - float(candidate_collapse)
+                    if collapse_delta > 1.0e-8:
+                        return True
+                    if collapse_delta < -1.0e-8:
+                        return False
+                if candidate_loss is not None and best_loss is not None:
+                    return float(candidate_loss) < float(best_loss)
             return False
         if best_score is not None:
             return False
@@ -721,25 +816,115 @@ class Finetuner:
         if not isinstance(summary, dict):
             return None
         selection_score = self._selection_score_from_summary(summary)
-        duration_spacing = summary.get("pred_duration_bucket_spacing")
-        long_bucket = duration_spacing.get("long") if isinstance(duration_spacing, dict) else None
+        raw_duration_spacing = summary.get("raw_duration_bucket_spacing")
+        final_duration_spacing = summary.get("final_duration_bucket_spacing")
         return {
             "spacing_metrics_primary": bool(summary.get("spacing_metrics_primary", False)),
             "local_path_default_definition": summary.get("local_path_default_definition"),
             "selection_score": selection_score,
-            "weak_le_medium_pass_rate": summary.get("pred_weak_le_medium_pass_rate"),
-            "medium_le_strong_pass_rate": summary.get("pred_medium_le_strong_pass_rate"),
-            "min_adjacent_gap_mean": summary.get("pred_min_adjacent_gap_mean"),
-            "adjacent_gap_collapse_rate": summary.get("pred_adjacent_gap_collapse_mean"),
-            "medium_minus_weak_mean": summary.get("pred_medium_minus_weak_mean"),
-            "strong_minus_medium_mean": summary.get("pred_strong_minus_medium_mean"),
-            "duration_bucket_spacing": duration_spacing,
-            "long_bucket_min_adjacent_gap_mean": None if not isinstance(long_bucket, dict) else long_bucket.get("min_adjacent_gap_mean"),
-            "long_bucket_adjacent_gap_collapse_rate": None if not isinstance(long_bucket, dict) else long_bucket.get("adjacent_gap_collapse_mean"),
-            "selection_metric_definition": "pred_min_adjacent_gap_mean - pred_adjacent_gap_collapse_mean + 0.5 * (pred_weak_le_medium_pass_rate + pred_medium_le_strong_pass_rate)",
-            "predicted_spacing_summary": self._extract_spacing_summary(summary, "pred"),
+            "selection_score_v2": selection_score,
+            "selection_primary_domain": "raw_local_spacing",
+            "selection_tiebreak": "collapse_then_loss",
+            "weak_le_medium_pass_rate": summary.get("raw_weak_le_medium_pass_rate"),
+            "medium_le_strong_pass_rate": summary.get("raw_medium_le_strong_pass_rate"),
+            "min_adjacent_gap_mean": summary.get("raw_min_adjacent_gap_mean"),
+            "adjacent_gap_collapse_rate": summary.get("raw_adjacent_gap_collapse_mean"),
+            "medium_minus_weak_mean": summary.get("raw_medium_minus_weak_mean"),
+            "strong_minus_medium_mean": summary.get("raw_strong_minus_medium_mean"),
+            "raw_min_adjacent_gap_mean": summary.get("raw_min_adjacent_gap_mean"),
+            "raw_adjacent_gap_collapse_rate": summary.get("raw_adjacent_gap_collapse_mean"),
+            "raw_weak_le_medium_pass_rate": summary.get("raw_weak_le_medium_pass_rate"),
+            "raw_medium_le_strong_pass_rate": summary.get("raw_medium_le_strong_pass_rate"),
+            "final_min_adjacent_gap_mean": summary.get("final_min_adjacent_gap_mean"),
+            "final_adjacent_gap_collapse_rate": summary.get("final_adjacent_gap_collapse_mean"),
+            "final_weak_le_medium_pass_rate": summary.get("final_weak_le_medium_pass_rate"),
+            "final_medium_le_strong_pass_rate": summary.get("final_medium_le_strong_pass_rate"),
+            "duration_bucket_spacing": raw_duration_spacing,
+            "raw_duration_bucket_spacing": raw_duration_spacing,
+            "final_duration_bucket_spacing": final_duration_spacing,
+            "medium_bucket_min_adjacent_gap_mean": self._bucket_metric(raw_duration_spacing, "medium", "min_adjacent_gap_mean"),
+            "medium_bucket_adjacent_gap_collapse_rate": self._bucket_metric(raw_duration_spacing, "medium", "adjacent_gap_collapse_mean"),
+            "long_bucket_min_adjacent_gap_mean": self._bucket_metric(raw_duration_spacing, "long", "min_adjacent_gap_mean"),
+            "long_bucket_adjacent_gap_collapse_rate": self._bucket_metric(raw_duration_spacing, "long", "adjacent_gap_collapse_mean"),
+            "selection_metric_definition": "1.5 * raw_min_adjacent_gap_mean - raw_adjacent_gap_collapse_rate + 0.5 * raw_weak_le_medium_pass_rate + 0.5 * raw_medium_le_strong_pass_rate + 0.75 * medium_bucket_raw_min_adjacent_gap_mean + 1.0 * long_bucket_raw_min_adjacent_gap_mean",
+            "selection_metric_definition_v2": "1.5 * raw_min_adjacent_gap_mean - raw_adjacent_gap_collapse_rate + 0.5 * raw_weak_le_medium_pass_rate + 0.5 * raw_medium_le_strong_pass_rate + 0.75 * medium_bucket_raw_min_adjacent_gap_mean + 1.0 * long_bucket_raw_min_adjacent_gap_mean",
+            "predicted_spacing_summary": self._extract_spacing_summary(summary, "raw"),
+            "raw_spacing_summary": self._extract_spacing_summary(summary, "raw"),
+            "final_spacing_summary": self._extract_spacing_summary(summary, "final"),
             "target_spacing_reference": self._extract_spacing_summary(summary, "target"),
         }
+
+    def _spacing_best_window_qualifies(self, spacing_selection):
+        if not isinstance(spacing_selection, dict):
+            return False
+        selection_score = spacing_selection.get("selection_score_v2")
+        medium_gap = spacing_selection.get("medium_bucket_min_adjacent_gap_mean")
+        long_gap = spacing_selection.get("long_bucket_min_adjacent_gap_mean")
+        if self.spacing_best_window_require_positive_score:
+            if selection_score is None or not math.isfinite(float(selection_score)) or float(selection_score) <= 0.0:
+                return False
+        if self.spacing_best_window_require_positive_medium_long_gap:
+            if medium_gap is None or long_gap is None:
+                return False
+            if not math.isfinite(float(medium_gap)) or not math.isfinite(float(long_gap)):
+                return False
+            if float(medium_gap) <= 0.0 or float(long_gap) <= 0.0:
+                return False
+        return True
+
+    def _spacing_early_stop_payload(self, spacing_selection):
+        state = dict(getattr(self, "_spacing_early_stop_state", {}) or {})
+        qualifies = self._spacing_best_window_qualifies(spacing_selection)
+        payload = {
+            "enabled": bool(state.get("enabled", False)),
+            "patience": int(state.get("patience", 0) or 0),
+            "best_window_active": bool(state.get("best_window_active", False)),
+            "best_window_enter_epoch": state.get("best_window_enter_epoch"),
+            "no_improve_count": int(state.get("no_improve_count", 0) or 0),
+            "triggered": bool(state.get("triggered", False)),
+            "trigger_epoch": state.get("trigger_epoch"),
+            "qualifies_current_epoch": qualifies,
+        }
+        if isinstance(spacing_selection, dict):
+            payload["selection_score_v2"] = spacing_selection.get("selection_score_v2")
+            payload["medium_bucket_min_adjacent_gap_mean"] = spacing_selection.get("medium_bucket_min_adjacent_gap_mean")
+            payload["long_bucket_min_adjacent_gap_mean"] = spacing_selection.get("long_bucket_min_adjacent_gap_mean")
+        return payload
+
+    def _write_best_selection_with_early_stop_state(self):
+        if not self._best_valid_selection:
+            return
+        selection_path = os.path.join(self.output_folder, "best_model_selection.json")
+        payload = copy.deepcopy(self._best_valid_selection)
+        payload["spacing_early_stop_final_state"] = self._spacing_early_stop_payload(
+            payload.get("spacing_selection")
+        )
+        with open(selection_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+
+    def _update_spacing_early_stop_state(self, epoch_no, spacing_selection, is_best):
+        state = getattr(self, "_spacing_early_stop_state", None)
+        if not isinstance(state, dict) or not state.get("enabled", False):
+            return False
+        qualifies = self._spacing_best_window_qualifies(spacing_selection)
+        if is_best and qualifies:
+            state["best_window_active"] = True
+            if state.get("best_window_enter_epoch") is None:
+                state["best_window_enter_epoch"] = int(epoch_no)
+            state["no_improve_count"] = 0
+            return False
+        if not state.get("best_window_active", False):
+            return False
+        if is_best:
+            state["no_improve_count"] = 0
+            return False
+        state["no_improve_count"] = int(state.get("no_improve_count", 0) or 0) + 1
+        if state["no_improve_count"] >= int(state.get("patience", 1)):
+            state["triggered"] = True
+            state["trigger_epoch"] = int(epoch_no)
+            self._write_best_selection_with_early_stop_state()
+            return True
+        return False
 
     def _training_batch_diagnostics(self, batch):
         payload = {}
@@ -932,9 +1117,15 @@ class Finetuner:
         for epoch_no in range(self.n_epochs):
             self._train_epoch(epoch_no)
             if self.valid_loader is not None and (epoch_no + 1) % self.valid_epoch_interval == 0:
-                self.valid(epoch_no)
+                should_stop = self.valid(epoch_no)
                 if self.run_generation_eval:
                     self.evaluate(epoch_no)
+                if should_stop:
+                    print(
+                        f"\n*** Spacing-aware early stop triggered at epoch {epoch_no} "
+                        f"(patience={self._spacing_early_stop_state.get('patience')}).\n"
+                    )
+                    break
     
     def evaluate(self, epoch_no):
         metric_list = ["cos", "rats", "auc"]
@@ -1021,6 +1212,8 @@ class Finetuner:
         valid_summary["target_duration_bucket_spacing"] = self._aggregate_duration_bucket_spacing(valid_diagnostics, "target_duration_bucket_spacing")
         predicted_summary = self._summarize_numeric_dicts(predicted_diagnostics)
         predicted_summary["pred_duration_bucket_spacing"] = self._aggregate_duration_bucket_spacing(predicted_diagnostics, "pred_duration_bucket_spacing")
+        predicted_summary["raw_duration_bucket_spacing"] = self._aggregate_duration_bucket_spacing(predicted_diagnostics, "raw_duration_bucket_spacing")
+        predicted_summary["final_duration_bucket_spacing"] = self._aggregate_duration_bucket_spacing(predicted_diagnostics, "final_duration_bucket_spacing")
         valid_summary.update(predicted_summary)
         route_metadata = self._canonical_predicted_route_metadata()
         valid_summary["spacing_metrics_primary"] = bool(
@@ -1033,6 +1226,7 @@ class Finetuner:
         valid_summary["final_mapping_scope"] = route_metadata["final_mapping_scope"]
         spacing_selection = self._build_spacing_selection_payload(valid_summary)
         selection_score = None if not isinstance(spacing_selection, dict) else spacing_selection.get("selection_score")
+        selection_collapse = None if not isinstance(spacing_selection, dict) else spacing_selection.get("raw_adjacent_gap_collapse_rate")
 
         self.tf_writer.add_scalar("Finetune/Valid/epoch_loss", avg_loss_valid, epoch_no)
         if selection_score is not None and math.isfinite(float(selection_score)):
@@ -1043,8 +1237,14 @@ class Finetuner:
                 "medium_le_strong_pass_rate",
                 "min_adjacent_gap_mean",
                 "adjacent_gap_collapse_rate",
+                "raw_min_adjacent_gap_mean",
+                "raw_adjacent_gap_collapse_rate",
+                "final_min_adjacent_gap_mean",
+                "final_adjacent_gap_collapse_rate",
                 "medium_minus_weak_mean",
                 "strong_minus_medium_mean",
+                "medium_bucket_min_adjacent_gap_mean",
+                "medium_bucket_adjacent_gap_collapse_rate",
                 "long_bucket_min_adjacent_gap_mean",
                 "long_bucket_adjacent_gap_collapse_rate",
             ):
@@ -1060,36 +1260,51 @@ class Finetuner:
             "target_spacing_summary": self._extract_spacing_summary(valid_summary, "target"),
             "valid_summary": valid_summary,
         }
-        selection_path = os.path.join(self.output_folder, "valid_epoch_summary.jsonl")
-        with open(selection_path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(selection_payload, ensure_ascii=False) + "\n")
 
         finite_selection_score = None
         if selection_score is not None and math.isfinite(float(selection_score)):
             finite_selection_score = float(selection_score)
+        finite_selection_collapse = None
+        if selection_collapse is not None and math.isfinite(float(selection_collapse)):
+            finite_selection_collapse = float(selection_collapse)
         best_score = None if not math.isfinite(float(self._best_valid_score)) else float(self._best_valid_score)
         is_best = self._is_better_selection(
             candidate_score=finite_selection_score,
             candidate_loss=avg_loss_valid,
             best_score=best_score,
             best_loss=self._best_valid_loss,
+            candidate_collapse=finite_selection_collapse,
+            best_collapse=self._best_valid_collapse,
         )
         if is_best:
             if finite_selection_score is not None:
                 self._best_valid_score = float(finite_selection_score)
                 self._best_valid_loss = avg_loss_valid
+                self._best_valid_collapse = finite_selection_collapse
                 self._best_valid_selection = selection_payload
                 if best_score is None or float(finite_selection_score) > float(best_score) + 1.0e-8:
                     print(f"\n*** Best spacing selection score is updated to {finite_selection_score} at {epoch_no} (loss={avg_loss_valid}).\n")
                 else:
-                    print(f"\n*** Spacing selection tie broken by lower valid loss {avg_loss_valid} at {epoch_no}.\n")
+                    if self._best_valid_collapse is not None and best_score is not None and finite_selection_collapse is not None:
+                        print(f"\n*** Spacing selection tie broken by lower raw collapse {finite_selection_collapse} at {epoch_no} (loss={avg_loss_valid}).\n")
+                    else:
+                        print(f"\n*** Spacing selection tie broken by lower valid loss {avg_loss_valid} at {epoch_no}.\n")
             else:
                 self._best_valid_loss = avg_loss_valid
+                self._best_valid_collapse = finite_selection_collapse
                 self._best_valid_selection = selection_payload
                 print(f"\n*** Best loss is updated to {avg_loss_valid} at {epoch_no}.\n")
 
+        should_stop = self._update_spacing_early_stop_state(epoch_no, spacing_selection, is_best)
+        selection_payload["spacing_early_stop"] = self._spacing_early_stop_payload(spacing_selection)
+        if is_best and self._best_valid_selection is not None:
+            self._best_valid_selection["spacing_early_stop"] = copy.deepcopy(selection_payload["spacing_early_stop"])
+        selection_path = os.path.join(self.output_folder, "valid_epoch_summary.jsonl")
+        with open(selection_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(selection_payload, ensure_ascii=False) + "\n")
         if is_best:
             self.save_model(epoch_no, selection_payload=selection_payload)
+        return should_stop
 
 
     """

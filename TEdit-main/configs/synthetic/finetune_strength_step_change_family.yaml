@@ -71,4 +71,4 @@ train:
     compare_raw_and_final: true
     projector_modulation_scalars: true
     validate_family_invariants: true
-  ctrl_attrs: [[trend_injection]]
+  ctrl_attrs: [[step_change]]

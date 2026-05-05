@@ -19,14 +19,438 @@ if str(REPO_ROOT) not in sys.path:
 
 from models.conditional_generator import ConditionalGenerator
 from models.diffusion.diff_csdi_multipatch_weaver import Diff_CSDI_MultiPatch_Weaver_Parallel, ResidualBlock
+from data import EditDataset
 from train.finetuner import Finetuner
 import test_scripts.evaluate_tedit_strength_effect as strength_effect_eval
 import test_scripts.run_tedit_trend_monotonic_eval as trend_monotonic_eval
+from test_scripts.build_strength_pipeline_replay_benchmark import build_replay_benchmark
+from test_scripts.verify_strength_pipeline_summary import verify_summary
 from test_scripts.build_tedit_strength_trend_family_dataset import build_family_dataset
 from tool.tedit_wrapper import TEditWrapper
+from tool.ts_editors import (
+    _build_fixed_period_seasonality_scaffold,
+    _build_hard_zero_scaffold,
+    _build_multiplier_scaffold,
+    _build_noise_injection_scaffold,
+    _build_seasonality_amplitude_anchor,
+    _build_seasonality_scaffold,
+    _build_step_change_scaffold,
+    _build_trend_injection_scaffold,
+    _resolve_season_enhance_tgt_attrs,
+    _resolve_seasonality_amplitude_gain,
+)
+from modules.llm import _apply_explicit_prompt_hints
+from run_pipeline import (
+    _apply_family_region_override,
+    _apply_pipeline_mode,
+    _benchmark_region,
+    _build_condensed_execution_instruction,
+    _direct_tool_choice,
+    _family_consistent_localization_enabled,
+    _family_region_source,
+    _resolve_execution_instruction,
+    _sample_replay_plan,
+)
 
 
 class TestOutputBranchCarrierContract(unittest.TestCase):
+    def test_explicit_strength_prompt_hints_override_wrong_medium_intent(self):
+        plan = {
+            "intent": {"effect_family": "trend", "shape": "hump", "direction": "up", "strength": "medium"},
+            "execution": {"tool_name": "hybrid_up", "canonical_tool": "trend_linear_up", "parameters": {"strength_label": 1, "strength_scalar": 1.0}},
+            "parameters": {"strength_label": 1, "strength_scalar": 1.0},
+        }
+        normalized = _apply_explicit_prompt_hints(
+            plan,
+            "Edit only one short window of the target series. Make that segment show a temporary upward hump that returns toward baseline. Use strong strength and keep the non-edit region unchanged.",
+            ts_length=96,
+        )
+
+        self.assertEqual(normalized["intent"]["strength"], "strong")
+        self.assertEqual(normalized["parameters"]["strength_label"], 2)
+        self.assertEqual(normalized["parameters"]["strength_scalar"], 2.0)
+
+    def test_family_consistent_localization_helpers_enable_and_override_region(self):
+        sample = {"family_id": "family_001", "pipeline_options": {"family_consistent_localization": True}}
+        self.assertTrue(_family_consistent_localization_enabled(sample))
+        self.assertEqual(_family_region_source(sample), "llm_first_sample")
+
+        plan = {
+            "parameters": {"region": [10, 30]},
+            "localization": {"region": [10, 30]},
+            "execution": {"parameters": {"region": [10, 30]}},
+        }
+        overridden = _apply_family_region_override(plan, [20, 40], "family_001", "family_cache")
+        self.assertEqual(overridden["parameters"]["region"], [20, 40])
+        self.assertEqual(overridden["localization"]["region"], [20, 40])
+        self.assertEqual(overridden["execution"]["parameters"]["region"], [20, 40])
+        self.assertEqual(overridden["pipeline_localization_policy"]["region_source"], "family_cache")
+        self.assertEqual(overridden["pipeline_localization_policy"]["family_id"], "family_001")
+
+    def test_benchmark_family_region_source_uses_gt_region(self):
+        sample = {
+            "family_id": "seasonality_family_001",
+            "gt_start": 12,
+            "gt_end": 34,
+            "pipeline_options": {
+                "family_consistent_localization": True,
+                "family_region_source": "benchmark",
+            },
+        }
+        self.assertEqual(_family_region_source(sample), "benchmark")
+        self.assertEqual(_benchmark_region(sample, {}, 96), [12, 34])
+
+    def test_build_condensed_execution_instruction_uses_canonical_short_phrase(self):
+        trend_plan = {"intent": {"effect_family": "trend", "direction": "up", "strength": "strong", "duration": "medium"}}
+        season_plan = {"intent": {"effect_family": "seasonality", "shape": "periodic", "strength": "weak", "duration": "medium"}}
+        self.assertEqual(_build_condensed_execution_instruction(trend_plan), "Apply a strong upward trend edit in this medium window")
+        self.assertEqual(_build_condensed_execution_instruction(season_plan), "Apply a weak seasonality enhancement in this medium window")
+
+    def test_direct_edit_periodic_prompt_routes_to_season_enhance(self):
+        tool_name, canonical_tool = _direct_tool_choice("Make the periodic peaks and troughs in this segment clearer")
+        self.assertEqual(tool_name, "season_enhance")
+        self.assertEqual(canonical_tool, "seasonality_enhance")
+
+    def test_resolve_execution_instruction_prefers_planner_execution_phrase(self):
+        plan = {
+            "intent": {"effect_family": "trend", "direction": "up", "strength": "strong", "duration": "medium"},
+            "execution": {"execution_phrase": "Apply a strong upward trend edit in this medium window"},
+            "parameters": {"instruction_text": "old local fallback phrase"},
+        }
+        self.assertEqual(_resolve_execution_instruction(plan), "Apply a strong upward trend edit in this medium window")
+
+    def test_replay_plan_mode_uses_benchmark_plan_without_llm_mutation(self):
+        sample = {
+            "replay_plan": {
+                "tool_name": "season_enhance",
+                "intent": {"effect_family": "seasonality", "shape": "periodic"},
+                "parameters": {"region": [4, 12]},
+            }
+        }
+
+        plan = _sample_replay_plan(sample)
+        normalized = _apply_pipeline_mode(
+            full_plan=plan,
+            prompt_text="周期增强",
+            ts_length=32,
+            mode="replay_plan",
+        )
+
+        self.assertEqual(normalized["tool_name"], "season_enhance")
+        self.assertEqual(normalized["parameters"]["region"], [4, 12])
+
+    def test_runtime_strength_scalar_can_differ_from_benchmark_sort_scalar(self):
+        sample = {"strength_label": 1, "strength_scalar": 0.5, "runtime_strength_scalar": 1.0}
+        plan = {"parameters": {}}
+
+        if "strength_label" in sample:
+            plan["parameters"]["strength_label"] = sample["strength_label"]
+        if "strength_scalar" in sample:
+            plan["parameters"]["strength_scalar"] = sample["strength_scalar"]
+        if "runtime_strength_scalar" in sample:
+            plan["parameters"]["strength_scalar"] = sample["runtime_strength_scalar"]
+
+        self.assertEqual(sample["strength_scalar"], 0.5)
+        self.assertEqual(plan["parameters"]["strength_scalar"], 1.0)
+
+    def test_strength_summary_verifier_rejects_nonmonotonic_family(self):
+        payload = {
+            "family_rows": [
+                {
+                    "family": "trend",
+                    "primary_strength_metric": "edit_gain",
+                    "weak_primary_strength_value": 1.0,
+                    "medium_primary_strength_value": 0.5,
+                    "strong_primary_strength_value": 2.0,
+                    "primary_min_adjacent_gap_mean": -0.5,
+                    "primary_monotonic_hit": 0.0,
+                    "bg_mae_strong_minus_weak": 0.0,
+                }
+            ]
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            summary_path = Path(tmpdir) / "summary.json"
+            summary_path.write_text(json.dumps(payload), encoding="utf-8")
+            result = verify_summary(
+                str(summary_path),
+                require_families=["trend"],
+                min_primary_gap=0.0,
+                max_bg_drift=1.0e-6,
+                max_season_period_error=1.0e-6,
+                max_season_level_drift=None,
+                max_season_trend_drift=None,
+            )
+
+        self.assertEqual(result["status"], "failed")
+        self.assertTrue(any("not strictly monotonic" in item for item in result["failures"]))
+
+    def test_replay_benchmark_builder_adds_plan_and_trend_runtime_scalar(self):
+        payload = {
+            "samples": [
+                {
+                    "sample_id": "trend_weak",
+                    "base_ts": [1.0, 2.0],
+                    "region": [0, 2],
+                    "strength_label": 1,
+                    "strength_scalar": 0.5,
+                    "strength_text": "medium",
+                    "duration_bucket": "short",
+                    "edit_intent_gt": {"effect_family": "trend", "direction": "up", "shape": "linear"},
+                },
+                {
+                    "sample_id": "season_weak",
+                    "base_ts": [1.0, 2.0],
+                    "region": [0, 2],
+                    "strength_label": 0,
+                    "strength_scalar": 0.0,
+                    "strength_text": "weak",
+                    "duration_bucket": "medium",
+                    "edit_intent_gt": {"effect_family": "seasonality", "direction": "neutral", "shape": "periodic"},
+                },
+            ]
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            src = Path(tmpdir) / "benchmark.json"
+            out = Path(tmpdir) / "replay.json"
+            src.write_text(json.dumps(payload), encoding="utf-8")
+            result = build_replay_benchmark(
+                benchmark_path=str(src),
+                output_path=str(out),
+                trend_runtime_scalar="legacy_label",
+            )
+            replay = json.loads(out.read_text(encoding="utf-8"))
+
+        self.assertEqual(result["num_samples"], 2)
+        self.assertEqual(replay["samples"][0]["replay_plan"]["tool_name"], "hybrid_up")
+        self.assertEqual(replay["samples"][0]["runtime_strength_scalar"], 1.0)
+        self.assertEqual(replay["samples"][1]["replay_plan"]["tool_name"], "season_enhance")
+
+    def test_resolve_execution_instruction_falls_back_to_builder(self):
+        plan = {
+            "intent": {"effect_family": "seasonality", "shape": "periodic", "strength": "weak", "duration": "medium"},
+            "execution": {},
+            "parameters": {},
+        }
+        self.assertEqual(_resolve_execution_instruction(plan), "Apply a weak seasonality enhancement in this medium window")
+
+    def test_season_enhance_target_attrs_are_strength_binned(self):
+        self.assertTrue(np.array_equal(_resolve_season_enhance_tgt_attrs(strength_label=0), np.array([0, 0, 1], dtype=np.int64)))
+        self.assertTrue(np.array_equal(_resolve_season_enhance_tgt_attrs(strength_label=1), np.array([0, 0, 2], dtype=np.int64)))
+        self.assertTrue(np.array_equal(_resolve_season_enhance_tgt_attrs(strength_label=2), np.array([0, 0, 3], dtype=np.int64)))
+        self.assertTrue(np.array_equal(_resolve_season_enhance_tgt_attrs(strength_scalar=0.0), np.array([0, 0, 1], dtype=np.int64)))
+        self.assertTrue(np.array_equal(_resolve_season_enhance_tgt_attrs(strength_scalar=0.5), np.array([0, 0, 2], dtype=np.int64)))
+        self.assertTrue(np.array_equal(_resolve_season_enhance_tgt_attrs(strength_scalar=1.0), np.array([0, 0, 3], dtype=np.int64)))
+
+    def test_seasonality_amplitude_gain_is_strength_ordered(self):
+        self.assertAlmostEqual(_resolve_seasonality_amplitude_gain(strength_label=0), 0.08)
+        self.assertAlmostEqual(_resolve_seasonality_amplitude_gain(strength_label=1), 0.25)
+        self.assertAlmostEqual(_resolve_seasonality_amplitude_gain(strength_label=2), 0.45)
+        self.assertAlmostEqual(_resolve_seasonality_amplitude_gain(strength_scalar=0.0), 0.08)
+        self.assertAlmostEqual(_resolve_seasonality_amplitude_gain(strength_scalar=0.5), 0.25)
+        self.assertAlmostEqual(_resolve_seasonality_amplitude_gain(strength_scalar=1.0), 0.45)
+
+    def test_seasonality_amplitude_anchor_grows_with_strength(self):
+        ts = np.sin(np.linspace(0.0, 4.0 * np.pi, 96, endpoint=False)).astype(np.float32)
+        weak_anchor = _build_seasonality_amplitude_anchor(ts, 16, 80, strength_label=0, apply_soft_mask=False)
+        medium_anchor = _build_seasonality_amplitude_anchor(ts, 16, 80, strength_label=1, apply_soft_mask=False)
+        strong_anchor = _build_seasonality_amplitude_anchor(ts, 16, 80, strength_label=2, apply_soft_mask=False)
+
+        weak_gain = float(np.mean(np.abs(weak_anchor[16:80])))
+        medium_gain = float(np.mean(np.abs(medium_anchor[16:80])))
+        strong_gain = float(np.mean(np.abs(strong_anchor[16:80])))
+
+        self.assertLess(weak_gain, medium_gain)
+        self.assertLess(medium_gain, strong_gain)
+
+    def test_seasonality_scaffold_delta_grows_with_strength(self):
+        ts = np.sin(np.linspace(0.0, 4.0 * np.pi, 96, endpoint=False)).astype(np.float32)
+        weak = _build_seasonality_scaffold(ts, 16, 80, strength_label=0, apply_soft_mask=False)
+        medium = _build_seasonality_scaffold(ts, 16, 80, strength_label=1, apply_soft_mask=False)
+        strong = _build_seasonality_scaffold(ts, 16, 80, strength_label=2, apply_soft_mask=False)
+
+        weak_gain = float(np.mean(np.abs(weak[16:80] - ts[16:80])))
+        medium_gain = float(np.mean(np.abs(medium[16:80] - ts[16:80])))
+        strong_gain = float(np.mean(np.abs(strong[16:80] - ts[16:80])))
+
+        self.assertLess(weak_gain, medium_gain)
+        self.assertLess(medium_gain, strong_gain)
+
+    def test_seasonality_fixed_period_metric_separates_amplitude_from_level(self):
+        n = 96
+        cycles = 4
+        t = np.arange(n, dtype=np.float64)
+        base = np.zeros(n, dtype=np.float64)
+        target = np.sin(2.0 * np.pi * cycles * t / n)
+        level_cheat = target + 5.0
+        mask = np.ones(n, dtype=bool)
+        config = {"cycles": cycles, "expected_period": n / cycles}
+
+        target_metrics = strength_effect_eval._seasonality_frequency_fixed_metrics(base, target, target, mask, config)
+        cheat_metrics = strength_effect_eval._seasonality_frequency_fixed_metrics(base, target, level_cheat, mask, config)
+
+        self.assertAlmostEqual(target_metrics["target_fixed_period_fourier_amplitude"], 1.0, places=5)
+        self.assertAlmostEqual(cheat_metrics["pred_fixed_period_fourier_amplitude"], 1.0, places=5)
+        self.assertGreater(cheat_metrics["level_drift"], 4.9)
+
+    def test_seasonality_fixed_period_metric_flags_frequency_cheat(self):
+        n = 96
+        expected_cycles = 4
+        t = np.arange(n, dtype=np.float64)
+        base = np.zeros(n, dtype=np.float64)
+        target = np.sin(2.0 * np.pi * expected_cycles * t / n)
+        frequency_cheat = np.sin(2.0 * np.pi * 8 * t / n)
+        mask = np.ones(n, dtype=bool)
+        config = {"cycles": expected_cycles, "expected_period": n / expected_cycles}
+
+        metrics = strength_effect_eval._seasonality_frequency_fixed_metrics(base, target, frequency_cheat, mask, config)
+
+        self.assertLess(metrics["pred_fixed_period_fourier_amplitude"], 0.05)
+        self.assertGreater(metrics["dominant_period_error"], 10.0)
+
+    def test_seasonality_dominant_period_uses_edit_delta_not_source_shape(self):
+        n = 96
+        expected_cycles = 4
+        t = np.arange(n, dtype=np.float64)
+        base = 3.0 * np.sin(2.0 * np.pi * 1 * t / n)
+        seasonal_delta = np.sin(2.0 * np.pi * expected_cycles * t / n)
+        target = base + seasonal_delta
+        edited = target.copy()
+        mask = np.ones(n, dtype=bool)
+        config = {"cycles": expected_cycles, "expected_period": n / expected_cycles}
+
+        metrics = strength_effect_eval._seasonality_frequency_fixed_metrics(base, target, edited, mask, config)
+
+        self.assertAlmostEqual(metrics["dominant_period_error"], 0.0, places=6)
+
+    def test_fixed_period_seasonality_scaffold_matches_config_frequency(self):
+        n = 96
+        start, end = 10, 58
+        cycles = 4
+        amplitude = 0.3
+        phase = 0.4
+        ts = np.zeros(n, dtype=np.float32)
+        config = {
+            "control_axis": "seasonality_amplitude",
+            "frequency_edit_allowed": False,
+            "cycles": cycles,
+            "phase": phase,
+            "seasonal_amplitude": amplitude,
+            "expected_period": (end - start) / cycles,
+        }
+
+        scaffold = _build_fixed_period_seasonality_scaffold(ts, start, end, config)
+        mask = np.zeros(n, dtype=bool)
+        mask[start:end] = True
+        metrics = strength_effect_eval._seasonality_frequency_fixed_metrics(
+            ts,
+            scaffold,
+            scaffold,
+            mask,
+            config,
+        )
+
+        self.assertIsNotNone(scaffold)
+        self.assertAlmostEqual(metrics["dominant_period_error"], 0.0, places=6)
+        self.assertGreater(metrics["pred_fixed_period_fourier_amplitude"], 0.0)
+        self.assertAlmostEqual(metrics["level_drift"], 0.0, places=6)
+        self.assertAlmostEqual(metrics["trend_drift"], 0.0, places=6)
+
+    def test_trend_injection_scaffold_uses_configured_hump_amplitude(self):
+        ts = np.ones(12, dtype=np.float32) * 5.0
+        scaffold = _build_trend_injection_scaffold(
+            ts,
+            2,
+            10,
+            {"injection_type": "trend_injection", "amplitude": 4.0},
+        )
+
+        self.assertIsNotNone(scaffold)
+        self.assertAlmostEqual(float(scaffold[0]), 5.0)
+        self.assertAlmostEqual(float(scaffold[2]), 5.0)
+        self.assertAlmostEqual(float(scaffold[9]), 5.0)
+        self.assertGreater(float(np.max(scaffold[2:10] - ts[2:10])), 3.7)
+
+    def test_multiplier_scaffold_uses_configured_ratio_and_ramp(self):
+        ts = np.ones(12, dtype=np.float32) * 2.0
+        scaffold = _build_multiplier_scaffold(
+            ts,
+            2,
+            10,
+            {"injection_type": "multiplier", "multiplier": 2.0, "ramp_out": 3},
+        )
+
+        self.assertIsNotNone(scaffold)
+        self.assertAlmostEqual(float(scaffold[2]), 4.0)
+        self.assertAlmostEqual(float(scaffold[6]), 4.0)
+        self.assertAlmostEqual(float(scaffold[9]), 2.0)
+        self.assertAlmostEqual(float(scaffold[0]), 2.0)
+
+    def test_step_change_scaffold_uses_configured_magnitude_and_ramp(self):
+        ts = np.ones(12, dtype=np.float32) * 5.0
+        scaffold = _build_step_change_scaffold(
+            ts,
+            2,
+            10,
+            {"injection_type": "step_change", "magnitude": -3.0, "ramp_out": 3},
+        )
+
+        self.assertIsNotNone(scaffold)
+        self.assertAlmostEqual(float(scaffold[2]), 2.0)
+        self.assertAlmostEqual(float(scaffold[6]), 2.0)
+        self.assertAlmostEqual(float(scaffold[9]), 5.0)
+        self.assertAlmostEqual(float(scaffold[0]), 5.0)
+
+    def test_hard_zero_scaffold_uses_configured_floor_and_ramp(self):
+        ts = np.arange(12, dtype=np.float32)
+        scaffold = _build_hard_zero_scaffold(
+            ts,
+            2,
+            10,
+            {"injection_type": "hard_zero", "floor_value": 1.5, "ramp": 2},
+        )
+
+        self.assertIsNotNone(scaffold)
+        self.assertAlmostEqual(float(scaffold[2]), 2.0)
+        self.assertAlmostEqual(float(scaffold[3]), 1.5)
+        self.assertAlmostEqual(float(scaffold[6]), 1.5)
+        self.assertAlmostEqual(float(scaffold[9]), 10.0)
+        self.assertAlmostEqual(float(scaffold[0]), 0.0)
+
+    def test_noise_injection_scaffold_scales_same_template_monotonically(self):
+        ts = np.ones(16, dtype=np.float32) * 10.0
+        template = [-1.0, 0.0, 1.0, 0.5, -0.5, 1.5, -1.5, 0.25]
+        weak = _build_noise_injection_scaffold(
+            ts,
+            4,
+            12,
+            {
+                "injection_type": "noise_injection",
+                "noise_std_ratio": 0.5,
+                "baseline_offset": 0.0,
+                "region_noise_std": 2.0,
+                "noise_template": template,
+            },
+        )
+        strong = _build_noise_injection_scaffold(
+            ts,
+            4,
+            12,
+            {
+                "injection_type": "noise_injection",
+                "noise_std_ratio": 1.5,
+                "baseline_offset": 0.0,
+                "region_noise_std": 2.0,
+                "noise_template": template,
+            },
+        )
+
+        self.assertIsNotNone(weak)
+        self.assertIsNotNone(strong)
+        weak_delta = np.asarray(weak[4:12] - ts[4:12], dtype=np.float64)
+        strong_delta = np.asarray(strong[4:12] - ts[4:12], dtype=np.float64)
+        self.assertGreater(float(np.std(strong_delta)), float(np.std(weak_delta)))
+        self.assertAlmostEqual(float(np.mean(weak_delta)), 0.0, places=6)
+
     def test_legacy_scalar_family_dataset_meta_and_sweep_contract(self):
         csv_path = REPO_ROOT / "test_scripts" / "data" / "ETTh1.csv"
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -479,17 +903,35 @@ class TestOutputBranchCarrierContract(unittest.TestCase):
         summary = {
             "spacing_metrics_primary": True,
             "local_path_default_definition": "edit_time_series + edit_mask + final_output_strength_mapping.scope=edit_region",
-            "pred_weak_le_medium_pass_rate": 1.0,
-            "pred_medium_le_strong_pass_rate": 1.0,
-            "pred_min_adjacent_gap_mean": 0.2,
-            "pred_adjacent_gap_collapse_mean": 0.0,
-            "pred_medium_minus_weak_mean": 0.2,
-            "pred_strong_minus_medium_mean": 0.2,
-            "pred_duration_bucket_spacing": {
+            "raw_weak_le_medium_pass_rate": 1.0,
+            "raw_medium_le_strong_pass_rate": 1.0,
+            "raw_min_adjacent_gap_mean": 0.2,
+            "raw_adjacent_gap_collapse_mean": 0.0,
+            "raw_medium_minus_weak_mean": 0.2,
+            "raw_strong_minus_medium_mean": 0.2,
+            "raw_duration_bucket_spacing": {
+                "medium": {
+                    "min_adjacent_gap_mean": 0.3,
+                    "adjacent_gap_collapse_mean": 0.0,
+                },
                 "long": {
                     "min_adjacent_gap_mean": 0.1,
                     "adjacent_gap_collapse_mean": 0.0,
                 }
+            },
+            "final_weak_le_medium_pass_rate": 1.0,
+            "final_medium_le_strong_pass_rate": 1.0,
+            "final_min_adjacent_gap_mean": 0.2,
+            "final_adjacent_gap_collapse_mean": 0.0,
+            "final_duration_bucket_spacing": {
+                "medium": {
+                    "min_adjacent_gap_mean": 0.3,
+                    "adjacent_gap_collapse_mean": 0.0,
+                },
+                "long": {
+                    "min_adjacent_gap_mean": 0.1,
+                    "adjacent_gap_collapse_mean": 0.0,
+                },
             },
             "target_weak_le_medium_pass_rate": 0.0,
             "target_medium_le_strong_pass_rate": 0.0,
@@ -501,10 +943,149 @@ class TestOutputBranchCarrierContract(unittest.TestCase):
 
         selection = finetuner._build_spacing_selection_payload(summary)
 
-        self.assertAlmostEqual(selection["selection_score"], 1.2, places=6)
+        self.assertAlmostEqual(selection["selection_score"], 1.625, places=6)
+        self.assertAlmostEqual(selection["selection_score_v2"], 1.625, places=6)
+        self.assertEqual(selection["selection_primary_domain"], "raw_local_spacing")
+        self.assertEqual(selection["selection_tiebreak"], "collapse_then_loss")
         self.assertAlmostEqual(selection["weak_le_medium_pass_rate"], 1.0, places=6)
         self.assertAlmostEqual(selection["min_adjacent_gap_mean"], 0.2, places=6)
+        self.assertAlmostEqual(selection["medium_bucket_min_adjacent_gap_mean"], 0.3, places=6)
+        self.assertAlmostEqual(selection["long_bucket_min_adjacent_gap_mean"], 0.1, places=6)
         self.assertAlmostEqual(selection["target_spacing_reference"]["min_adjacent_gap_mean"], -1.0, places=6)
+        self.assertAlmostEqual(selection["final_spacing_summary"]["min_adjacent_gap_mean"], 0.2, places=6)
+
+    def test_finetuner_spacing_selection_tiebreaks_by_collapse_before_loss(self):
+        finetuner = Finetuner.__new__(Finetuner)
+
+        self.assertTrue(
+            finetuner._is_better_selection(
+                candidate_score=1.0,
+                candidate_loss=20.0,
+                best_score=1.0,
+                best_loss=10.0,
+                candidate_collapse=0.2,
+                best_collapse=0.4,
+            )
+        )
+        self.assertFalse(
+            finetuner._is_better_selection(
+                candidate_score=1.0,
+                candidate_loss=5.0,
+                best_score=1.0,
+                best_loss=10.0,
+                candidate_collapse=0.5,
+                best_collapse=0.2,
+            )
+        )
+
+    def test_finetuner_valid_summary_aggregates_raw_and_final_bucket_spacing(self):
+        finetuner = Finetuner.__new__(Finetuner)
+        predicted_diagnostics = [
+            {
+                "pred_duration_bucket_spacing": {
+                    "medium": {"min_adjacent_gap_mean": 0.2, "adjacent_gap_collapse_mean": 0.5},
+                    "long": {"min_adjacent_gap_mean": 0.1, "adjacent_gap_collapse_mean": 0.4},
+                },
+                "raw_duration_bucket_spacing": {
+                    "medium": {"min_adjacent_gap_mean": 0.2, "adjacent_gap_collapse_mean": 0.5},
+                    "long": {"min_adjacent_gap_mean": 0.1, "adjacent_gap_collapse_mean": 0.4},
+                },
+                "final_duration_bucket_spacing": {
+                    "medium": {"min_adjacent_gap_mean": 0.25, "adjacent_gap_collapse_mean": 0.45},
+                    "long": {"min_adjacent_gap_mean": 0.15, "adjacent_gap_collapse_mean": 0.35},
+                },
+                "raw_weak_le_medium_pass_rate": 1.0,
+                "raw_medium_le_strong_pass_rate": 1.0,
+                "raw_min_adjacent_gap_mean": 0.2,
+                "raw_adjacent_gap_collapse_mean": 0.0,
+                "final_weak_le_medium_pass_rate": 1.0,
+                "final_medium_le_strong_pass_rate": 1.0,
+                "final_min_adjacent_gap_mean": 0.2,
+                "final_adjacent_gap_collapse_mean": 0.0,
+                "spacing_metrics_primary": True,
+            }
+        ]
+
+        predicted_summary = finetuner._summarize_numeric_dicts(predicted_diagnostics)
+        predicted_summary["pred_duration_bucket_spacing"] = finetuner._aggregate_duration_bucket_spacing(predicted_diagnostics, "pred_duration_bucket_spacing")
+        predicted_summary["raw_duration_bucket_spacing"] = finetuner._aggregate_duration_bucket_spacing(predicted_diagnostics, "raw_duration_bucket_spacing")
+        predicted_summary["final_duration_bucket_spacing"] = finetuner._aggregate_duration_bucket_spacing(predicted_diagnostics, "final_duration_bucket_spacing")
+        selection = finetuner._build_spacing_selection_payload(predicted_summary)
+
+        self.assertAlmostEqual(selection["selection_score_v2"], 1.55, places=6)
+        self.assertAlmostEqual(selection["raw_duration_bucket_spacing"]["medium"]["min_adjacent_gap_mean"], 0.2, places=6)
+        self.assertAlmostEqual(selection["final_duration_bucket_spacing"]["long"]["min_adjacent_gap_mean"], 0.15, places=6)
+
+    def test_finetuner_spacing_best_window_qualifies_when_score_and_medium_long_gap_are_positive(self):
+        finetuner = Finetuner.__new__(Finetuner)
+        finetuner.spacing_best_window_require_positive_score = True
+        finetuner.spacing_best_window_require_positive_medium_long_gap = True
+        selection = {
+            "selection_score_v2": 0.1,
+            "medium_bucket_min_adjacent_gap_mean": 0.01,
+            "long_bucket_min_adjacent_gap_mean": 0.02,
+        }
+        self.assertTrue(finetuner._spacing_best_window_qualifies(selection))
+        selection["long_bucket_min_adjacent_gap_mean"] = -0.01
+        self.assertFalse(finetuner._spacing_best_window_qualifies(selection))
+
+    def test_finetuner_spacing_early_stop_triggers_after_patience_without_refresh(self):
+        finetuner = Finetuner.__new__(Finetuner)
+        finetuner.spacing_best_window_require_positive_score = True
+        finetuner.spacing_best_window_require_positive_medium_long_gap = True
+        finetuner._best_valid_selection = {
+            "spacing_selection": {
+                "selection_score_v2": 0.5,
+                "medium_bucket_min_adjacent_gap_mean": 0.3,
+                "long_bucket_min_adjacent_gap_mean": 0.2,
+            }
+        }
+        finetuner.output_folder = tempfile.mkdtemp()
+        finetuner._spacing_early_stop_state = {
+            "enabled": True,
+            "patience": 2,
+            "best_window_active": False,
+            "best_window_enter_epoch": None,
+            "no_improve_count": 0,
+            "triggered": False,
+            "trigger_epoch": None,
+        }
+        qualifying = {
+            "selection_score_v2": 0.5,
+            "medium_bucket_min_adjacent_gap_mean": 0.3,
+            "long_bucket_min_adjacent_gap_mean": 0.2,
+        }
+        self.assertFalse(finetuner._update_spacing_early_stop_state(1, qualifying, is_best=True))
+        self.assertTrue(finetuner._spacing_early_stop_state["best_window_active"])
+        self.assertFalse(finetuner._update_spacing_early_stop_state(2, qualifying, is_best=False))
+        self.assertEqual(finetuner._spacing_early_stop_state["no_improve_count"], 1)
+        self.assertTrue(finetuner._update_spacing_early_stop_state(3, qualifying, is_best=False))
+        self.assertTrue(finetuner._spacing_early_stop_state["triggered"])
+        self.assertEqual(finetuner._spacing_early_stop_state["trigger_epoch"], 3)
+
+    def test_discrete_strength_family_loader_preserves_duration_bucket(self):
+        csv_path = REPO_ROOT / "test_scripts" / "data" / "ETTh1.csv"
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir) / "trend_legacy_family"
+            build_family_dataset(
+                csv_path=str(csv_path),
+                dataset_name="ETTh1",
+                output_dir=str(output_dir),
+                seq_len=96,
+                random_seed=17,
+                train_families=1,
+                valid_families=1,
+                test_families=1,
+                injection_types=["trend_injection"],
+                selector="trend_injection",
+                scalar_scheme="legacy_0_1_2",
+            )
+            dataset = EditDataset({"name": "discrete_strength_family", "folder": str(output_dir)})
+            batch = next(iter(dataset.get_loader(split="valid", batch_size=1, shuffle=False, include_self=False)))
+
+        self.assertIsInstance(batch.get("duration_bucket"), list)
+        self.assertEqual(len(batch["duration_bucket"]), 3)
+        self.assertTrue(all(isinstance(item, str) and item for item in batch["duration_bucket"]))
 
     def test_strength_effect_eval_uses_edit_region_soft_local_route(self):
         calls = []

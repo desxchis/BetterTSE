@@ -11,6 +11,17 @@ STRENGTH_TEXT_TO_LABEL = {
 
 
 _WEAK_PHRASES = [
+    "weak",
+    "low strength",
+    "mild",
+    "slight",
+    "subtle",
+    "gentle",
+    "弱档",
+    "轻微档",
+    "弱一些",
+    "偏弱",
+    "轻微",
     "稍微增强一点",
     "轻微增强",
     "略微增强",
@@ -25,6 +36,14 @@ _WEAK_PHRASES = [
 ]
 
 _MEDIUM_PHRASES = [
+    "medium",
+    "moderate",
+    "medium strength",
+    "normal strength",
+    "中等档",
+    "中档",
+    "中等",
+    "适中档",
     "适当增强",
     "适度增强",
     "中等增强",
@@ -35,6 +54,17 @@ _MEDIUM_PHRASES = [
 ]
 
 _STRONG_PHRASES = [
+    "strong",
+    "high strength",
+    "intense",
+    "clear",
+    "obvious",
+    "significant",
+    "强档",
+    "明显档",
+    "强烈",
+    "偏强",
+    "明显",
     "尽量强",
     "尽可能强",
     "非常强",
@@ -47,6 +77,9 @@ _STRONG_PHRASES = [
 
 _CONSTRAINT_PHRASES = {
     "avoid_overshoot": [
+        "avoid overshoot",
+        "do not overshoot",
+        "not too much",
         "别过冲",
         "不要过冲",
         "别太夸张",
@@ -55,6 +88,9 @@ _CONSTRAINT_PHRASES = {
         "不要太猛",
     ],
     "conservative": [
+        "conservative",
+        "keep it conservative",
+        "not too strong",
         "保守一点",
         "别太强",
         "不要太强",

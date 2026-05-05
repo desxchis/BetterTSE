@@ -28,50 +28,58 @@ You must reason in TWO STAGES, but output ONE JSON object:
 
 ━━━━━━━━━━━━━━━━━  STAGE 1: TEMPORAL LOCALIZATION  ━━━━━━━━━━━━━━━━━
 
-First identify the time anchor phrase and map it to a coarse bucket before deciding the exact region.
+This is the most critical stage. You must produce a PRECISE temporal bounding box, not a loose guess.
 
-Bucket guide:
-- early: indices `[0, {early_end})`
-- mid: indices `[{early_end}, {mid_end})`
-- late: indices `[{mid_end}, {ts_length})`
+──── STEP 1a: Identify the duration bucket ──────────────────────────
 
-Typical phrase mapping:
-- `自今日清晨起`, `在早班交接后`, `大清早的时候` -> usually `early`
-- `从今天中午开始`, `在今日运行中段`, `刚才` -> usually `mid`
-- `预计在今晚深夜`, `在夜间低谷期前`, `就快到半夜的时候` -> usually `late`
+The prompt will include a duration hint keyword. Map it to an exact step range:
+- `short`  → 8–18 steps
+- `medium` → 18–35 steps
+- `long`   → 35–60 steps
 
-Localization rules:
-- Output a coarse `position_bucket` first, then choose an exact `region`.
-- The region should be a local temporal box, not the whole sequence.
-- Use `duration_steps` as an explicit estimate of event length before finalizing the region.
-- For transient shock / switch events, duration is usually short: 5–20 steps.
-- For sustained trend / seasonality / shutdown events, duration is usually medium or long: 15–60 steps.
+The chosen `duration_steps` MUST fall inside the range for the bucket mentioned in the prompt.
+The region length (`region[1] - region[0]`) MUST equal `duration_steps`.
+
+──── STEP 1b: Identify the position bucket ──────────────────────────
+
+The prompt will include a positional hint phrase. Map it to the right bucket:
+- "early part", "early position", or "first third" → early: center at {(early_end)//2}
+- "middle part", "middle position", or "center part" → mid: center at {(early_end + mid_end)//2}
+- "late part", "late position", or "last third" → late: center at {(mid_end + ts_length)//2}
+
+If no positional phrase is present, default to mid bucket.
+
+──── STEP 1c: Place the window ──────────────────────────────────────
+
+1. Set region_center to the bucket center from STEP 1b.
+2. Center the window: region_start = region_center - duration_steps//2, region_end = region_start + duration_steps.
+3. Clip to bounds: region_start = max(0, region_start), region_end = min({ts_length}, region_end).
+4. Region must be strictly less than the full sequence.
+
+Generate 3 proposals, each with a different duration_steps within the bucket's range.
+All proposals use the SAME region_center. Only duration varies.
+Rank by how well the duration fills the bucket's typical range.
 
 ━━━━━━━━━━━━━━━━━  STAGE 2: CANONICAL EDIT INTENT  ━━━━━━━━━━━━━━━━━
 
 Infer the intent with these fields:
-- effect_family: `trend`, `seasonality`, `volatility`, `impulse`, `level`, `shutdown`
+- effect_family: `trend`, `seasonality`, `hard_zero`, `step_change`, `multiplier`, `noise_injection`
 - direction: `up`, `down`, `neutral`
-- shape: `linear`, `quadratic`, `hump`, `plateau`, `step`, `flatline`, `irregular_noise`, `transient`, `periodic`, `flatten`, `residual_amplify`, `none`
+- shape: `linear`, `quadratic`, `hump`, `step`, `flatline`, `irregular_noise`, `periodic`, `flatten`, `scaled_surge`, `none`
 - duration: `short`, `medium`, `long`
 - strength: `weak`, `medium`, `strong`
 
 Disambiguation rules:
-- If the effect is short-lived and returns quickly toward baseline, prefer `impulse`.
-- If the mean level stays roughly unchanged but fluctuations widen or narrow, prefer `volatility`.
 - If the main change is oscillation amplitude or cyclicity, prefer `seasonality`.
-- Only choose `trend` when the event implies sustained drift across many steps.
-- Only choose `shutdown` when the semantics clearly imply zeroing, outage, or hard stop.
-- If the prompt says "短时冲高后回落", "先偏离后恢复", or "一度承压随后恢复", prefer `shape=hump` rather than a long global trend.
-- If the prompt says "持续承压并维持高位", "持续偏高", "维持在高位一段时间", prefer `effect_family=level` and `shape=plateau`.
-- If the prompt says "突然切换后维持", "切换到新的状态", or "跳到另一种运行水平", prefer `effect_family=level` and `shape=step`.
-- If the prompt says "杂乱跳变", "信号失真", or "无规律波动", prefer `effect_family=volatility` and `shape=irregular_noise`.
+- If the prompt says "local trend edit", "temporary upward hump", "temporary downward dip", or "depart-then-return", prefer `effect_family=trend` and `shape=hump`.
+- If the prompt says "switch to a new level", "regime switch", or "jump to another operating level", prefer `effect_family=step_change` and `shape=step`.
+- If the prompt says "multiplicative amplification", "amplified by a multiplier", or "overall amplification but outside-window unchanged", prefer `effect_family=multiplier` and `shape=scaled_surge`.
+- If the prompt says "irregular noise", "distorted signal", "erratic readings", or "random jumps", prefer `effect_family=noise_injection` and `shape=irregular_noise`.
 - If the prompt mentions regular cycles, seasonal rhythm, repeated oscillation, daily/weekly periodic pattern, or rhythmic ups and downs, prefer `effect_family=seasonality` rather than `volatility`.
-- If the prompt says "周期更明显", "节律更强", "峰谷更清晰", or "重复起伏被放大", prefer `effect_family=seasonality` and `shape=periodic`.
-- If the prompt says "周期被压平", "节律减弱", "峰谷没那么明显", or "重复起伏被削弱", prefer `effect_family=seasonality` and `shape=flatten`.
-- If the prompt says "降到极低水平并维持", "停摆", or "几乎中断", prefer `effect_family=shutdown` and `shape=flatline`.
-- Use `shape=transient` only for a very short spike-like pulse, not for a medium-duration hump or flatline event.
-- Use `shape=linear` only for sustained monotonic drift, not for a step switch.
+- If the prompt says "repeated peaks and troughs are clearer", "seasonality is stronger", or "periodic oscillations are amplified", prefer `effect_family=seasonality` and `shape=periodic`.
+- If the prompt says "seasonality is flattened", "weaker periodic oscillations", or "peaks and troughs are muted", prefer `effect_family=seasonality` and `shape=flatten`.
+- If the prompt says "near-zero flatline", "shutdown", or "almost interrupted", prefer `effect_family=hard_zero` and `shape=flatline`.
+- Use `shape=linear` only for sustained monotonic drift when the trend does not clearly return toward baseline.
 
 ━━━━━━━━━━━━━━━━━  STAGE 3: TOOL MAPPING  ━━━━━━━━━━━━━━━━━
 
@@ -89,40 +97,43 @@ Canonical mapping guide:
 - `trend + down + quadratic` -> `trend_quadratic_down` -> `trend_quadratic_down`
 - `seasonality + neutral + periodic` -> `seasonality_enhance` -> `season_enhance`
 - `seasonality + neutral + flatten` -> `seasonality_reduce` -> `season_reduce`
-- `volatility + neutral + flatten` -> `smooth_denoise` -> `ensemble_smooth`
-- `volatility + neutral + residual_amplify` -> choose the closest split volatility tool, not the old generic one
-- `volatility + neutral + irregular_noise` -> prefer:
+- `trend + up/down + hump` -> stable local trend tool; prefer `trend_linear_up/down` -> `hybrid_up/hybrid_down`
+- `step_change + up/down + step` -> `level_step` -> `step_shift`
+- `hard_zero + down + flatline` -> `hard_zero_flatline` -> `hybrid_down`
+- `multiplier + up + scaled_surge` -> `multiplier_amplify` -> `hybrid_up`
+- `noise_injection + neutral + irregular_noise` -> choose the closest split noise tool, not the old generic family label:
   - whole-window noisy corruption -> `volatility_global_scale` -> `volatility_global_scale`
   - local bursty corruption -> `volatility_local_burst` -> `volatility_local_burst`
   - gradually stronger/weaker corruption -> `volatility_envelope_monotonic` -> `volatility_envelope_monotonic`
-- `impulse + up/down + transient` -> `impulse_spike` -> `spike_inject`
-- `impulse + up/down + hump` -> closest current local hump tool; prefer `spike_inject` for short/medium local bump, or `trend_quadratic_up/down` only if the window is clearly wider and smoother
-- `level + up + plateau` -> closest current elevated-level tool; prefer `hybrid_up`
-- `level + up/down + step` -> `level_step` -> `step_shift`
-- `shutdown + down + flatline` -> closest current shutdown tool; prefer `hybrid_down`
 
 Weak-signal interpretation guide:
-- "持续承压", "持续走高", "明显偏高" -> likely `trend + up`
-- "持续承压并维持高位", "持续偏高", "高位维持一段时间" -> likely `level + plateau`
-- "周期更明显", "节律增强", "峰谷更清晰" -> likely `seasonality + periodic`
-- "周期被压平", "节律减弱", "峰谷变钝" -> likely `seasonality + flatten`
-- "持续走低", "跌到低位并维持" -> likely `trend + down` or `shutdown`
-- "短时冲高后恢复" -> likely `impulse + hump`
-- "突然切换并维持" -> likely `level + step`; prefer `step_shift`
-- "杂乱跳变", "信号异常", "读数失真" -> likely `volatility + irregular_noise`
-- "降到极低水平并维持" -> likely `shutdown + flatline`
+- "sustained high level", "keeps rising", "clearly elevated" -> likely `trend + up`
+- "stronger seasonality", "clearer rhythm", "clearer peaks and troughs" -> likely `seasonality + periodic`
+- "seasonality is flattened", "weaker rhythm", "muted peaks and troughs" -> likely `seasonality + flatten`
+- "sustained low level", "drops to a low level and stays there" -> likely `trend + down` or `hard_zero`
+- "short upward hump then recovery" -> likely `trend + hump`
+- "sudden switch and then maintained" -> likely `step_change + step`; prefer `step_shift`
+- "irregular jumps", "abnormal signal", "distorted readings" -> likely `noise_injection + irregular_noise`
+- "drops to a near-zero level and stays there" -> likely `hard_zero + flatline`
 
 ━━━━━━━━━━━━━━━━━  REGION SELECTION  ━━━━━━━━━━━━━━━━━
 
-- Sustained trend/seasonality effects usually span 20–60 steps.
-- Volatility changes usually span 10–40 steps.
-- Transient impulses usually span 5–20 steps.
-- The event should start at a plausible future index relative to the event onset.
+Duration-by-family reference (region length = duration_steps):
+- trend/seasonality: short=10–18, medium=20–35, long=40–60 steps
+- hard_zero/step_change/multiplier: short=8–12, medium=14–25, long=26–40 steps
+- noise_injection: short=8–15, medium=16–30, long=30–50 steps
+
+Position defaults (when no explicit time anchor in prompt):
+- short events: centered in the mid bucket
+- medium events: centered in the mid bucket
+- long events: mid bucket, shifted toward the second quarter
 
 CRITICAL CONSTRAINTS:
 - region[0] MUST be >= 0 and < {ts_length}
 - region[1] MUST be > region[0] and <= {ts_length}
-- The region length MUST be >= 1
+- region[1] - region[0] MUST equal duration_steps (exact match)
+- The region length MUST be >= 5
+- Do NOT select the full sequence as the region
 - `math_shift` and `shift_factor` are mutually exclusive
 - For volatility split tools and `spike_inject`, do not provide `math_shift` or `shift_factor`
 
@@ -133,9 +144,9 @@ Return STRICT JSON with this schema:
   "thought": "brief reasoning from time anchor -> region -> canonical intent -> execution tool",
   "volatility_subtype": "<global_scale|local_burst|envelope_monotonic|preview_non_monotonic|none>",
   "intent": {{
-    "effect_family": "<trend|seasonality|volatility|impulse|level|shutdown>",
+    "effect_family": "<trend|seasonality|hard_zero|step_change|multiplier|noise_injection>",
     "direction": "<up|down|neutral>",
-    "shape": "<linear|quadratic|hump|plateau|step|flatline|irregular_noise|transient|periodic|flatten|residual_amplify|none>",
+    "shape": "<linear|quadratic|hump|step|flatline|irregular_noise|periodic|flatten|scaled_surge|none>",
     "duration": "<short|medium|long>",
     "strength": "<weak|medium|strong>"
   }},
@@ -152,6 +163,7 @@ Return STRICT JSON with this schema:
     "tool_name": "<actual execution tool>",
     "control_source": "<native_tedit|hybrid|math_only>",
     "local_edit_hint": "short local instruction for the selected region only",
+    "execution_phrase": "a short canonical execution phrase derived from the parsed intent only; this will be passed to the editing model instead of the full user instruction",
     "parameters": {{
       "region": [int, int]
     }}
@@ -159,7 +171,7 @@ Return STRICT JSON with this schema:
 }}
 
 Parameter rules:
-- `volatility_subtype` is required when `intent.effect_family=volatility` or `intent.shape=irregular_noise`
+- `volatility_subtype` is required when `intent.effect_family=noise_injection` or `intent.shape=irregular_noise`
 - Use `preview_non_monotonic` for multi-stage / non-monotonic envelope cases; these remain preview-side cases
 - `hybrid_up`, `hybrid_down`, `trend_quadratic_up`, `trend_quadratic_down`:
   may include either `math_shift` or `shift_factor`
@@ -169,14 +181,16 @@ Parameter rules:
   may include `background_scale`, `burst_center`, `burst_width`, `burst_amplitude`, `burst_envelope_sharpness`, `baseline_offset_ratio`
 - `volatility_envelope_monotonic`:
   may include `base_noise_scale`, `start_scale`, `end_scale`, `baseline_offset_ratio`, `trend_preserve`
-- `spike_inject`:
-  may include `amplitude`, `width`, `center`
 - `step_shift`:
   may include either `math_shift` or `shift_factor`
 - `season_enhance`, `season_reduce`, `ensemble_smooth`:
   region only
 - For seasonality tools, strength is represented in `intent.strength` and may be passed as `strength_label` / `strength_scalar` to the TEdit strength path when available.
 - Do not use `math_shift` or `shift_factor` for seasonality; periodic amplitude is controlled by the strength path or benchmark target amplitude.
+- `execution.execution_phrase` must be a distilled execution-side phrase derived from the parsed intent, not a paraphrase of the full user request.
+- Keep `execution.execution_phrase` short and canonical, e.g.:
+  - `Apply a strong upward trend edit in this medium window`
+  - `Apply a weak seasonality enhancement in this medium window`
 
 Backward compatibility requirement:
 - Ensure `execution.tool_name` is a valid current tool name from the catalog.
@@ -303,23 +317,23 @@ Two-stage editing workflow:
 </edit>
 
 Common editing intents and tools:
-1. Trend adjustment (趋势调整):
+1. Trend adjustment:
    - Intent: "trend"
    - Tools: increase_trend, decrease_trend, tedit_change_trend
 
-2. Volatility adjustment (波动性调整):
+2. Volatility adjustment:
    - Intent: "volatility"
    - Tools: increase_volatility, decrease_volatility, tedit_change_volatility
 
-3. Seasonality modification (季节性修改):
+3. Seasonality modification:
    - Intent: "seasonality"
    - Tools: tedit_change_seasonality
 
-4. Anomaly handling (异常值处理):
+4. Anomaly handling:
    - Intent: "anomaly"
    - Tools: remove_anomalies_in_region, select_editing_region
 
-5. Smoothing (平滑):
+5. Smoothing:
    - Intent: "smoothing"
    - Tools: smooth_region, decrease_volatility
 
@@ -348,14 +362,14 @@ Available TEdit diffusion-based tools (semantic editing):
 {tedit}
 
 Common editing operations:
-1. Trend adjustment (趋势调整):
-   - increase_trend: Increase the upward/downward trend magnitude (增加趋势幅度)
-   - decrease_trend: Decrease the upward/downward trend magnitude (减少趋势幅度)
+1. Trend adjustment:
+   - increase_trend: Increase the upward/downward trend magnitude
+   - decrease_trend: Decrease the upward/downward trend magnitude
    - tedit_change_trend: Change trend type using diffusion model
 
-2. Volatility adjustment (波动性调整):
-   - increase_volatility: Increase the fluctuation/variance (增加波动性)
-   - decrease_volatility: Decrease the fluctuation/variance (减少波动性)
+2. Volatility adjustment:
+   - increase_volatility: Increase the fluctuation/variance
+   - decrease_volatility: Decrease the fluctuation/variance
    - tedit_change_volatility: Change volatility using diffusion model
 
 3. Other editing operations:

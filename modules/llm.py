@@ -47,11 +47,11 @@ SourceType = Literal["OpenAI", "DashScope", "InterWeb", "Ollama", "vLLM"]
 
 
 def _infer_direction_hint(text: str) -> str:
-    normalized = text or ""
-    upward_hints = ("冲高", "抬升", "走高", "偏高", "激增", "飙升", "高位")
+    normalized = str(text or "").lower()
+    upward_hints = ("upward", "higher", "increase", "rising", "amplified", "冲高", "抬升", "走高", "偏高", "激增", "飙升", "高位")
     if any(token in normalized for token in upward_hints):
         return "up"
-    downward_hints = ("降至极低", "跌到低位", "停摆", "中断", "掉到特别低", "走低")
+    downward_hints = ("downward", "lower", "decrease", "dip", "near-zero", "shutdown", "降至极低", "跌到低位", "停摆", "中断", "掉到特别低", "走低")
     if any(token in normalized for token in downward_hints):
         return "down"
     return ""
@@ -111,30 +111,62 @@ def _apply_explicit_prompt_hints(plan: Dict[str, Any], instruction_text: str, ts
 
     strength_parse = parse_strength_text(instruction_text)
     normalized["strength_parse"] = strength_parse
-    if str(intent.get("strength", "")).lower() not in {"weak", "medium", "strong"}:
+    matched_tokens = strength_parse.get("matched_tokens") or []
+    parse_confidence = float(strength_parse.get("confidence", 0.0))
+    explicit_strength_hint = bool(matched_tokens) and parse_confidence >= 0.75
+    if explicit_strength_hint or str(intent.get("strength", "")).lower() not in {"weak", "medium", "strong"}:
         intent["strength"] = str(strength_parse["strength_text"])
-    params.setdefault("strength_label", int(strength_parse["strength_label"]))
+        params["strength_label"] = int(strength_parse["strength_label"])
+        params.pop("strength_scalar", None)
+        execution.setdefault("parameters", {})
+        if isinstance(execution["parameters"], dict):
+            execution["parameters"]["strength_label"] = int(strength_parse["strength_label"])
+            execution["parameters"].pop("strength_scalar", None)
+    else:
+        params.setdefault("strength_label", int(strength_parse["strength_label"]))
 
     shape_hint = infer_shape_hint(instruction_text)
     direction_hint = _infer_direction_hint(instruction_text)
+    trend_hump_hints = (
+        "local trend edit",
+        "temporary upward hump",
+        "temporary downward dip",
+        "depart-then-return",
+        "returns toward baseline",
+        "short-term business factor",
+        "局部趋势型编辑",
+        "趋势型编辑",
+        "阶段性抬升后再回稳",
+        "阶段性走低后再回稳",
+        "短期业务因素影响",
+    )
+    has_explicit_trend_hump = any(token in instruction_text for token in trend_hump_hints)
 
-    if not shape_hint and not direction_hint:
+    if has_explicit_trend_hump:
+        intent["effect_family"] = "trend"
+        intent["shape"] = "hump"
+        if not direction_hint:
+            direction_hint = "up"
+        execution["canonical_tool"] = "trend_linear_down" if direction_hint == "down" else "trend_linear_up"
+        execution["tool_name"] = "hybrid_down" if direction_hint == "down" else "hybrid_up"
+
+    if not shape_hint and not direction_hint and not has_explicit_trend_hump:
         return normalized
 
     if shape_hint:
         intent["shape"] = shape_hint
         if shape_hint == "flatline":
-            intent["effect_family"] = "shutdown"
+            intent["effect_family"] = "hard_zero"
             if not direction_hint:
                 direction_hint = "down"
-            execution["canonical_tool"] = "trend_linear_down"
+            execution["canonical_tool"] = "hard_zero_flatline"
             execution["tool_name"] = "hybrid_down"
         elif shape_hint == "step":
-            intent["effect_family"] = "level"
+            intent["effect_family"] = "step_change"
             execution["canonical_tool"] = "level_step"
             execution["tool_name"] = "step_shift"
         elif shape_hint == "irregular_noise":
-            intent["effect_family"] = "volatility"
+            intent["effect_family"] = "noise_injection"
             intent["direction"] = "neutral"
             proposed_subtype = normalized.get("volatility_subtype") or intent.get("volatility_subtype")
             if not proposed_subtype:
@@ -142,12 +174,42 @@ def _apply_explicit_prompt_hints(plan: Dict[str, Any], instruction_text: str, ts
             normalized["volatility_subtype"] = proposed_subtype
             intent["volatility_subtype"] = proposed_subtype
         elif shape_hint == "hump":
-            intent["effect_family"] = "impulse"
-            execution["canonical_tool"] = "impulse_spike"
-            execution["tool_name"] = "spike_inject"
+            if any(token in instruction_text for token in trend_hump_hints):
+                intent["effect_family"] = "trend"
+                if not direction_hint:
+                    direction_hint = "up"
+                execution["canonical_tool"] = "trend_linear_down" if direction_hint == "down" else "trend_linear_up"
+                execution["tool_name"] = "hybrid_down" if direction_hint == "down" else "hybrid_up"
+            else:
+                intent["effect_family"] = "impulse"
+                execution["canonical_tool"] = "impulse_spike"
+                execution["tool_name"] = "spike_inject"
 
-    seasonality_enhance_hints = ("周期更明显", "周期性更强", "节律更明显", "峰谷更清晰", "增强季节性", "增强周期性")
-    seasonality_reduce_hints = ("周期减弱", "周期性减弱", "节律变弱", "峰谷被压平", "削弱季节性", "削弱周期性", "平滑周期")
+    seasonality_enhance_hints = (
+        "seasonality enhancement",
+        "seasonality-amplitude enhancement",
+        "repeated peaks and troughs clearer",
+        "more regular",
+        "periodic oscillations",
+        "周期更明显",
+        "周期性更强",
+        "节律更明显",
+        "峰谷更清晰",
+        "增强季节性",
+        "增强周期性",
+    )
+    seasonality_reduce_hints = (
+        "seasonality reduction",
+        "flatten seasonality",
+        "weaker periodic oscillations",
+        "周期减弱",
+        "周期性减弱",
+        "节律变弱",
+        "峰谷被压平",
+        "削弱季节性",
+        "削弱周期性",
+        "平滑周期",
+    )
     if any(token in instruction_text for token in seasonality_enhance_hints):
         intent["effect_family"] = "seasonality"
         intent["direction"] = "neutral"
@@ -161,20 +223,55 @@ def _apply_explicit_prompt_hints(plan: Dict[str, Any], instruction_text: str, ts
         execution["canonical_tool"] = "seasonality_reduce"
         execution["tool_name"] = "season_reduce"
 
-    plateau_hints = ("持续承压", "持续偏高", "维持高位", "高位维持", "持续处于高位")
+    plateau_hints = ("sustained high level", "maintained high level", "持续承压", "持续偏高", "维持高位", "高位维持", "持续处于高位")
+    multiplier_hints = ("multiplicative amplification", "amplified by a multiplier", "multiplier edit", "乘性放大", "按倍数抬升", "成倍增加", "倍数放大", "整体放大")
+    noise_hints = ("irregular noise", "noise corruption", "distorted", "noisy", "erratic", "杂乱跳变", "信号失真", "无规律波动", "读数失真", "噪声扰动")
+    hard_zero_hints = ("near-zero", "flatline", "shutdown", "almost interrupted", "归零", "贴地", "停摆", "几乎中断", "降到极低水平并维持")
+    if any(token in instruction_text for token in multiplier_hints):
+        intent["effect_family"] = "multiplier"
+        intent["shape"] = "scaled_surge"
+        intent["direction"] = "up"
+        execution["canonical_tool"] = "multiplier_amplify"
+        execution["tool_name"] = "hybrid_up"
+    elif any(token in instruction_text for token in noise_hints):
+        intent["effect_family"] = "noise_injection"
+        intent["shape"] = "irregular_noise"
+        intent["direction"] = "neutral"
+    elif any(token in instruction_text for token in hard_zero_hints):
+        intent["effect_family"] = "hard_zero"
+        intent["shape"] = "flatline"
+        if not direction_hint:
+            direction_hint = "down"
+        execution["canonical_tool"] = "hard_zero_flatline"
+        execution["tool_name"] = "hybrid_down"
+
     if any(token in instruction_text for token in plateau_hints):
-        intent["effect_family"] = "level"
-        intent["shape"] = "plateau"
+        intent["effect_family"] = "multiplier"
+        intent["shape"] = "scaled_surge"
         if not direction_hint:
             direction_hint = "up"
-        execution["canonical_tool"] = "trend_linear_up"
+        execution["canonical_tool"] = "multiplier_amplify"
         execution["tool_name"] = "hybrid_up"
 
     if direction_hint:
         intent["direction"] = direction_hint
-        if execution.get("tool_name") in {"hybrid_up", "hybrid_down"}:
+        if intent.get("effect_family") == "trend" and execution.get("tool_name") in {"hybrid_up", "hybrid_down"}:
             execution["tool_name"] = "hybrid_down" if direction_hint == "down" else "hybrid_up"
             execution["canonical_tool"] = "trend_linear_down" if direction_hint == "down" else "trend_linear_up"
+
+    effect_family = intent.get("effect_family")
+    shape = intent.get("shape")
+    if effect_family == "hard_zero" and shape == "flatline":
+        intent["direction"] = "down"
+        execution["canonical_tool"] = "hard_zero_flatline"
+        execution["tool_name"] = "hybrid_down"
+    elif effect_family == "step_change" and shape == "step":
+        execution["canonical_tool"] = "level_step"
+        execution["tool_name"] = "step_shift"
+    elif effect_family == "multiplier" and shape == "scaled_surge":
+        intent["direction"] = "up"
+        execution["canonical_tool"] = "multiplier_amplify"
+        execution["tool_name"] = "hybrid_up"
 
     normalized["tool_name"] = execution.get("tool_name", normalized.get("tool_name"))
     normalized["canonical_tool"] = execution.get("canonical_tool", normalized.get("canonical_tool"))
@@ -425,7 +522,7 @@ def get_event_driven_plan(
         f"[Sequence Info] The time series has exactly {ts_length} timesteps "
         f"(index 0 to {ts_length - 1}). "
         f"You MUST ensure region[0] >= 0 and region[1] <= {ts_length}.\n"
-        f"[Allowed Effect Families] trend, seasonality, volatility, impulse, level, shutdown\n"
+        f"[Allowed Effect Families] trend, seasonality, hard_zero, step_change, multiplier, noise_injection\n"
         f"[Localization Hint] Long trends usually span 20-60 steps; transient shocks usually span 5-20 steps.\n"
         f"[Temporal Buckets] early=[0,{early_end}), mid=[{early_end},{mid_end}), late=[{mid_end},{ts_length})\n"
         f"[Anchor Mapping] 清晨/早班/大清早->early; 中午/运行中段/刚才->mid; 深夜/夜间低谷前/半夜->late"
@@ -469,6 +566,12 @@ def get_event_driven_plan(
             normalized.setdefault("execution", {}).setdefault("parameters", {})
             normalized["execution"]["parameters"]["region"] = refined_localization["region"]
             normalized = _apply_volatility_route(normalized, instruction_text, ts_length=ts_length)
+            execution = normalized.setdefault("execution", {})
+            params = normalized.setdefault("parameters", {})
+            execution_phrase = execution.get("execution_phrase") or execution.get("condensed_instruction")
+            if isinstance(execution_phrase, str) and execution_phrase.strip():
+                execution["execution_phrase"] = execution_phrase.strip()
+                params["instruction_text"] = execution_phrase.strip()
             return normalize_llm_plan(normalized, ts_length=ts_length)
         except json.JSONDecodeError as e:
             raise ValueError(f"Failed to parse LLM response as JSON: {e}\nResponse: {content}")

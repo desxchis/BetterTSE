@@ -1,7 +1,7 @@
 ### Dataset ###
 data:
   name: discrete_strength_family
-  folder: ./datasets/discrete_strength_family
+  folder: ./datasets/discrete_strength_trend_family/trend_injection
 
 
 ### Finetune ###
@@ -16,19 +16,19 @@ train:
   val_epoch_interval: 1
   display_interval: 1
   include_self: false
-  freeze_backbone_for_strength: false
+  freeze_backbone_for_strength: true
   beta_only_repair: false
   reset_beta_output_head: false
   instruction_text_dropout_prob: 0.0
-  strength_lr_scale: 10.0
+  strength_lr_scale: 20.0
   strength_diagnostics_enabled: true
   strength_diagnostics_interval: 1
   diffusion_loss_weight: 0.2
-  gain_match_loss_weight: 6.0
+  gain_match_loss_weight: 8.0
   family_gap_match_loss_weight: 2.0
   edit_region_loss_weight: 0.5
   background_loss_weight: 0.2
-  monotonic_loss_weight: 2.0
+  monotonic_loss_weight: 3.0
   family_relative_gain_loss_weight: 3.0
   family_relative_margin_scale: 1.5
   constant_gain_penalty_weight: 2.0
@@ -60,11 +60,6 @@ train:
       gain_order_margin: 0.02
       gain_order_weight: 0.3
       gain_order_direction: increasing
-      scalar_transform:
-        enabled: true
-        scale: 2.0
-        offset: 0.0
-        name: current_0_0p5_1_to_legacy_0_1_2
   run_generation_eval: false
   skip_final_evaluate: true
   strength_debug:

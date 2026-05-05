@@ -38,20 +38,20 @@ def normalize_position_bucket(bucket: str, fallback: str = "mid") -> str:
     return POSITION_BUCKET_ALIASES.get(str(bucket or "").strip().lower(), fallback)
 
 
-EARLY_HINTS = ("清晨", "早班", "大清早", "早上")
-MID_EARLY_HINTS = ("上午", "前半段", "较早时段")
-MIDDLE_HINTS = ("中午", "运行中段", "刚才", "午后")
-MID_LATE_HINTS = ("傍晚", "晚些时候", "恢复阶段")
-LATE_HINTS = ("深夜", "夜间", "半夜", "夜里", "低谷期前")
+EARLY_HINTS = ("early part", "early position", "early window", "first third", "清晨", "早班", "大清早", "早上")
+MID_EARLY_HINTS = ("first half", "earlier part", "上午", "前半段", "较早时段")
+MIDDLE_HINTS = ("middle part", "middle position", "mid sequence", "center part", "中午", "运行中段", "刚才", "午后")
+MID_LATE_HINTS = ("later part", "recovery phase", "傍晚", "晚些时候", "恢复阶段")
+LATE_HINTS = ("late part", "late position", "last third", "near the end", "深夜", "夜间", "半夜", "夜里", "低谷期前")
 
-SHORT_HINTS = ("短时", "瞬时", "很快", "短暂", "一度")
-LONG_HINTS = ("持续", "维持", "一段时间", "逐步", "随后")
-RECOVERY_HINTS = ("恢复", "回落", "回到常态", "逐步平稳", "恢复阶段")
-SWITCH_HINTS = ("切换", "转移", "重置", "阶跃", "切到新的状态")
-NOISE_HINTS = ("杂乱跳变", "失真", "无规律波动", "信号异常", "跳变")
-HUMP_HINTS = ("短时冲高后回落", "先升后降", "先偏离后恢复", "阶段性抬升后逐步回落")
-SHUTDOWN_HINTS = ("停摆", "停机", "极低水平", "接近停滞", "几乎中断")
-ONSET_HINTS = ("开始", "交接后", "之后", "自", "从", "预计在")
+SHORT_HINTS = ("short", "brief", "temporary", "transient", "短时", "瞬时", "很快", "短暂", "一度")
+LONG_HINTS = ("sustained", "maintained", "for a while", "gradual", "then", "持续", "维持", "一段时间", "逐步", "随后")
+RECOVERY_HINTS = ("recover", "return", "back to baseline", "stabilize", "恢复", "回落", "回到常态", "逐步平稳", "恢复阶段")
+SWITCH_HINTS = ("switch", "regime", "step", "jump to a new level", "切换", "转移", "重置", "阶跃", "切到新的状态")
+NOISE_HINTS = ("irregular noise", "distorted", "noisy", "erratic", "random jumps", "杂乱跳变", "失真", "无规律波动", "信号异常", "跳变")
+HUMP_HINTS = ("temporary upward hump", "temporary downward dip", "depart-then-return", "returns toward baseline", "短时冲高后回落", "先升后降", "先偏离后恢复", "阶段性抬升后逐步回落")
+SHUTDOWN_HINTS = ("shutdown", "near-zero", "flatline", "almost interrupted", "停摆", "停机", "极低水平", "接近停滞", "几乎中断")
+ONSET_HINTS = ("start", "after", "from", "begin", "expected around", "开始", "交接后", "之后", "自", "从", "预计在")
 VOLATILITY_CANONICAL_TOOLS = {
     "volatility_increase",
     "volatility_global_scale",

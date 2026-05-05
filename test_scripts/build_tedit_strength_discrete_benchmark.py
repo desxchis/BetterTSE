@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -55,7 +56,7 @@ class _FallbackInjector:
         direction = _normalize_direction(injection_config.get("direction", "neutral"))
         if self.injection_type == "trend_injection":
             return {
-                "effect_family": "impulse",
+                "effect_family": "trend",
                 "shape": "hump",
                 "direction": direction,
                 "duration": "medium",
@@ -64,7 +65,7 @@ class _FallbackInjector:
             }
         if self.injection_type == "step_change":
             return {
-                "effect_family": "level",
+                "effect_family": "step_change",
                 "shape": "step",
                 "direction": direction,
                 "duration": "medium",
@@ -73,7 +74,7 @@ class _FallbackInjector:
             }
         if self.injection_type == "multiplier":
             return {
-                "effect_family": "level",
+                "effect_family": "multiplier",
                 "shape": "scaled_surge",
                 "direction": "upward",
                 "duration": "medium",
@@ -82,7 +83,7 @@ class _FallbackInjector:
             }
         if self.injection_type == "hard_zero":
             return {
-                "effect_family": "shutdown",
+                "effect_family": "hard_zero",
                 "shape": "flatline",
                 "direction": "downward",
                 "duration": "medium",
@@ -91,7 +92,7 @@ class _FallbackInjector:
             }
         if self.injection_type == "noise_injection":
             return {
-                "effect_family": "volatility",
+                "effect_family": "noise_injection",
                 "shape": "irregular_noise",
                 "direction": "neutral",
                 "duration": "medium",
@@ -170,11 +171,25 @@ STRENGTH_TEXT_TO_SCALAR = {
     "strong": 1.0,
 }
 
-STRENGTH_ZH = {
-    "weak": "轻微",
-    "medium": "中等",
-    "strong": "明显",
+FAMILY_STRENGTH_TEXT_TO_SCALAR = {
+    "trend_injection": dict(STRENGTH_TEXT_TO_SCALAR),
+    "seasonality_injection": dict(STRENGTH_TEXT_TO_SCALAR),
+    "step_change": dict(STRENGTH_TEXT_TO_SCALAR),
+    "multiplier": dict(STRENGTH_TEXT_TO_SCALAR),
+    "hard_zero": dict(STRENGTH_TEXT_TO_SCALAR),
+    "noise_injection": dict(STRENGTH_TEXT_TO_SCALAR),
 }
+
+STRENGTH_WORD = {
+    "weak": "weak",
+    "medium": "medium",
+    "strong": "strong",
+}
+
+
+def _english_feature_desc(feature_desc: str) -> str:
+    text = re.sub(r"\s*[\(（][^()（）]*[\u4e00-\u9fff][^()（）]*[\)）]", "", str(feature_desc or "target series"))
+    return text.strip() or "target series"
 
 DURATION_BUCKET_SPECS = {
     "short": (0.08, 0.12),
@@ -281,12 +296,12 @@ FAMILY_TAG_TEMPLATES = {
 }
 
 INSTRUCTION_TEMPLATES = {
-    "trend_injection": "请把{feature_desc}在一个{duration_bucket}窗口里做{strength_zh}的trend/hump局部变化，保持显式趋势方向为{direction_label}，只改那一段，非编辑区尽量保持不变。",
-    "seasonality_injection": "请把{feature_desc}在一个{duration_bucket}窗口里{seasonality_prompt}，只改那一段，非编辑区尽量保持不变。",
-    "step_change": "请把{feature_desc}在一个{duration_bucket}窗口里做{strength_zh}的step/level局部变化，保持显式台阶方向为{direction_label}，只改那一段，非编辑区尽量保持不变。",
-    "multiplier": "请把{feature_desc}在一个{duration_bucket}窗口里做{strength_zh}的乘性放大（multiplier）局部变化，明确体现按倍数抬升的语义，只改那一段，非编辑区尽量保持不变。",
-    "hard_zero": "请把{feature_desc}在一个{duration_bucket}窗口里做{strength_zh}的归零/贴地（hard zero, flatline）局部变化，明确体现关停贴地语义，只改那一段，非编辑区尽量保持不变。",
-    "noise_injection": "请把{feature_desc}在一个{duration_bucket}窗口里做{strength_zh}的volatility/noise局部变化，明确体现不规则噪声扰动语义，只改那一段，非编辑区尽量保持不变。",
+    "trend_injection": "Apply a {strength_word} local trend edit to {feature_desc} within one {duration_bucket} window, with explicit {direction_label} direction and a depart-then-return hump shape. Edit only that segment and keep the non-edit region unchanged.",
+    "seasonality_injection": "Apply a local seasonality edit to {feature_desc} within one {duration_bucket} window: {seasonality_prompt}. Edit only that segment and keep the non-edit region unchanged.",
+    "step_change": "Apply a {strength_word} local step_change edit to {feature_desc} within one {duration_bucket} window, with explicit {direction_label} step direction. Edit only that segment and keep the non-edit region unchanged.",
+    "multiplier": "Apply a {strength_word} local multiplier edit to {feature_desc} within one {duration_bucket} window, clearly expressing multiplicative amplification. Edit only that segment and keep the non-edit region unchanged.",
+    "hard_zero": "Apply a {strength_word} local hard_zero edit to {feature_desc} within one {duration_bucket} window, clearly expressing near-zero shutdown semantics. Edit only that segment and keep the non-edit region unchanged.",
+    "noise_injection": "Apply a {strength_word} local noise_injection edit to {feature_desc} within one {duration_bucket} window, clearly expressing irregular noise corruption. Edit only that segment and keep the non-edit region unchanged.",
 }
 
 
@@ -337,21 +352,22 @@ def _prompt_text(
     strength_text: str,
     direction: str,
 ) -> str:
+    feature_desc = _english_feature_desc(feature_desc)
     template = INSTRUCTION_TEMPLATES.get(
         tool_name,
-        "请把{feature_desc}在一个{duration_bucket}窗口里做{strength_zh}的{effect_family}/{shape}局部变化，只改那一段，非编辑区尽量保持不变。",
+        "Apply a {strength_word} local {effect_family}/{shape} edit to {feature_desc} within one {duration_bucket} window. Edit only that segment and keep the non-edit region unchanged.",
     )
     return template.format(
         feature_desc=feature_desc,
         duration_bucket=duration_bucket,
-        strength_zh=STRENGTH_ZH[strength_text],
+        strength_word=STRENGTH_WORD[strength_text],
         effect_family=effect_family,
         shape=shape,
         direction_label=_normalize_direction(direction),
         seasonality_prompt={
-            "weak": "加入轻微的规律性周期起伏",
-            "medium": "加入中等强度的周期性波动",
-            "strong": "加入明显的周期性起伏",
+            "weak": "add weak regular periodic oscillations",
+            "medium": "add medium-strength periodic oscillations",
+            "strong": "add strong periodic oscillations",
         }[strength_text],
     )
 
@@ -474,16 +490,25 @@ def _build_noise_target(
     base_region = np.asarray(base_ts[start_step:end_step], dtype=np.float64)
     centered_noise = np.asarray(family_noise[:region_len], dtype=np.float64)
     centered_noise = centered_noise - float(np.mean(centered_noise))
-    noise_scale = np.abs(centered_noise)
-    max_scale = float(np.max(noise_scale))
-    if max_scale > 1.0e-8:
-        noise_scale = noise_scale / max_scale
-    target_ts[start_step:end_step] = base_region + noise_scale * float(noise_std_ratio)
+    noise_std = float(np.std(base_region))
+    if noise_std <= 1.0e-8:
+        noise_std = max(float(np.std(base_ts)), 1.0)
+    noise_delta = centered_noise
+    delta_std = float(np.std(noise_delta))
+    if delta_std > 1.0e-8:
+        noise_delta = noise_delta / delta_std
+    noise_template = noise_delta.copy()
+    baseline_offset = float(np.mean(base_region)) * float(baseline_ratio)
+    noise_delta = noise_delta * noise_std * float(noise_std_ratio)
+    target_ts[start_step:end_step] = base_region + baseline_offset + noise_delta
     mask_gt[start_step:end_step] = 1
     return target_ts, mask_gt, {
         "injection_type": "noise_injection",
         "baseline_ratio": float(baseline_ratio),
         "noise_std_ratio": float(noise_std_ratio),
+        "baseline_offset": float(baseline_offset),
+        "region_noise_std": float(noise_std),
+        "noise_template": [float(v) for v in noise_template.tolist()],
         "start_step": int(start_step),
         "end_step": int(end_step),
         "duration": int(duration),
@@ -531,13 +556,22 @@ def _build_seasonality_target(
     base_region = np.asarray(base_ts[start_step:end_step], dtype=np.float64)
     data_range = max(float(np.max(base_ts)) - float(np.min(base_ts)), 1e-6)
     amplitude = data_range * float(seasonal_amplitude_ratio)
-    u = np.linspace(0.0, 1.0, region_len)
-    envelope = np.sin(np.pi * u)
-    seasonal_wave = envelope * np.sin(2.0 * np.pi * int(cycles) * u + float(phase))
+    seasonal_wave = _fixed_period_unit_seasonal_wave(region_len, int(cycles), float(phase))
     target_ts[start_step:end_step] = base_region + amplitude * seasonal_wave
+    expected_period = float(region_len) / max(float(cycles), 1.0)
     config = {
         "injection_type": "seasonality_injection",
+        "seasonality_mode": "amplitude_fixed_frequency",
+        "control_axis": "seasonality_amplitude",
+        "fixed_period": True,
+        "fixed_phase": True,
+        "fixed_waveform": True,
+        "wave_orthogonalized": True,
+        "amplitude_normalization": "fixed_period_fourier_unit",
+        "frequency_edit_allowed": False,
         "cycles": int(cycles),
+        "dominant_cycles": int(cycles),
+        "expected_period": expected_period,
         "phase": float(phase),
         "seasonal_amplitude": float(amplitude),
         "seasonal_amplitude_ratio": float(seasonal_amplitude_ratio),
@@ -548,6 +582,40 @@ def _build_seasonality_target(
 
     mask_gt[start_step:end_step] = 1
     return target_ts, mask_gt, config
+
+
+def _fixed_period_unit_seasonal_wave(region_len: int, cycles: int, phase: float) -> np.ndarray:
+    region_len = int(region_len)
+    cycles = int(cycles)
+    if region_len <= 1 or cycles <= 0:
+        return np.zeros(max(region_len, 0), dtype=np.float64)
+
+    t = np.arange(region_len, dtype=np.float64)
+    omega = 2.0 * np.pi * float(cycles) / float(region_len)
+    wave = np.sin(omega * t + float(phase))
+
+    baseline = np.column_stack(
+        [
+            np.ones(region_len, dtype=np.float64),
+            np.linspace(-0.5, 0.5, region_len, dtype=np.float64),
+        ]
+    )
+    coef, *_ = np.linalg.lstsq(baseline, wave, rcond=None)
+    wave = wave - baseline @ coef
+
+    design = np.column_stack(
+        [
+            np.ones(region_len, dtype=np.float64),
+            np.linspace(-0.5, 0.5, region_len, dtype=np.float64),
+            np.cos(omega * t),
+            np.sin(omega * t),
+        ]
+    )
+    fit_coef, *_ = np.linalg.lstsq(design, wave, rcond=None)
+    amp = float(np.sqrt(float(fit_coef[2]) ** 2 + float(fit_coef[3]) ** 2))
+    if amp <= 1.0e-12:
+        return wave
+    return wave / amp
 
 
 def _build_step_target(base_ts: np.ndarray, start_step: int, duration: int, magnitude_ratio: float, direction: str) -> tuple[np.ndarray, np.ndarray, Dict[str, Any]]:
@@ -800,6 +868,13 @@ def build_discrete_benchmark(
             "type": "continuous_scalar",
             "anchor_mapping": STRENGTH_TEXT_TO_SCALAR,
             "range": [0.0, 1.0],
+        },
+        "seasonality_definition": {
+            "stage": "seasonality_amplitude",
+            "fixed": ["period", "phase", "waveform"],
+            "varied": ["amplitude"],
+            "primary_metric": "fixed_period_fourier_amplitude",
+            "forbidden": ["period", "cycle", "frequency"],
         },
         "families": families,
         "samples": flat_samples,

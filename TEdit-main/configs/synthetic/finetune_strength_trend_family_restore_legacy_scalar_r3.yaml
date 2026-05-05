@@ -1,12 +1,12 @@
 ### Dataset ###
 data:
   name: discrete_strength_family
-  folder: ./datasets/discrete_strength_family
+  folder: ./datasets/discrete_strength_trend_family_restore_legacy_scalar
 
 
 ### Finetune ###
 train:
-  epochs: 10
+  epochs: 6
   batch_size: 4
   lr: 1.0e-5
   enable_strength_control: true
@@ -20,19 +20,19 @@ train:
   beta_only_repair: false
   reset_beta_output_head: false
   instruction_text_dropout_prob: 0.0
-  strength_lr_scale: 10.0
+  strength_lr_scale: 3.0
   strength_diagnostics_enabled: true
   strength_diagnostics_interval: 1
   diffusion_loss_weight: 0.2
-  gain_match_loss_weight: 6.0
+  gain_match_loss_weight: 12.0
   family_gap_match_loss_weight: 2.0
   edit_region_loss_weight: 0.5
   background_loss_weight: 0.2
-  monotonic_loss_weight: 2.0
-  family_relative_gain_loss_weight: 3.0
+  monotonic_loss_weight: 0.25
+  family_relative_gain_loss_weight: 10.0
   family_relative_margin_scale: 1.5
-  constant_gain_penalty_weight: 2.0
-  minimum_family_gain_std: 0.05
+  constant_gain_penalty_weight: 4.0
+  minimum_family_gain_std: 0.12
   numeric_only_loss_weight: 4.0
   beta_direction_loss_weight: 0.0
   beta_direction_margin: 0.0
@@ -60,11 +60,13 @@ train:
       gain_order_margin: 0.02
       gain_order_weight: 0.3
       gain_order_direction: increasing
+      scope: edit_region
       scalar_transform:
-        enabled: true
-        scale: 2.0
+        enabled: false
+        scale: 1.0
         offset: 0.0
-        name: current_0_0p5_1_to_legacy_0_1_2
+        name: identity
+        auto_legacy_half_step: false
   run_generation_eval: false
   skip_final_evaluate: true
   strength_debug:

@@ -97,6 +97,97 @@ def _normalize_gt_config(sample: Dict[str, Any]) -> Dict[str, Any]:
     return gt_config
 
 
+def _family_consistent_localization_enabled(sample: Dict[str, Any]) -> bool:
+    pipeline_options = sample.get("pipeline_options", {})
+    if isinstance(pipeline_options, dict):
+        return bool(pipeline_options.get("family_consistent_localization", False))
+    return False
+
+
+def _family_region_source(sample: Dict[str, Any]) -> str:
+    pipeline_options = sample.get("pipeline_options", {})
+    if isinstance(pipeline_options, dict):
+        return str(pipeline_options.get("family_region_source", "llm_first_sample")).strip().lower()
+    return "llm_first_sample"
+
+
+def _benchmark_region(sample: Dict[str, Any], gt_config: Dict[str, Any], series_len: int) -> List[int]:
+    start = gt_config.get("start_step", sample.get("gt_start", 0))
+    end = gt_config.get("end_step", sample.get("gt_end", series_len))
+    start_idx = max(0, min(int(series_len), int(start)))
+    end_idx = max(start_idx, min(int(series_len), int(end)))
+    return [start_idx, end_idx]
+
+
+def _apply_family_region_override(plan: Dict[str, Any], region: List[int], family_id: str, source: str) -> Dict[str, Any]:
+    normalized = dict(plan)
+    normalized["parameters"] = dict(normalized.get("parameters", {}))
+    normalized["parameters"]["region"] = [int(region[0]), int(region[1])]
+    normalized["localization"] = dict(normalized.get("localization", {}))
+    normalized["localization"]["region"] = [int(region[0]), int(region[1])]
+    normalized["execution"] = dict(normalized.get("execution", {}))
+    exec_params = dict(normalized["execution"].get("parameters", {}))
+    exec_params["region"] = [int(region[0]), int(region[1])]
+    normalized["execution"]["parameters"] = exec_params
+    normalized["pipeline_localization_policy"] = {
+        "family_consistent_localization": True,
+        "region_source": source,
+        "family_id": str(family_id),
+    }
+    return normalized
+
+
+def _build_condensed_execution_instruction(plan: Dict[str, Any]) -> str:
+    intent = plan.get("intent", {}) if isinstance(plan.get("intent"), dict) else {}
+    effect_family = str(intent.get("effect_family", "")).strip().lower()
+    direction = str(intent.get("direction", "neutral")).strip().lower()
+    shape = str(intent.get("shape", "")).strip().lower()
+    strength = str(intent.get("strength", "medium")).strip().lower()
+    duration = str(intent.get("duration", "medium")).strip().lower()
+
+    strength_en = {"weak": "weak", "medium": "medium", "strong": "strong"}.get(strength, "medium")
+    duration_en = {
+        "short": "short window",
+        "medium": "medium window",
+        "long": "long window",
+        "short_or_medium": "short-to-medium window",
+        "medium_or_long": "medium-to-long window",
+    }.get(duration, "local window")
+
+    if effect_family == "trend":
+        direction_en = "upward" if direction == "up" else "downward"
+        return f"Apply a {strength_en} {direction_en} trend edit in this {duration_en}"
+    if effect_family == "seasonality":
+        if shape == "flatten":
+            return f"Apply a {strength_en} seasonality reduction in this {duration_en}"
+        return f"Apply a {strength_en} seasonality enhancement in this {duration_en}"
+    if effect_family == "hard_zero":
+        return f"Apply a {strength_en} near-zero flatline edit in this {duration_en}"
+    if effect_family == "step_change":
+        direction_en = "upward" if direction == "up" else "downward"
+        return f"Apply a {strength_en} {direction_en} step-regime edit in this {duration_en}"
+    if effect_family == "multiplier":
+        return f"Apply a {strength_en} multiplicative amplification edit in this {duration_en}"
+    if effect_family == "noise_injection":
+        return f"Apply a {strength_en} irregular-noise edit in this {duration_en}"
+    return f"Apply a {strength_en} local edit in this {duration_en}"
+
+
+def _resolve_execution_instruction(plan: Dict[str, Any]) -> str:
+    execution = plan.get("execution", {}) if isinstance(plan.get("execution"), dict) else {}
+    parameters = plan.get("parameters", {}) if isinstance(plan.get("parameters"), dict) else {}
+
+    execution_phrase = execution.get("execution_phrase") or execution.get("condensed_instruction")
+    if isinstance(execution_phrase, str) and execution_phrase.strip():
+        return execution_phrase.strip()
+
+    instruction_text = parameters.get("instruction_text")
+    if isinstance(instruction_text, str) and instruction_text.strip():
+        return instruction_text.strip()
+
+    return _build_condensed_execution_instruction(plan)
+
+
 # ---------------------------------------------------------------------------
 # 核心 pipeline
 # ---------------------------------------------------------------------------
@@ -154,7 +245,7 @@ def run_pipeline(
     # ── Stage 1: 初始化 LLM 客户端 ───────────────────────────────────────
     llm_client = None
     get_event_driven_plan_fn = None
-    if mode != "direct_edit":
+    if mode not in {"direct_edit", "replay_plan"}:
         logger.info("[Stage 1] 初始化 LLM 客户端")
         from modules.llm import CustomLLMClient, get_event_driven_plan
 
@@ -172,7 +263,7 @@ def run_pipeline(
         get_event_driven_plan_fn = get_event_driven_plan
         logger.info(f"  模型: {api_cfg['model_name']}  |  Base URL: {api_cfg['base_url']}")
     else:
-        logger.info("[Stage 1] direct_edit 模式跳过 LLM 初始化")
+        logger.info(f"[Stage 1] {mode} 模式跳过 LLM 初始化")
 
     # ── Stage 2: 初始化 TEdit 模型（可选）────────────────────────────────
     tedit: Optional[TEditWrapper] = None
@@ -194,6 +285,7 @@ def run_pipeline(
     # ── Stage 3: 逐样本处理 ──────────────────────────────────────────────
     evaluator = TSEditEvaluator()
     results: List[Dict[str, Any]] = []
+    family_region_cache: Dict[str, List[int]] = {}
 
     for i, sample in enumerate(samples):
         sample_id = sample.get("sample_id", f"sample_{i:04d}")
@@ -231,6 +323,8 @@ def run_pipeline(
         try:
             if mode == "direct_edit":
                 full_plan = {}
+            elif mode == "replay_plan":
+                full_plan = _sample_replay_plan(sample)
             else:
                 full_plan = get_event_driven_plan_fn(
                     news_text="",
@@ -244,6 +338,34 @@ def run_pipeline(
                 ts_length=len(base_ts),
                 mode=mode,
             )
+            family_id = str(sample.get("family_id", "") or "")
+            if family_id and _family_consistent_localization_enabled(sample):
+                cached_region = family_region_cache.get(family_id)
+                if cached_region is not None:
+                    plan = _apply_family_region_override(plan, cached_region, family_id, source="family_cache")
+                else:
+                    region_source = _family_region_source(sample)
+                    if region_source in {"benchmark", "gt", "ground_truth"}:
+                        proposed_region = _benchmark_region(sample, gt_config, len(base_ts))
+                    else:
+                        proposed_region = plan.get("parameters", {}).get("region", [0, len(base_ts)])
+                    family_region_cache[family_id] = [int(proposed_region[0]), int(proposed_region[1])]
+                    plan = _apply_family_region_override(plan, family_region_cache[family_id], family_id, source=region_source)
+            plan.setdefault("parameters", {})
+            plan["parameters"] = dict(plan["parameters"])
+            plan["parameters"]["instruction_text_full"] = vague_prompt
+            plan["parameters"]["instruction_text"] = _resolve_execution_instruction(plan)
+            # Inject benchmark strength info into tool params for TEdit strength control
+            if "strength_label" in sample:
+                plan["parameters"]["strength_label"] = sample["strength_label"]
+            if "strength_scalar" in sample:
+                plan["parameters"]["strength_scalar"] = sample["strength_scalar"]
+            if "runtime_strength_label" in sample:
+                plan["parameters"]["strength_label"] = sample["runtime_strength_label"]
+            if "runtime_strength_scalar" in sample:
+                plan["parameters"]["strength_scalar"] = sample["runtime_strength_scalar"]
+            if isinstance(sample.get("injection_config"), dict):
+                plan["parameters"]["injection_config"] = sample["injection_config"]
             region = plan.get("parameters", {}).get("region", [0, len(base_ts)])
             logger.info(
                 f"  Pipeline mode={mode}  tool={plan.get('tool_name')}  "
@@ -411,7 +533,10 @@ def _direct_tool_choice(prompt_text: str) -> tuple[str, str]:
     shape = infer_shape_hint(text)
     down_hints = ("走低", "回落", "下降", "下滑", "停摆", "停机", "降到", "更低位")
     up_hints = ("走高", "冲高", "抬升", "上扬", "上升", "偏高", "高位")
+    seasonality_hints = ("周期", "节律", "峰谷", "season", "seasonality", "seasonal", "cyclic", "periodic", "peaks and troughs")
 
+    if any(token in lowered or token in text for token in seasonality_hints):
+        return "season_enhance", EDIT_TOOL_SPECS["season_enhance"]["canonical_tool"]
     if shape == "step":
         return "step_shift", EDIT_TOOL_SPECS["step_shift"]["canonical_tool"]
     if shape == "hump":
@@ -504,6 +629,8 @@ def _apply_pipeline_mode(
     normalized = normalize_llm_plan(full_plan, ts_length=ts_length)
     if mode == "full_bettertse":
         return normalized
+    if mode == "replay_plan":
+        return normalized
     if mode == "direct_edit":
         return _build_direct_edit_plan(prompt_text, ts_length)
     if mode == "wo_localization":
@@ -542,6 +669,17 @@ def _apply_pipeline_mode(
         ablated["execution"].pop("canonical_tool", None)
         return normalize_llm_plan(ablated, ts_length=ts_length)
     raise ValueError(f"unsupported pipeline mode: {mode}")
+
+
+def _sample_replay_plan(sample: Dict[str, Any]) -> Dict[str, Any]:
+    """Return a benchmark-provided plan for offline pipeline replay."""
+    for key in ("replay_plan", "llm_plan", "cached_plan"):
+        plan = sample.get(key)
+        if isinstance(plan, dict) and plan:
+            return plan
+    raise ValueError(
+        "replay_plan mode requires each sample to contain replay_plan, llm_plan, or cached_plan"
+    )
 
 def _math_only_edit(
     plan: Dict[str, Any],
@@ -650,11 +788,26 @@ def _compute_intent_alignment(gt_intent: Dict[str, Any], predicted_intent: Dict[
     if not gt_intent:
         return {}
 
+    def canonicalize_effect_family(intent: Dict[str, Any]) -> Any:
+        family = intent.get("effect_family")
+        shape = intent.get("shape")
+        if family == "shutdown" or shape == "flatline":
+            return "hard_zero"
+        if family == "level" and shape == "step":
+            return "step_change"
+        if family == "level" and shape == "scaled_surge":
+            return "multiplier"
+        if family == "volatility" and shape == "irregular_noise":
+            return "noise_injection"
+        if family == "impulse" and shape == "hump":
+            return "trend"
+        return family
+
     fields = ("effect_family", "shape", "direction")
     matches = {}
     for field in fields:
-        gt_value = gt_intent.get(field)
-        pred_value = predicted_intent.get(field)
+        gt_value = canonicalize_effect_family(gt_intent) if field == "effect_family" else gt_intent.get(field)
+        pred_value = canonicalize_effect_family(predicted_intent) if field == "effect_family" else predicted_intent.get(field)
         matches[field] = 1.0 if gt_value and pred_value and gt_value == pred_value else 0.0
 
     return {
@@ -715,7 +868,7 @@ def main() -> None:
     parser.add_argument(
         "--mode",
         default="full_bettertse",
-        choices=["full_bettertse", "direct_edit", "wo_localization", "wo_canonical_layer"],
+        choices=["full_bettertse", "direct_edit", "replay_plan", "wo_localization", "wo_canonical_layer"],
         help="pipeline mode / ablation setting",
     )
     parser.add_argument(

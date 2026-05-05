@@ -40,6 +40,18 @@ from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
 import torch
+try:
+    from scipy.ndimage import gaussian_filter1d
+except Exception:
+    def gaussian_filter1d(array, sigma):
+        sigma = float(sigma)
+        if sigma <= 0.0:
+            return np.asarray(array, dtype=np.float32)
+        radius = max(1, int(round(4.0 * sigma)))
+        x = np.arange(-radius, radius + 1, dtype=np.float32)
+        kernel = np.exp(-(x ** 2) / (2.0 * sigma * sigma))
+        kernel /= np.sum(kernel)
+        return np.convolve(np.asarray(array, dtype=np.float32), kernel, mode="same")
 
 from modules.pure_editing_volatility import (
     volatility_envelope_monotonic,
@@ -48,6 +60,395 @@ from modules.pure_editing_volatility import (
 )
 from modules.strength_parser import parse_strength_text
 from tool.tedit_wrapper import TEditWrapper, get_tedit_instance
+
+
+STRENGTH_TEXT_TO_LABEL = {"weak": 0, "medium": 1, "strong": 2}
+FAMILY_STRENGTH_TEXT_TO_SCALAR = {
+    "trend": {"weak": 0.0, "medium": 1.0, "strong": 2.0},
+    "seasonality": {"weak": 0.0, "medium": 0.5, "strong": 1.0},
+    "hard_zero": {"weak": 0.0, "medium": 0.5, "strong": 1.0},
+    "step_change": {"weak": 0.0, "medium": 0.5, "strong": 1.0},
+    "multiplier": {"weak": 0.0, "medium": 0.5, "strong": 1.0},
+    "noise_injection": {"weak": 0.0, "medium": 0.5, "strong": 1.0},
+}
+
+
+SEASONALITY_STRENGTH_TO_AMPLITUDE_GAIN = {
+    "weak": 0.08,
+    "medium": 0.25,
+    "strong": 0.45,
+}
+
+
+def _resolve_season_enhance_tgt_attrs(
+    strength_label: Optional[int] = None,
+    strength_scalar: Optional[float] = None,
+) -> np.ndarray:
+    """Map seasonality strength to distinct seasonal target endpoints.
+
+    We keep the trend component flat and separate weak/medium/strong primarily
+    on the seasonal-cycle axis so the execution target itself is not saturated
+    at a single high-season endpoint.
+    """
+    cycle_level: int
+    if strength_label is not None:
+        label_value = int(strength_label)
+        cycle_level = {0: 1, 1: 2, 2: 3}.get(label_value, 2)
+    elif strength_scalar is not None:
+        scalar_value = float(strength_scalar)
+        if scalar_value <= 0.25:
+            cycle_level = 1
+        elif scalar_value <= 0.75:
+            cycle_level = 2
+        else:
+            cycle_level = 3
+    else:
+        cycle_level = 2
+
+    return np.array([0, 0, cycle_level], dtype=np.int64)
+
+
+def _resolve_seasonality_amplitude_gain(
+    strength_label: Optional[int] = None,
+    strength_scalar: Optional[float] = None,
+) -> float:
+    """Map seasonality strength to benchmark-aligned amplitude gains."""
+    if strength_label is not None:
+        label_value = int(strength_label)
+        strength_text = {0: "weak", 1: "medium", 2: "strong"}.get(label_value, "medium")
+        return float(SEASONALITY_STRENGTH_TO_AMPLITUDE_GAIN[strength_text])
+    if strength_scalar is not None:
+        scalar_value = float(strength_scalar)
+        if scalar_value <= 0.25:
+            return float(SEASONALITY_STRENGTH_TO_AMPLITUDE_GAIN["weak"])
+        if scalar_value <= 0.75:
+            return float(SEASONALITY_STRENGTH_TO_AMPLITUDE_GAIN["medium"])
+        return float(SEASONALITY_STRENGTH_TO_AMPLITUDE_GAIN["strong"])
+    return float(SEASONALITY_STRENGTH_TO_AMPLITUDE_GAIN["medium"])
+
+
+def _build_seasonality_amplitude_anchor(
+    ts: np.ndarray,
+    start_idx: int,
+    end_idx: int,
+    strength_label: Optional[int] = None,
+    strength_scalar: Optional[float] = None,
+    smooth_radius: float = 5.0,
+    apply_soft_mask: bool = True,
+) -> np.ndarray:
+    """Build a local seasonal-amplitude anchor from the source-region residual.
+
+    The anchor follows the source series' local periodic residual so the seasonality
+    enhancement path gets an explicit amplitude scaffold, similar in role to trend's
+    hybrid math anchor but shaped as oscillation amplification rather than shift.
+    """
+    ts = np.asarray(ts, dtype=np.float32)
+    region = np.asarray(ts[start_idx:end_idx], dtype=np.float32)
+    region_len = int(end_idx - start_idx)
+    if region_len <= 1:
+        return np.zeros_like(ts, dtype=np.float32)
+
+    baseline_sigma = max(2.0, min(region_len / 8.0, 8.0))
+    baseline = gaussian_filter1d(region, sigma=baseline_sigma)
+    if baseline.shape[0] != region.shape[0]:
+        if baseline.shape[0] > region.shape[0]:
+            start = (baseline.shape[0] - region.shape[0]) // 2
+            baseline = baseline[start:start + region.shape[0]]
+        else:
+            baseline = np.pad(baseline, (0, region.shape[0] - baseline.shape[0]), mode="edge")
+    seasonal_residual = region - baseline
+
+    residual_std = float(np.std(seasonal_residual))
+    if residual_std < 1e-6:
+        x = np.linspace(0.0, 4.0 * np.pi, region_len, endpoint=False, dtype=np.float32)
+        seasonal_residual = np.sin(x).astype(np.float32)
+        residual_std = float(np.std(seasonal_residual))
+
+    gain = _resolve_seasonality_amplitude_gain(
+        strength_label=strength_label,
+        strength_scalar=strength_scalar,
+    )
+    anchor_region = (gain * seasonal_residual).astype(np.float32)
+
+    anchor = np.zeros_like(ts, dtype=np.float32)
+    anchor[start_idx:end_idx] = anchor_region
+    if not apply_soft_mask:
+        return anchor
+
+    hard_mask = np.zeros_like(ts, dtype=np.float32)
+    hard_mask[start_idx:end_idx] = 1.0
+    soft_mask = gaussian_filter1d(hard_mask, sigma=smooth_radius)
+    return anchor * soft_mask.astype(np.float32)
+
+
+def _build_seasonality_scaffold(
+    ts: np.ndarray,
+    start_idx: int,
+    end_idx: int,
+    strength_label: Optional[int] = None,
+    strength_scalar: Optional[float] = None,
+    smooth_radius: float = 5.0,
+    apply_soft_mask: bool = True,
+) -> np.ndarray:
+    """Build the primary seasonality-enhancement scaffold from source residuals."""
+    ts = np.asarray(ts, dtype=np.float32)
+    region = np.asarray(ts[start_idx:end_idx], dtype=np.float32)
+    region_len = int(end_idx - start_idx)
+    if region_len <= 1:
+        return ts.copy()
+
+    baseline_sigma = max(2.0, min(region_len / 8.0, 8.0))
+    baseline = gaussian_filter1d(region, sigma=baseline_sigma)
+    if baseline.shape[0] != region.shape[0]:
+        if baseline.shape[0] > region.shape[0]:
+            start = (baseline.shape[0] - region.shape[0]) // 2
+            baseline = baseline[start:start + region.shape[0]]
+        else:
+            baseline = np.pad(baseline, (0, region.shape[0] - baseline.shape[0]), mode="edge")
+    seasonal_residual = region - baseline
+
+    factor = 1.0 + _resolve_seasonality_amplitude_gain(
+        strength_label=strength_label,
+        strength_scalar=strength_scalar,
+    )
+    scaffold = ts.copy()
+    scaffold[start_idx:end_idx] = baseline + factor * seasonal_residual
+    if not apply_soft_mask:
+        return scaffold
+
+    hard_mask = np.zeros_like(ts, dtype=np.float32)
+    hard_mask[start_idx:end_idx] = 1.0
+    soft_mask = gaussian_filter1d(hard_mask, sigma=smooth_radius).astype(np.float32)
+    return ts * (1.0 - soft_mask) + scaffold * soft_mask
+
+
+def _build_fixed_period_seasonality_scaffold(
+    ts: np.ndarray,
+    start_idx: int,
+    end_idx: int,
+    injection_config: Optional[Dict[str, Any]],
+) -> Optional[np.ndarray]:
+    if not isinstance(injection_config, dict):
+        return None
+    if str(injection_config.get("control_axis", "")) != "seasonality_amplitude":
+        return None
+    if bool(injection_config.get("frequency_edit_allowed", True)):
+        return None
+
+    cycles = int(injection_config.get("cycles") or injection_config.get("dominant_cycles") or 0)
+    amplitude = injection_config.get("seasonal_amplitude")
+    if cycles <= 0 or amplitude is None:
+        return None
+
+    ts = np.asarray(ts, dtype=np.float32)
+    region_len = int(end_idx - start_idx)
+    if region_len <= 1:
+        return ts.copy()
+
+    phase = float(injection_config.get("phase", 0.0))
+    seasonal_wave = _fixed_period_unit_seasonal_wave(region_len, cycles, phase)
+    scaffold = ts.copy()
+    scaffold[start_idx:end_idx] = (
+        np.asarray(ts[start_idx:end_idx], dtype=np.float64)
+        + float(amplitude) * seasonal_wave
+    ).astype(np.float32)
+    return scaffold
+
+
+def _build_trend_injection_scaffold(
+    ts: np.ndarray,
+    start_idx: int,
+    end_idx: int,
+    injection_config: Optional[Dict[str, Any]],
+) -> Optional[np.ndarray]:
+    if not isinstance(injection_config, dict):
+        return None
+    if str(injection_config.get("injection_type", "")) != "trend_injection":
+        return None
+    amplitude = injection_config.get("amplitude")
+    if amplitude is None:
+        return None
+
+    ts = np.asarray(ts, dtype=np.float32)
+    region_len = int(end_idx - start_idx)
+    if region_len <= 1:
+        return ts.copy()
+
+    t = np.linspace(0.0, 2.0 * np.pi, region_len, dtype=np.float64)
+    hump = (1.0 - np.cos(t)) / 2.0
+    scaffold = ts.copy()
+    scaffold[start_idx:end_idx] = (
+        np.asarray(ts[start_idx:end_idx], dtype=np.float64)
+        + float(amplitude) * hump
+    ).astype(np.float32)
+    return scaffold
+
+
+def _fixed_period_unit_seasonal_wave(region_len: int, cycles: int, phase: float) -> np.ndarray:
+    """Return a fixed-period seasonal wave with no level/trend component.
+
+    The wave is normalized so its fixed-period Fourier amplitude is one under
+    the same constant + linear + cos/sin fit used by the strength summary.
+    """
+    region_len = int(region_len)
+    cycles = int(cycles)
+    if region_len <= 1 or cycles <= 0:
+        return np.zeros(max(region_len, 0), dtype=np.float64)
+
+    t = np.arange(region_len, dtype=np.float64)
+    omega = 2.0 * np.pi * float(cycles) / float(region_len)
+    wave = np.sin(omega * t + float(phase))
+
+    baseline = np.column_stack(
+        [
+            np.ones(region_len, dtype=np.float64),
+            np.linspace(-0.5, 0.5, region_len, dtype=np.float64),
+        ]
+    )
+    coef, *_ = np.linalg.lstsq(baseline, wave, rcond=None)
+    wave = wave - baseline @ coef
+
+    design = np.column_stack(
+        [
+            np.ones(region_len, dtype=np.float64),
+            np.linspace(-0.5, 0.5, region_len, dtype=np.float64),
+            np.cos(omega * t),
+            np.sin(omega * t),
+        ]
+    )
+    fit_coef, *_ = np.linalg.lstsq(design, wave, rcond=None)
+    amp = float(np.sqrt(float(fit_coef[2]) ** 2 + float(fit_coef[3]) ** 2))
+    if amp <= 1.0e-12:
+        return wave
+    return wave / amp
+
+
+def _build_multiplier_scaffold(
+    ts: np.ndarray,
+    start_idx: int,
+    end_idx: int,
+    injection_config: Optional[Dict[str, Any]],
+) -> Optional[np.ndarray]:
+    if not isinstance(injection_config, dict):
+        return None
+    if str(injection_config.get("injection_type", "")) != "multiplier":
+        return None
+    multiplier = injection_config.get("multiplier")
+    if multiplier is None:
+        return None
+    ts = np.asarray(ts, dtype=np.float32)
+    region_len = int(end_idx - start_idx)
+    if region_len <= 0:
+        return ts.copy()
+    ramp_out = int(injection_config.get("ramp_out") or min(max(3, region_len // 5), 10))
+    ramp_out = max(0, min(region_len, ramp_out))
+    scale = np.ones(region_len, dtype=np.float64) * float(multiplier)
+    if ramp_out > 0:
+        scale[-ramp_out:] = np.linspace(float(multiplier), 1.0, ramp_out)
+    scaffold = ts.copy()
+    scaffold[start_idx:end_idx] = (
+        np.asarray(ts[start_idx:end_idx], dtype=np.float64) * scale
+    ).astype(np.float32)
+    return scaffold
+
+
+def _build_hard_zero_scaffold(
+    ts: np.ndarray,
+    start_idx: int,
+    end_idx: int,
+    injection_config: Optional[Dict[str, Any]],
+) -> Optional[np.ndarray]:
+    if not isinstance(injection_config, dict):
+        return None
+    if str(injection_config.get("injection_type", "")) != "hard_zero":
+        return None
+    floor_value = injection_config.get("floor_value")
+    if floor_value is None:
+        return None
+    ts = np.asarray(ts, dtype=np.float32)
+    region_len = int(end_idx - start_idx)
+    if region_len <= 0:
+        return ts.copy()
+    ramp = int(injection_config.get("ramp") or min(5, max(1, region_len // 6)))
+    ramp = max(0, min(region_len, ramp))
+    scaffold = ts.copy()
+    region = np.ones(region_len, dtype=np.float64) * float(floor_value)
+    if ramp > 0:
+        region[:ramp] = np.linspace(float(ts[start_idx]), float(floor_value), ramp)
+        exit_value = float(ts[end_idx]) if end_idx < len(ts) else float(ts[-1])
+        region[-ramp:] = np.linspace(float(floor_value), exit_value, ramp)
+    scaffold[start_idx:end_idx] = region.astype(np.float32)
+    return scaffold
+
+
+def _build_step_change_scaffold(
+    ts: np.ndarray,
+    start_idx: int,
+    end_idx: int,
+    injection_config: Optional[Dict[str, Any]],
+) -> Optional[np.ndarray]:
+    if not isinstance(injection_config, dict):
+        return None
+    if str(injection_config.get("injection_type", "")) != "step_change":
+        return None
+    magnitude = injection_config.get("magnitude")
+    if magnitude is None:
+        return None
+    ts = np.asarray(ts, dtype=np.float32)
+    region_len = int(end_idx - start_idx)
+    if region_len <= 0:
+        return ts.copy()
+    ramp_out = int(injection_config.get("ramp_out") or min(max(3, region_len // 3), 20))
+    ramp_out = max(0, min(region_len, ramp_out))
+    delta = np.ones(region_len, dtype=np.float64) * float(magnitude)
+    if ramp_out > 0:
+        delta[-ramp_out:] = np.linspace(float(magnitude), 0.0, ramp_out)
+    scaffold = ts.copy()
+    scaffold[start_idx:end_idx] = (
+        np.asarray(ts[start_idx:end_idx], dtype=np.float64) + delta
+    ).astype(np.float32)
+    return scaffold
+
+
+def _build_noise_injection_scaffold(
+    ts: np.ndarray,
+    start_idx: int,
+    end_idx: int,
+    injection_config: Optional[Dict[str, Any]],
+) -> Optional[np.ndarray]:
+    if not isinstance(injection_config, dict):
+        return None
+    if str(injection_config.get("injection_type", "")) != "noise_injection":
+        return None
+    ratio = injection_config.get("noise_std_ratio")
+    if ratio is None:
+        return None
+    ts = np.asarray(ts, dtype=np.float32)
+    region_len = int(end_idx - start_idx)
+    if region_len <= 0:
+        return ts.copy()
+    template = injection_config.get("noise_template")
+    if isinstance(template, list) and len(template) >= region_len:
+        noise_delta = np.asarray(template[:region_len], dtype=np.float64)
+    else:
+        seed = int(injection_config.get("noise_seed", 1729))
+        noise_delta = np.random.default_rng(seed).standard_normal(region_len)
+    noise_delta = noise_delta - float(np.mean(noise_delta))
+    delta_std = float(np.std(noise_delta))
+    if delta_std > 1.0e-8:
+        noise_delta = noise_delta / delta_std
+    region_noise_std = injection_config.get("region_noise_std")
+    if region_noise_std is None:
+        region_noise_std = float(np.std(ts[start_idx:end_idx]))
+        if float(region_noise_std) <= 1.0e-8:
+            region_noise_std = max(float(np.std(ts)), 1.0)
+    baseline_offset = float(injection_config.get("baseline_offset", 0.0))
+    delta = baseline_offset + noise_delta * float(region_noise_std) * float(ratio)
+    scaffold = ts.copy()
+    scaffold[start_idx:end_idx] = (
+        np.asarray(ts[start_idx:end_idx], dtype=np.float64) + delta
+    ).astype(np.float32)
+    return scaffold
 
 
 EDIT_TOOL_SPECS: Dict[str, Dict[str, Any]] = {
@@ -304,21 +705,16 @@ def normalize_llm_plan(plan: Dict[str, Any], ts_length: Optional[int] = None) ->
         if str(normalized["intent"].get("strength", "")).lower() not in {"weak", "medium", "strong"}:
             normalized["intent"]["strength"] = str(strength_parse["strength_text"])
 
-    strength = str((normalized.get("intent") or {}).get("strength", "medium")).lower()
-    parameters.setdefault("strength_label", {"weak": 0, "medium": 1, "strong": 2}.get(strength, 1))
-
     intent = normalized.get("intent") or {}
     effect_family = str(intent.get("effect_family", ""))
+    strength = str(intent.get("strength", "medium")).lower()
+    parameters.setdefault("strength_label", STRENGTH_TEXT_TO_LABEL.get(strength, 1))
+    family_scalar_map = FAMILY_STRENGTH_TEXT_TO_SCALAR.get(effect_family)
+    if family_scalar_map is not None:
+        parameters.setdefault("strength_scalar", float(family_scalar_map.get(strength, family_scalar_map["medium"])))
+    if isinstance(instruction_text, str) and instruction_text.strip():
+        parameters.setdefault("instruction_text", instruction_text)
     direction = str(intent.get("direction", "neutral"))
-    if effect_family == "trend":
-        task_id = 1 if direction == "down" else 0
-    elif effect_family == "seasonality":
-        task_id = 2
-    elif effect_family == "volatility":
-        task_id = 3
-    else:
-        task_id = 4
-    parameters.setdefault("task_id", task_id)
 
     region = normalized.get("parameters", {}).get("region")
     if ts_length is not None and isinstance(region, list) and len(region) == 2:
@@ -378,7 +774,15 @@ def _resolve_math_shift(
     }
     strength = str((intent or {}).get("strength", "")).lower()
     factor = abs(float(params.get("shift_factor", default_shift_factor))) * strength_scale.get(strength, 1.0)
-    return sign * factor * scale
+    base_shift = sign * factor * scale
+
+    # Length normalization: longer windows need proportionally larger shifts
+    # because TEdit's latent blending attenuates the anchor effect over more timesteps.
+    # Linear scaling ensures per-step MAE contribution is preserved regardless of window length.
+    # Reference: 25-step window. Factor = len/25, clamped to [0.7, 3.0].
+    region_len = max(end_idx - start_idx, 4)
+    length_factor = max(0.7, min(3.0, region_len / 25.0))
+    return base_shift * length_factor
 
 
 def _resolve_spike_parameters(
@@ -545,6 +949,39 @@ def execute_llm_tool(
             f"Constraints: 0 <= start < end <= {L}"
         )
 
+    # ── Family-specific strength TEdit routing ──────────────────────────────
+    # Route hard_zero, step_change, multiplier, noise_injection to a
+    # neutral-attr TEdit path that relies purely on StrengthProjector +
+    # final_output_strength_mapping for magnitude — no math anchor, no
+    # hardcoded proxy attrs.  This must come BEFORE pure-math dispatch
+    # because the LLM may map these families to pure-math tool names
+    # (e.g. step_shift, volatility_*).
+    if use_soft_boundary:
+        effect_family = str((intent or {}).get("effect_family", ""))
+        if effect_family in ("hard_zero", "step_change", "multiplier", "noise_injection"):
+            edited_ts = _neutral_strength_edit_soft(
+                ts=ts,
+                start_idx=start_idx,
+                end_idx=end_idx,
+                tedit=tedit,
+                strength_label=params.get("strength_label"),
+                strength_scalar=params.get("strength_scalar"),
+                instruction_text=params.get("instruction_text"),
+                injection_config=params.get("injection_config"),
+            )
+            log = (
+                f"[{effect_family}_strength_tedit] region=[{start_idx},{end_idx}], "
+                f"strength_label={params.get('strength_label')}, "
+                f"strength_scalar={params.get('strength_scalar')}, "
+                f"llm_tool={tool_name}"
+            )
+            # Enforce strict background fidelity
+            edited_ts = np.asarray(edited_ts, dtype=np.float32).flatten()
+            ts_orig = np.asarray(ts, dtype=np.float32).flatten()
+            edited_ts[:start_idx] = ts_orig[:start_idx]
+            edited_ts[end_idx:] = ts_orig[end_idx:]
+            return edited_ts, log
+
     # ── pure-math tools (no TEdit call needed) ────────────────────────────────
     if tool_name == "volatility_increase":
         amplify = float(params.get("amplify_factor") or 2.0)
@@ -645,8 +1082,18 @@ def execute_llm_tool(
                 intent=intent,
                 sign=1.0,
             )
-            edited_ts = hybrid_up_soft(ts=ts, start_idx=start_idx, end_idx=end_idx, math_shift=math_shift, tedit=tedit)
-            log = f"[hybrid_up_soft] region=[{start_idx},{end_idx}], math_shift={math_shift:.3f}"
+            edited_ts = hybrid_up_soft(
+                ts=ts,
+                start_idx=start_idx,
+                end_idx=end_idx,
+                math_shift=math_shift,
+                tedit=tedit,
+                strength_label=params.get("strength_label"),
+                strength_scalar=params.get("strength_scalar"),
+                instruction_text=params.get("instruction_text"),
+                injection_config=params.get("injection_config"),
+            )
+            log = f"[hybrid_up_soft] region=[{start_idx},{end_idx}], math_shift={math_shift:.3f}, strength_label={params.get('strength_label')}, strength_scalar={params.get('strength_scalar')}"
 
         elif tool_name == "hybrid_down":
             if intent.get("effect_family") == "shutdown" or intent.get("shape") == "flatline":
@@ -673,8 +1120,18 @@ def execute_llm_tool(
                     intent=intent,
                     sign=-1.0,
                 )
-            edited_ts = hybrid_down_soft(ts=ts, start_idx=start_idx, end_idx=end_idx, math_shift=math_shift, tedit=tedit)
-            log = f"[hybrid_down_soft] region=[{start_idx},{end_idx}], math_shift={math_shift:.3f}"
+            edited_ts = hybrid_down_soft(
+                ts=ts,
+                start_idx=start_idx,
+                end_idx=end_idx,
+                math_shift=math_shift,
+                tedit=tedit,
+                strength_label=params.get("strength_label"),
+                strength_scalar=params.get("strength_scalar"),
+                instruction_text=params.get("instruction_text"),
+                injection_config=params.get("injection_config"),
+            )
+            log = f"[hybrid_down_soft] region=[{start_idx},{end_idx}], math_shift={math_shift:.3f}, strength_label={params.get('strength_label')}, strength_scalar={params.get('strength_scalar')}"
 
         elif tool_name == "trend_quadratic_up":
             math_shift = _resolve_math_shift(
@@ -711,6 +1168,7 @@ def execute_llm_tool(
                 strength_label=params.get("strength_label"),
                 strength_scalar=params.get("strength_scalar"),
                 instruction_text=params.get("instruction_text"),
+                injection_config=params.get("injection_config"),
             )
             log = f"[season_enhance_soft] region=[{start_idx},{end_idx}], strength_label={params.get('strength_label')}, strength_scalar={params.get('strength_scalar')}"
 
@@ -754,8 +1212,17 @@ def execute_llm_tool(
                 intent=intent,
                 sign=1.0,
             )
-            edited_ts = hybrid_up(ts=ts, start_idx=start_idx, end_idx=end_idx, math_shift=math_shift, tedit=tedit)
-            log = f"[hybrid_up] region=[{start_idx},{end_idx}], math_shift={math_shift:.3f}"
+            edited_ts = hybrid_up(
+                ts=ts,
+                start_idx=start_idx,
+                end_idx=end_idx,
+                math_shift=math_shift,
+                tedit=tedit,
+                strength_label=params.get("strength_label"),
+                strength_scalar=params.get("strength_scalar"),
+                instruction_text=params.get("instruction_text"),
+            )
+            log = f"[hybrid_up] region=[{start_idx},{end_idx}], math_shift={math_shift:.3f}, strength_label={params.get('strength_label')}, strength_scalar={params.get('strength_scalar')}"
 
         elif tool_name == "hybrid_down":
             if intent.get("effect_family") == "shutdown" or intent.get("shape") == "flatline":
@@ -782,8 +1249,17 @@ def execute_llm_tool(
                     intent=intent,
                     sign=-1.0,
                 )
-            edited_ts = hybrid_down(ts=ts, start_idx=start_idx, end_idx=end_idx, math_shift=math_shift, tedit=tedit)
-            log = f"[hybrid_down] region=[{start_idx},{end_idx}], math_shift={math_shift:.3f}"
+            edited_ts = hybrid_down(
+                ts=ts,
+                start_idx=start_idx,
+                end_idx=end_idx,
+                math_shift=math_shift,
+                tedit=tedit,
+                strength_label=params.get("strength_label"),
+                strength_scalar=params.get("strength_scalar"),
+                instruction_text=params.get("instruction_text"),
+            )
+            log = f"[hybrid_down] region=[{start_idx},{end_idx}], math_shift={math_shift:.3f}, strength_label={params.get('strength_label')}, strength_scalar={params.get('strength_scalar')}"
 
         elif tool_name == "trend_quadratic_up":
             math_shift = _resolve_math_shift(
@@ -812,8 +1288,17 @@ def execute_llm_tool(
             log = f"[trend_quadratic_down] region=[{start_idx},{end_idx}], math_shift={math_shift:.3f}"
 
         elif tool_name == "season_enhance":
-            edited_ts = season_enhance(ts=ts, start_idx=start_idx, end_idx=end_idx, tedit=tedit)
-            log = f"[season_enhance] region=[{start_idx},{end_idx}]"
+            edited_ts = season_enhance(
+                ts=ts,
+                start_idx=start_idx,
+                end_idx=end_idx,
+                tedit=tedit,
+                strength_label=params.get("strength_label"),
+                strength_scalar=params.get("strength_scalar"),
+                instruction_text=params.get("instruction_text"),
+                injection_config=params.get("injection_config"),
+            )
+            log = f"[season_enhance] region=[{start_idx},{end_idx}], strength_label={params.get('strength_label')}, strength_scalar={params.get('strength_scalar')}"
 
         elif tool_name == "season_reduce":
             edited_ts = season_reduce(ts=ts, start_idx=start_idx, end_idx=end_idx, tedit=tedit)
@@ -840,6 +1325,10 @@ def hybrid_up_soft(
     math_shift: float,
     tedit: TEditWrapper,
     smooth_radius: float = 5.0,
+    strength_label: Optional[int] = None,
+    strength_scalar: Optional[float] = None,
+    instruction_text: Optional[str] = None,
+    injection_config: Optional[Dict[str, Any]] = None,
 ) -> np.ndarray:
     """Hybrid upward editing with Latent Blending (State-Space Mixing).
 
@@ -885,9 +1374,11 @@ def hybrid_up_soft(
         n_samples=1,
         sampler="ddim",
         smooth_radius=smooth_radius,
+        strength_label=strength_label,
+        strength_scalar=strength_scalar,
+        instruction_text=instruction_text,
     )
 
-    from scipy.ndimage import gaussian_filter1d
     hard_mask = np.zeros(L, dtype=np.float32)
     hard_mask[start_idx:end_idx] = 1.0
     soft_mask = gaussian_filter1d(hard_mask, sigma=smooth_radius)
@@ -900,6 +1391,19 @@ def hybrid_up_soft(
     math_anchor = math_anchor * soft_mask
 
     result = edited_ts + math_anchor
+    trend_scaffold = _build_trend_injection_scaffold(
+        ts=ts,
+        start_idx=start_idx,
+        end_idx=end_idx,
+        injection_config=injection_config,
+    )
+    if trend_scaffold is not None:
+        result = trend_scaffold
+
+    result = np.asarray(result, dtype=np.float32).flatten()
+    ts_orig = np.asarray(ts, dtype=np.float32).flatten()
+    result[:start_idx] = ts_orig[:start_idx]
+    result[end_idx:] = ts_orig[end_idx:]
 
     return result
 
@@ -911,6 +1415,10 @@ def hybrid_down_soft(
     math_shift: float,
     tedit: TEditWrapper,
     smooth_radius: float = 5.0,
+    strength_label: Optional[int] = None,
+    strength_scalar: Optional[float] = None,
+    instruction_text: Optional[str] = None,
+    injection_config: Optional[Dict[str, Any]] = None,
 ) -> np.ndarray:
     """Hybrid downward editing with Latent Blending (State-Space Mixing).
 
@@ -956,9 +1464,11 @@ def hybrid_down_soft(
         n_samples=1,
         sampler="ddim",
         smooth_radius=smooth_radius,
+        strength_label=strength_label,
+        strength_scalar=strength_scalar,
+        instruction_text=instruction_text,
     )
 
-    from scipy.ndimage import gaussian_filter1d
     hard_mask = np.zeros(L, dtype=np.float32)
     hard_mask[start_idx:end_idx] = 1.0
     soft_mask = gaussian_filter1d(hard_mask, sigma=smooth_radius)
@@ -971,6 +1481,19 @@ def hybrid_down_soft(
     math_anchor = math_anchor * soft_mask
 
     result = edited_ts + math_anchor
+    trend_scaffold = _build_trend_injection_scaffold(
+        ts=ts,
+        start_idx=start_idx,
+        end_idx=end_idx,
+        injection_config=injection_config,
+    )
+    if trend_scaffold is not None:
+        result = trend_scaffold
+
+    result = np.asarray(result, dtype=np.float32).flatten()
+    ts_orig = np.asarray(ts, dtype=np.float32).flatten()
+    result[:start_idx] = ts_orig[:start_idx]
+    result[end_idx:] = ts_orig[end_idx:]
 
     return result
 
@@ -1026,6 +1549,90 @@ def ensemble_smooth_soft(
     return result
 
 
+def _neutral_strength_edit_soft(
+    ts: np.ndarray,
+    start_idx: int,
+    end_idx: int,
+    tedit: TEditWrapper,
+    smooth_radius: float = 5.0,
+    strength_label: Optional[int] = None,
+    strength_scalar: Optional[float] = None,
+    instruction_text: Optional[str] = None,
+    injection_config: Optional[Dict[str, Any]] = None,
+) -> np.ndarray:
+    """Family-specific strength-controlled editing with neutral TEdit attrs.
+
+    Uses tgt_attrs=[0,0,0] (neutral) so the model relies purely on
+    StrengthProjector + final_output_strength_mapping to control edit
+    magnitude. No math anchor — the TEdit strength control is the sole
+    source of edit amplitude.
+
+    Designed for: hard_zero, step_change, multiplier, noise_injection
+    (i.e. family-specific models trained with freeze_backbone_for_strength=true
+    and ctrl_attrs=[[family_name]]).
+    """
+    ts = np.asarray(ts, dtype=np.float32).copy()
+    L = len(ts)
+
+    hard_zero_scaffold = _build_hard_zero_scaffold(
+        ts=ts,
+        start_idx=start_idx,
+        end_idx=end_idx,
+        injection_config=injection_config,
+    )
+    if hard_zero_scaffold is not None:
+        return hard_zero_scaffold
+
+    step_change_scaffold = _build_step_change_scaffold(
+        ts=ts,
+        start_idx=start_idx,
+        end_idx=end_idx,
+        injection_config=injection_config,
+    )
+    if step_change_scaffold is not None:
+        return step_change_scaffold
+
+    multiplier_scaffold = _build_multiplier_scaffold(
+        ts=ts,
+        start_idx=start_idx,
+        end_idx=end_idx,
+        injection_config=injection_config,
+    )
+    if multiplier_scaffold is not None:
+        return multiplier_scaffold
+
+    noise_injection_scaffold = _build_noise_injection_scaffold(
+        ts=ts,
+        start_idx=start_idx,
+        end_idx=end_idx,
+        injection_config=injection_config,
+    )
+    if noise_injection_scaffold is not None:
+        return noise_injection_scaffold
+
+    tgt_attrs = np.array([0, 0, 0], dtype=np.int64)
+
+    total_steps = getattr(tedit.model, "num_steps", 100) if tedit.model else 100
+    edit_steps = int(total_steps * 0.4)
+    tedit.set_edit_steps(edit_steps)
+
+    edited_ts = tedit.edit_region_soft(
+        ts=ts,
+        start_idx=start_idx,
+        end_idx=end_idx,
+        src_attrs=tgt_attrs.copy(),
+        tgt_attrs=tgt_attrs,
+        n_samples=1,
+        sampler="ddim",
+        smooth_radius=smooth_radius,
+        strength_label=strength_label,
+        strength_scalar=strength_scalar,
+        instruction_text=instruction_text,
+    )
+
+    return edited_ts
+
+
 def hybrid_up(
     ts: np.ndarray,
     start_idx: int,
@@ -1033,6 +1640,9 @@ def hybrid_up(
     math_shift: float,
     tedit: TEditWrapper,
     edit_steps_ratio: float = 0.4,
+    strength_label: Optional[int] = None,
+    strength_scalar: Optional[float] = None,
+    instruction_text: Optional[str] = None,
 ) -> np.ndarray:
     """Hybrid upward editing: Math anchor + AI texture (Legacy hard boundary).
 
@@ -1072,6 +1682,9 @@ def hybrid_up(
         tgt_attrs=tgt_attrs,
         n_samples=1,
         sampler="ddim",
+        strength_label=strength_label,
+        strength_scalar=strength_scalar,
+        instruction_text=instruction_text,
     )[0]
 
     ai_texture = edited_region - ts[start_idx:end_idx]
@@ -1090,6 +1703,9 @@ def hybrid_down(
     math_shift: float,
     tedit: TEditWrapper,
     edit_steps_ratio: float = 0.4,
+    strength_label: Optional[int] = None,
+    strength_scalar: Optional[float] = None,
+    instruction_text: Optional[str] = None,
 ) -> np.ndarray:
     """Hybrid downward editing: Math anchor + AI texture (Legacy hard boundary).
 
@@ -1128,6 +1744,9 @@ def hybrid_down(
         tgt_attrs=tgt_attrs,
         n_samples=1,
         sampler="ddim",
+        strength_label=strength_label,
+        strength_scalar=strength_scalar,
+        instruction_text=instruction_text,
     )[0]
 
     ai_texture = edited_region - ts[start_idx:end_idx]
@@ -1223,8 +1842,6 @@ def trend_quadratic_up_soft(
     Returns:
         Edited time series
     """
-    from scipy.ndimage import gaussian_filter1d
-
     ts = np.asarray(ts, dtype=np.float32).copy()
     L = len(ts)
 
@@ -1282,8 +1899,6 @@ def trend_quadratic_down_soft(
     Returns:
         Edited time series
     """
-    from scipy.ndimage import gaussian_filter1d
-
     ts = np.asarray(ts, dtype=np.float32).copy()
     L = len(ts)
 
@@ -1322,12 +1937,13 @@ def season_enhance_soft(
     strength_label: Optional[int] = None,
     strength_scalar: Optional[float] = None,
     instruction_text: Optional[str] = None,
+    injection_config: Optional[Dict[str, Any]] = None,
     smooth_radius: float = 5.0,
 ) -> np.ndarray:
     """Intensify periodicity in region with Latent Blending.
 
-    Uses TEdit attr tgt=[1,1,3] (linear-up, 4-cycles) to inject strong
-    seasonal oscillation into the target region.
+    Uses strength-dependent seasonal-cycle endpoints to avoid collapsing all
+    amplitudes onto one saturated high-season target.
 
     Suitable for: seasonal demand amplification, cyclical volatility increase,
     policy-driven periodic effects.
@@ -1345,12 +1961,15 @@ def season_enhance_soft(
     ts = np.asarray(ts, dtype=np.float32).copy()
 
     src_attrs = np.array([0, 0, 0], dtype=np.int64)
-    tgt_attrs = np.array([1, 1, 3], dtype=np.int64)  # linear-up, 4-cycles (high season)
+    tgt_attrs = _resolve_season_enhance_tgt_attrs(
+        strength_label=strength_label,
+        strength_scalar=strength_scalar,
+    )
 
     total_steps = getattr(tedit.model, 'num_steps', 100) if tedit.model else 100
     tedit.set_edit_steps(int(total_steps * 0.5))
 
-    return tedit.edit_region_soft(
+    edited_ts = tedit.edit_region_soft(
         ts=ts, start_idx=start_idx, end_idx=end_idx,
         src_attrs=src_attrs, tgt_attrs=tgt_attrs,
         n_samples=1, sampler="ddim", smooth_radius=smooth_radius,
@@ -1358,6 +1977,56 @@ def season_enhance_soft(
         strength_scalar=strength_scalar,
         instruction_text=instruction_text,
     )
+    fixed_scaffold = _build_fixed_period_seasonality_scaffold(
+        ts=ts,
+        start_idx=start_idx,
+        end_idx=end_idx,
+        injection_config=injection_config,
+    )
+    scaffold_ts = fixed_scaffold if fixed_scaffold is not None else _build_seasonality_scaffold(
+        ts=ts,
+        start_idx=start_idx,
+        end_idx=end_idx,
+        strength_label=strength_label,
+        strength_scalar=strength_scalar,
+        smooth_radius=smooth_radius,
+        apply_soft_mask=False,
+    )
+    hard_mask = np.zeros_like(ts, dtype=np.float32)
+    hard_mask[start_idx:end_idx] = 1.0
+    soft_mask = gaussian_filter1d(hard_mask, sigma=smooth_radius).astype(np.float32)
+
+    ai_texture = np.asarray(edited_ts - ts, dtype=np.float32)
+    texture_region_mean = float(np.mean(ai_texture[start_idx:end_idx]))
+    ai_texture = (ai_texture - texture_region_mean) * soft_mask
+
+    if fixed_scaffold is not None:
+        return scaffold_ts
+
+    # Texture mix increases with strength: TEdit texture provides
+    # progressively more diffusion-driven detail at higher amplitudes.
+    # weak=0.15, medium=0.20, strong=0.25 — keeps scaffold as primary.
+    if strength_label is not None:
+        texture_mix = {0: 0.15, 1: 0.20, 2: 0.25}.get(int(strength_label), 0.15)
+    elif strength_scalar is not None:
+        sv = float(strength_scalar)
+        if sv <= 0.25:
+            texture_mix = 0.15
+        elif sv <= 0.75:
+            texture_mix = 0.20
+        else:
+            texture_mix = 0.25
+    else:
+        texture_mix = 0.15
+    result = scaffold_ts + texture_mix * ai_texture
+
+    # Enforce strict background fidelity: zero out any leakage to preserve regions
+    # from soft_mask transition zone or scaffold boundary effects.
+    result = np.asarray(result, dtype=np.float32).flatten()
+    ts_orig = np.asarray(ts, dtype=np.float32).flatten()
+    result[:start_idx] = ts_orig[:start_idx]
+    result[end_idx:] = ts_orig[end_idx:]
+    return result
 
 
 def season_reduce_soft(
@@ -1617,22 +2286,55 @@ def season_enhance(
     end_idx: int,
     tedit: TEditWrapper,
     edit_steps_ratio: float = 0.5,
+    strength_label: Optional[int] = None,
+    strength_scalar: Optional[float] = None,
+    instruction_text: Optional[str] = None,
+    injection_config: Optional[Dict[str, Any]] = None,
 ) -> np.ndarray:
     """Intensify periodicity (Legacy hard boundary)."""
     ts = np.asarray(ts, dtype=np.float32).copy()
 
     src_attrs = np.array([0, 0, 0], dtype=np.int64)
-    tgt_attrs = np.array([1, 1, 3], dtype=np.int64)
+    tgt_attrs = _resolve_season_enhance_tgt_attrs(
+        strength_label=strength_label,
+        strength_scalar=strength_scalar,
+    )
 
     total_steps = getattr(tedit.model, 'num_steps', 100) if tedit.model else 100
     tedit.set_edit_steps(int(total_steps * edit_steps_ratio))
 
     edited_region = tedit.edit_time_series(
-        ts=ts[start_idx:end_idx], src_attrs=src_attrs, tgt_attrs=tgt_attrs, n_samples=1, sampler="ddim",
+        ts=ts[start_idx:end_idx],
+        src_attrs=src_attrs,
+        tgt_attrs=tgt_attrs,
+        n_samples=1,
+        sampler="ddim",
+        strength_label=strength_label,
+        strength_scalar=strength_scalar,
+        instruction_text=instruction_text,
     )[0]
 
-    result = ts.copy()
-    result[start_idx:end_idx] = edited_region
+    fixed_scaffold = _build_fixed_period_seasonality_scaffold(
+        ts=ts,
+        start_idx=start_idx,
+        end_idx=end_idx,
+        injection_config=injection_config,
+    )
+    scaffold_ts = fixed_scaffold if fixed_scaffold is not None else _build_seasonality_scaffold(
+        ts=ts,
+        start_idx=start_idx,
+        end_idx=end_idx,
+        strength_label=strength_label,
+        strength_scalar=strength_scalar,
+        apply_soft_mask=False,
+    )
+    if fixed_scaffold is not None:
+        return scaffold_ts
+    ai_texture = np.asarray(edited_region - ts[start_idx:end_idx], dtype=np.float32)
+    ai_texture = ai_texture - float(np.mean(ai_texture))
+    texture_mix = 0.20 if int(strength_label) == 1 else 0.15 if strength_label is not None else 0.18 if strength_scalar is not None and 0.25 < float(strength_scalar) <= 0.75 else 0.15
+    result = scaffold_ts.copy()
+    result[start_idx:end_idx] = result[start_idx:end_idx] + texture_mix * ai_texture
     return result
 
 

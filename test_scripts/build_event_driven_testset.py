@@ -407,7 +407,7 @@ class PhysicalInjector(ABC):
 
         if injection_type == "multiplier":
             return {
-                "effect_family": "level",
+                "effect_family": "multiplier",
                 "shape": "scaled_surge",
                 "direction": "up",
                 "duration": "medium",
@@ -417,7 +417,7 @@ class PhysicalInjector(ABC):
 
         if injection_type == "hard_zero":
             return {
-                "effect_family": "shutdown",
+                "effect_family": "hard_zero",
                 "shape": "flatline",
                 "direction": "down",
                 "duration": "medium",
@@ -427,7 +427,7 @@ class PhysicalInjector(ABC):
 
         if injection_type == "noise_injection":
             return {
-                "effect_family": "volatility",
+                "effect_family": "noise_injection",
                 "shape": "irregular_noise",
                 "direction": "neutral",
                 "duration": "medium",
@@ -438,7 +438,7 @@ class PhysicalInjector(ABC):
         if injection_type == "trend_injection":
             direction = config.get("direction", "upward")
             return {
-                "effect_family": "impulse",
+                "effect_family": "trend",
                 "shape": "hump",
                 "direction": "up" if direction == "upward" else "down",
                 "duration": "medium",
@@ -449,7 +449,7 @@ class PhysicalInjector(ABC):
         if injection_type == "step_change":
             direction = config.get("direction", "up")
             return {
-                "effect_family": "level",
+                "effect_family": "step_change",
                 "shape": "step",
                 "direction": direction,
                 "duration": "medium",

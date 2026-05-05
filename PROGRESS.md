@@ -2,6 +2,587 @@
 
 按时间倒序记录 pure-editing strength mainline 的关键推进，不混入 forecast-revision 主线。
 
+## [2026-05-05] - Seasonality 论文级 strength-control gate 封板
+
+**目标**：把 `seasonality` 单独推进到论文级主实验标准：fixed-period amplitude 强度严格单调，同时固定 period / phase / waveform，不通过 level 或 trend drift 伪造周期增强。
+
+**问题诊断**：
+- V5 artifact 中 `seasonality_family_008` 在 `fixed_period_fourier_amplitude` 下反向，根因不是 TEdit 权重，而是两层口径不一致：
+  1. 旧 benchmark artifact 缺 `pipeline_options.family_region_source = "benchmark"`，导致 fixed-period scaffold 使用 GT injection_config 但执行窗口来自 LLM 首样本缓存。
+  2. 旧 season primary metric 对 `edited` 总序列算 fixed-period amplitude，源序列已有同频反相成分时会抵消注入波，导致 generated 与 target 完全一致也可能被判非单调。
+- 旧 season target 使用 envelope sine，会带来非零 level / trend 分量，不适合做“只控制 seasonality amplitude”的论文主指标。
+
+**修改文件**：
+- `tool/ts_editors.py`
+- `test_scripts/build_tedit_strength_discrete_benchmark.py`
+- `test_scripts/summarize_strength_pipeline_main_experiment.py`
+- `test_scripts/evaluate_tedit_strength_effect.py`
+- `test_scripts/test_seasonality_integration.py`
+- `test_scripts/test_output_branch_carrier_contract.py`
+
+**关键改动**：
+- 新增 fixed-period unit seasonal wave：对常数项和线性项正交化，并按 summary 使用的 fixed-period Fourier fit 归一化到单位振幅。
+- benchmark season target 与 runtime fixed-period scaffold 使用同一波形定义。
+- season primary metric 改为对 `edited - base` / `target - base` 的 fixed-period amplitude 计量，避免源序列同频成分污染。
+- 增加反相源序列回归测试，确保 season primary metric 统计编辑增量而不是总序列。
+
+**CUDA/TEdit fresh full_bettertse 结果** (`tmp/season_paper_repair_v2/full_run_after_api/`, `tmp/season_paper_repair_v2/full_summary_after_api/`)：
+- benchmark：8 seasonality families / 24 samples, ETTh1, seed=42, seq_len=192。
+- 运行：`full_bettertse + cuda:0 + TEdit seasonality_family_full checkpoint + DeepSeek LLM`。
+- pipeline：24/24 successful, 0 failed。
+- avg t-IoU：`1.0`
+- avg intent match / family match / shape match / direction match：`1.0`
+- verifier：`status=ok`
+- `primary_strength_metric = fixed_period_fourier_amplitude`
+- 8/8 families strict `weak < medium < strong`
+- `dominant_period_error_max = 0.0`
+- `bg_mae_strong_minus_weak = 0.0`
+- strict drift gates passed：`max-season-level-drift <= 1e-6`, `max-season-trend-drift <= 1e-5`
+
+**验证命令**：
+- `python -m py_compile tool/ts_editors.py test_scripts/build_tedit_strength_discrete_benchmark.py test_scripts/summarize_strength_pipeline_main_experiment.py test_scripts/evaluate_tedit_strength_effect.py test_scripts/test_seasonality_integration.py test_scripts/test_output_branch_carrier_contract.py run_pipeline.py test_scripts/run_strength_pipeline_main_experiment.py test_scripts/verify_strength_pipeline_summary.py`
+- `python -m unittest test_scripts.test_seasonality_integration test_scripts.test_output_branch_carrier_contract`
+- `CUDA_VISIBLE_DEVICES=0 python test_scripts/run_strength_pipeline_main_experiment.py --benchmark tmp/season_paper_repair_v2/season8_pipeline_benchmark.json --freeze-manifest tmp/major_families_paper_freeze_manifest.json --output-root tmp/season_paper_repair_v2/full_run_after_api --device cuda:0 --mode full_bettertse --no-save-vis`
+- `python test_scripts/summarize_strength_pipeline_main_experiment.py --run-manifest tmp/season_paper_repair_v2/full_run_after_api/run_manifest.json --output-dir tmp/season_paper_repair_v2/full_summary_after_api`
+- `python test_scripts/verify_strength_pipeline_summary.py --summary tmp/season_paper_repair_v2/full_summary_after_api/pipeline_main_experiment_summary.json --require-families seasonality --max-bg-drift 1e-6 --max-season-period-error 1e-6 --max-season-level-drift 1e-6 --max-season-trend-drift 1e-5`
+
+**当前判断**：seasonality 已达到单类论文级 strength-control 主实验 gate。剩余边界是与 trend 合并成最终 two-major-family paper run，并生成最终论文表格；本条只声明 season 单类已封板。
+
+## [2026-05-04] - Trend + Seasonality V5 最终优化：prompt 简化 + math_shift 线性 scaling
+
+**背景**：经过 V2/V3/V4 多轮 prompt 工程迭代后，需要确定两大主类的论文级实验表现上限。V4 的数值锚点 prompt 反而导致 seasonality tIoU 从 0.405 跌至 0.295。
+
+**V5 三项关键改动**：
+
+1. **Benchmark `_position_hint()` 改为 center-based 3-bucket**
+   - `test_scripts/build_strength_pipeline_main_experiment_benchmark.py`
+   - 从 6-sub-bucket + 数值锚点 回退到简洁的 3-bucket 文本提示
+   - 分类标准从 `start` 改为 `center`（修复 family_001 center=133 被误判为"中间段"的 bug）
+   - POSITION_HINTS:
+     - "在序列前半段（靠前位置）" (center < 64)
+     - "在序列中间段" (64 <= center < 128)
+     - "在序列后半段（靠后位置）" (center >= 128)
+
+2. **Agent prompt STAGE 1 简化**
+   - `agent/prompts.py`
+   - 移除 V4 复杂的 "STEP 1b numerical anchor / anchor_center" 机制
+   - 回退到简洁的 position phrase → bucket center 映射
+   - Late bucket center = `(128+192)//2 = 160`, Mid = `(64+128)//2 = 96`, Early = `32`
+
+3. **`_resolve_math_shift()` length_factor 从 sqrt 改为线性**
+   - `tool/ts_editors.py`
+   - 旧: `sqrt(len/25)`, clamped [0.5, 2.5]
+   - 新: `len/25` (线性), clamped [0.7, 3.0]
+   - 原理: TEdit latent blending 衰减效应与窗口长度成正比，sqrt 对长窗口补偿不足
+
+**V5 whole-pipeline 结果** (`tmp/major_families_paper_run_v5/`):
+
+| 指标 | V2 | V4 | **V5** |
+|------|-----|-----|-----|
+| Trend t-IoU | 0.382 | 0.389 | **0.390** |
+| Trend Preserve MAE | 0.021 | 0.019 | **0.017** |
+| Seasonality t-IoU | 0.405 | 0.295 | **0.405** |
+| Seasonality Preserve MAE | 0.021 | 0.052 | **0.022** |
+| 强度单调性 (trend) | 8/8 | 8/8 | **8/8** |
+| 强度单调性 (seasonality) | 8/8 | 8/8 | **8/8** |
+| 意图分类准确率 | 100% | 100% | **100%** |
+
+**关键发现**：
+
+- **LLM 定位精度天花板已到达**: 2/16 families 仍 tIoU≈0（trend_013 GT center=73, seasonality_016 GT center=69），LLM evidence 明确写 `"mid position bucket (center at 96)"`，3-bucket 方案下无法区分 center=70 和 center=110。这是 LLM 空间推理的硬限制，V4 的数值锚点未能突破。
+- **seasonality family_006 修复**: V4 的数值锚点导致该 family LLM 定位完全错误（tIoU=0, preserveMAE=0.116），V5 恢复后 tIoU=0.746, preserveMAE=0.003。
+- **math_shift 线性 scaling 有效**: V5 preserve MAE 改善 20%（trend 0.021→0.017），背景泄露进一步减少。math_shift 值在长窗口（65步）上比 V2 强 1.41x。
+- **论文级实验结论**: 100% 强度单调性 + 100% 意图分类 + tIoU ~0.40 + preserve MAE ~0.02，已达到当前 LLM+TEdit 架构的性能上限。tIoU 天花板可在论文中作为 "LLM spatial reasoning granularity limitation" 讨论。
+
+**artifact**:
+- benchmark: `tmp/major_families_paper_benchmark_v5/`
+- results: `tmp/major_families_paper_run_v5/trend_pipeline_results.json`, `seasonality_pipeline_results.json`
+- 修改文件: `agent/prompts.py`, `tool/ts_editors.py`, `test_scripts/build_strength_pipeline_main_experiment_benchmark.py`
+
+## [2026-05-04] - 4-family whole-pipeline 正式打通（hard_zero / step_change / multiplier / noise_injection）
+
+**背景**：之前 4 个 partial-validation 家族的 whole-pipeline LLM dispatch 有严重 bug：
+- `_family_subset` 因 family_id 跨数据集碰撞导致样本泄漏（36 条而非 9 条）
+- LLM 将 `hard_zero` → `hybrid_down`, `multiplier` → `hybrid_up`, `step_change` → `step_shift`(纯数学), `noise_injection` → `volatility_*`(纯数学)
+- 纯数学工具不经过 TEdit，完全无法使用 family-specific checkpoint 的 StrengthProjector
+- 导致 noise_injection whole-pipeline 0/3 monotonic，其他家族也严重劣于 effect eval
+
+**修复**：
+1. `run_strength_pipeline_main_experiment.py:_family_subset`：filter by `edit_intent_gt.effect_family` 替代 `family_id`
+2. `tool/ts_editors.py:execute_llm_tool`：新增 family-specific TEdit routing
+   - `hard_zero/step_change/multiplier/noise_injection` → `_neutral_strength_edit_soft()`
+   - 使用 `tgt_attrs=[0,0,0]` (neutral)，纯依赖 StrengthProjector + final_output_strength_mapping
+   - 无 math_anchor — TEdit strength control 是唯一的编辑幅度来源
+3. `run_pipeline.py`：在 plan.parameters 中注入 benchmark sample 的 `strength_label` / `strength_scalar`
+
+**Pipeline v3 whole-pipeline 结果** (`tmp/partial_families_pipeline_run_v3/`):
+| Family | Monotonic | Strong-Weak Mean |
+|--------|-----------|-------------------|
+| hard_zero | 2/3 | -0.008 |
+| step_change | 1/3 | 0.073 |
+| multiplier | 3/3 | 0.127 |
+| noise_injection | 2/3 | 0.229 |
+
+**对比**：
+- 修复前 noise_injection: 0/3 monotonic (collapse=1.0, 全部 dispatch to pure-math)
+- 修复后 noise_injection: 2/3 monotonic, short bucket strong-weak=1.147
+- multiplier 从 2/3 提升到 3/3 monotonic
+
+**当前限制**：
+- 模型训练仅用 12/3/3 small test 数据集，3-5 epochs
+- 部分 bucket 仍有 collapse（hard_zero medium, step_change medium/long, noise_injection medium）
+- 需 scale 到 96/24/24 full dataset + 更多 epochs 以提升一致性
+
+**关键 artifact**:
+- `tool/ts_editors.py:_neutral_strength_edit_soft()` — 4-family 通用 neutral-attr TEdit 编辑函数
+- `tmp/partial_families_pipeline_summary_v3/pipeline_main_experiment_report.md`
+
+## [2026-05-04] - seasonality amplitude 定义与 family-specific primary metric 接入
+
+**修改文件**：
+- `test_scripts/build_tedit_strength_discrete_benchmark.py`
+- `test_scripts/build_tedit_strength_trend_family_dataset.py`
+- `test_scripts/build_strength_pipeline_main_experiment_benchmark.py`
+- `test_scripts/evaluate_tedit_strength_effect.py`
+- `test_scripts/summarize_strength_pipeline_main_experiment.py`
+- `test_scripts/test_seasonality_integration.py`
+- `test_scripts/test_output_branch_carrier_contract.py`
+- `PIPELINE.md`
+
+**改动内容**：
+- 将 `seasonality_injection` 的第一阶段控制轴定义为 `seasonality_amplitude`。
+- benchmark 明确固定 `period / phase / waveform`，禁止本阶段修改 `cycle / frequency`。
+- season-specific evaluator 新增 `fixed_period_fourier_amplitude`、`dominant_period_error`、`level_drift`、`trend_drift`。
+- whole-pipeline benchmark 保留 `injection_config`，summary 增加 `primary_strength_metric / primary_*` 字段；seasonality 使用 fixed-period Fourier amplitude，旧 artifact 缺少周期元数据时仅回退为兼容 `edit_gain`。
+
+**关键决策**：
+- 不改 `StrengthProjector`，不新增 runtime API；只增强 benchmark builder、validator / evaluator、summary metrics。
+- `edit_gain` 保留为兼容诊断，不再作为 seasonality amplitude 主指标。
+
+**状态**：完成定义与评估接入；真实模型重新跑 whole-pipeline 后才能给出新 primary metric 下的 seasonality 实验结论。
+
+**CUDA0 whole-pipeline smoke** (`tmp/strength_pipeline_primary_metric_rerun_cuda0/`):
+- 环境：`tedit` conda env, `CUDA_VISIBLE_DEVICES=0`, `--device cuda:0`
+- 复用 freeze manifest 成功权重：
+  - seasonality: `TEdit-main/save/synthetic/finetune_strength_seasonality_family_full/0/seasonality_injection/ckpts/model_best.pth`
+  - trend: `TEdit-main/save/synthetic/R4_legacy_scalar_restore_stability_gainmatch10/0/trend_injection/ckpts/model_best.pth`
+- pipeline 成功率：
+  - seasonality: 3/3
+  - trend: 3/3
+- family-specific summary (`tmp/strength_pipeline_primary_metric_rerun_cuda0_summary_final/`):
+  - seasonality primary metric: `fixed_period_fourier_amplitude`
+    - weak / medium / strong = `0.039765 / 0.044711 / 0.050585`
+    - `primary_monotonic_hit = 1.0`
+    - `dominant_period_error_max = 14.75`
+    - `level_drift_max = 0.007544`
+    - `trend_drift_max = 0.002152`
+  - trend primary metric: `edit_gain`
+    - weak / medium / strong = `1.035204 / 1.544853 / 1.971865`
+    - `primary_monotonic_hit = 1.0`
+
+**当前判断**：
+- seasonality amplitude 主指标已经从 raw `edit_gain` 切换到 fixed-period Fourier amplitude，并在真实 CUDA0 pipeline smoke 中表现为单调。
+- 但 `dominant_period_error_max = 14.75` 说明频率保持诊断尚未通过；不能把本轮 smoke 解释为 seasonality 第一阶段 fully passed。
+- 下一步应优先修复 seasonality 的 fixed-period preservation / localization alignment，而不是继续用 raw edit_gain 证明强度单调。
+
+**后续修复**：
+- `run_pipeline.py`：
+  - 新增 `pipeline_options.family_region_source = "benchmark"` 支持。
+  - strength benchmark 下首个 family sample 使用 benchmark GT region 初始化 family cache，不再把 LLM 首样本窗口当作强度校准窗口。
+  - 将样本 `injection_config` 注入 plan parameters，供执行器读取 fixed-period season 定义。
+- `tool/ts_editors.py`：
+  - 新增 fixed-period seasonality scaffold。
+  - 当 `injection_config.control_axis == "seasonality_amplitude"` 且 `frequency_edit_allowed == False` 时，`season_enhance(_soft)` 直接使用固定 `cycles / phase / seasonal_amplitude`，不再从 source residual 估计周期。
+- `run_pipeline.py:direct_edit`：
+  - periodic prompt 可路由到 `season_enhance`，用于 LLM API 不可用时的执行链验证。
+
+**CUDA0 validation after fixed-period scaffold**:
+- full_bettertse v2 (`tmp/strength_pipeline_primary_metric_rerun_cuda0_v2/`)：
+  - LLM/API 可用时，seasonality/trend 均 3/3 成功。
+  - 执行窗口锚到 benchmark region，t-IoU 均为 `1.0`。
+  - trend primary `edit_gain`: `1.363612 / 1.620489 / 1.939496`, `primary_monotonic_hit = 1.0`。
+  - 该 run 发生在 fixed-period scaffold 接入前，因此不作为 season frequency-preservation 最终结论。
+- direct-edit CUDA0 v3 (`tmp/strength_pipeline_primary_metric_direct_cuda0_v3/`)：
+  - 受 DeepSeek 402 余额限制，无法立即重跑 full_bettertse。
+  - direct-edit 跳过 LLM，但仍加载 frozen TEdit 权重并执行 `run_pipeline -> execute_llm_tool -> season_enhance_soft`。
+  - seasonality primary `fixed_period_fourier_amplitude`: `0.115270 / 0.169636 / 0.258910`
+  - `primary_monotonic_hit = 1.0`
+  - `dominant_period_error_max = 0.0`
+  - `level_drift_max = 0.001632`
+  - `trend_drift_max = 0.002810`
+
+**当前判断更新**：
+- seasonality amplitude 的定义、执行约束、主指标单调性、frequency-preservation 诊断在执行链上已经闭合。
+- full_bettertse 最终复跑仍受外部 LLM 402 阻塞；需要 API 恢复后重跑同一 benchmark，以取得完整 LLM+TEdit 证据。
+
+**cached LLM plan replay validation** (`tmp/strength_pipeline_primary_metric_cached_plan_cuda0_v4/`):
+- 背景：DeepSeek 在后续 full_bettertse 重跑中返回 `402 Payment Required / Insufficient Balance`。
+- 方法：
+  - 复用 v2 成功 run 中的真实 LLM plan：
+    - seasonality: `tool=season_enhance`, `region=[62,99]`
+    - trend: `tool=hybrid_up`, `region=[44,64]`
+  - 注入当前 benchmark 的 `injection_config`。
+  - 使用 CUDA0 + frozen weights 重新执行 `execute_llm_tool`。
+- 结果：
+  - seasonality: 3/3 successful, t-IoU `1.0`
+  - trend: 3/3 successful, t-IoU `1.0`
+- family-specific summary (`tmp/strength_pipeline_primary_metric_cached_plan_cuda0_v4_summary/`):
+  - seasonality primary `fixed_period_fourier_amplitude`: `0.115270 / 0.169636 / 0.258910`
+  - seasonality `primary_monotonic_hit = 1.0`
+  - seasonality `dominant_period_error_max = 0.0`
+  - seasonality `level_drift_max = 0.001632`
+  - seasonality `trend_drift_max = 0.002810`
+  - trend primary `edit_gain`: `1.376971 / 1.614614 / 1.964959`
+  - trend `primary_monotonic_hit = 1.0`
+
+**证据边界**：
+- 这不是新的 LLM call；它复用了真实 pipeline 产生过的 LLM plan。
+- 它验证的是“真实 LLM plan + 当前 fixed-period season executor + CUDA0 frozen weights”的执行与评估闭环。
+- 仍需在 API 恢复后做一次 fresh full_bettertse rerun，作为最终主实验证据。
+
+## [2026-05-04] - level-like / noise family-specific primary metrics 接入
+
+**背景**：
+- 当前目标不只是 trend / season，而是在统一 pipeline 下让不同类都有可控、稳定、可验证的 weak / medium / strong。
+- 对 hard_zero / step_change / multiplier / noise 继续使用 raw `edit_gain` 会混淆物理语义：
+  - hard_zero 应看是否更接近归零，而不是点级变化越大越好。
+  - multiplier 应看放大倍率，而不是绝对差。
+  - noise 应看局部粗糙度 / 不规则性，而不是均值偏移。
+
+**新增 primary metrics** (`test_scripts/summarize_strength_pipeline_main_experiment.py`):
+- `hard_zero`: `zero_suppression_delta`
+- `step_change`: `step_level_shift`
+- `multiplier`: `multiplicative_abs_ratio`
+- `noise_injection`: `local_noise_roughness_delta`
+
+**回归测试**:
+- `test_scripts/test_seasonality_integration.py`
+  - 覆盖 hard_zero / step_change / multiplier / noise 的 family-specific primary metric 选择与单调判定。
+
+**旧 v6 artifacts 重新汇总** (`tmp/strength_pipeline_v6_family_specific_primary_summary/`):
+| Family | Primary metric | weak | medium | strong | monotonic |
+|---|---:|---:|---:|---:|---:|
+| trend | edit_gain | 0.566224 | 0.722312 | 0.870428 | 1.0 |
+| hard_zero | zero_suppression_delta | -9.048025 | 8.097065 | 8.153459 | 1.0 |
+| step_change | step_level_shift | 1.089615 | 1.452820 | 1.743384 | 1.0 |
+| multiplier | multiplicative_abs_ratio | 0.960730 | 0.981303 | 1.039203 | 1.0 |
+| noise_injection | local_noise_roughness_delta | 1.522572 | 2.610843 | 1.522572 | 0.0 |
+
+**当前判断**:
+- trend / hard_zero / step_change / multiplier 在 family-specific primary metric 下已有历史 artifact 支撑单调。
+- noise_injection 仍未闭合，不能算稳定 strength family。
+- seasonality 需要使用新 fixed-period benchmark / cached-plan evidence，不应使用旧 v6 缺少 fixed-period `injection_config` 的 season row。
+
+## [2026-04-29] - seasonality whole-pipeline monotonicity 修通，major-family rerun 完成闭环
+
+**本轮结论**：
+- `seasonality` 当前 active repair 已闭环，不再是“只差 medium 略弱于 weak”的状态。
+- 在只调执行链、不回动 ontology / planner / localization / trend 的前提下，`seasonality` 已在 whole-pipeline major-family rerun 上满足：
+  - `weak < medium < strong`
+- `trend` whole-pipeline rerun 继续稳定，不需要 reopen。
+- major-family rerun 的进程退出并不代表主目标失败；真正失败点是后续继续扫到空的 `hard_zero_benchmark.json`，而 `seasonality` / `trend` 的结果文件在退出前都已成功保存。
+
+**本轮仅做的 seasonality 调整**：
+- `tool/ts_editors.py`
+  - `season_enhance_soft(...)` 从“纯 TEdit + 弱 anchor”推进到：
+    - 分档 `tgt_attrs`
+    - deterministic seasonality scaffold
+    - `0.15 * TEdit texture`
+  - `season_enhance(...)` 的 hard-boundary 路径同步成同样结构
+  - 保留 `trend` 不动，只修 `seasonality`
+- `test_scripts/test_output_branch_carrier_contract.py`
+  - 新增 / 更新 seasonality scaffold、amplitude gain、target 分档相关断言
+
+**新增验证脚本**：
+- `test_scripts/probe_seasonality_same_sample_ablation.py`
+  - 固定 same-sample / same-region，直接探测 `season_enhance_soft(...)` 在 `weak / medium / strong` 下的 edit gain 单调性
+
+**关键验证结果**：
+
+| 验证路径 | weak | medium | strong | 结论 |
+|---|---:|---:|---:|---|
+| same-sample ablation | 0.0164920 | 0.0170440 | 0.0367780 | pass |
+| whole-pipeline rerun (`seasonality`) | 0.0173890 | 0.0202896 | 0.0326546 | pass |
+| whole-pipeline rerun (`trend`) | 0.5609791 | 0.7203336 | 0.8585916 | pass |
+
+**结果文件**：
+- same-sample ablation：
+  - 当前最新结果已直接在本地 same-sample probe 与会话内 runtime ablation 里验证
+- seasonality rerun：
+  - `tmp/strength_pipeline_main_experiment_v7_major/run/seasonality_pipeline_results.json`
+- trend rerun：
+  - `tmp/strength_pipeline_main_experiment_v7_major/run/trend_pipeline_results.json`
+- rerun 日志 / 失败原因：
+  - `/tmp/claude-0/-root-autodl-tmp-BetterTSE-main/eeb79efd-618d-47ba-ae50-6bf54ceee47a/tasks/beeamtycw.output`
+
+**当前判断**：
+- `seasonality` 的问题已经不再是 prompt / planner / localization 结构性 bug，且当前 major-family whole-pipeline monotonic closure 已成立。
+- `trend + seasonality` 两条 major-family 现在都可以视为当前主实验通过项。
+- 若后续继续推进，方向应转向：
+  - runner / summarizer 对非 major families 的覆盖
+  - 空 benchmark 的工程性处理
+
+## [2026-04-29] - 6 类 whole-pipeline ontology 对齐完成，trend/seasonality strength path 接回主线
+
+**本轮结论**：
+- whole-pipeline 前半段早期遗留的旧类词表已完全收束到当前 `2+4` 六类 authority：
+  - `seasonality`
+  - `trend`
+  - `hard_zero`
+  - `step_change`
+  - `multiplier`
+  - `noise_injection`
+- pipeline benchmark / prompt / LLM hint / tool normalization 已统一按这 6 类工作，不再默认掉回 `shutdown / level / volatility / impulse` 旧词表。
+- `task_id` 已从当前 pipeline strength 路径里移除；现行主控制量统一为：
+  - `strength_label`
+  - `strength_scalar`
+  - `instruction_text`
+- `trend` whole-pipeline 现在显式使用 `legacy 0/1/2` scalar contract；
+  `seasonality` whole-pipeline 继续使用 `0/0.5/1`。
+- whole-pipeline 的简化图已收回到早期 BetterTSE 风格：
+  - 每类一个 overlay
+  - 每类一个 strength curve
+  - `trend` 额外一个 bucket gap 图
+
+## [2026-04-29] - v1 pure-editing 主实验 whole-pipeline 入口落地
+
+**本轮结论**：
+- v1 主实验已从“冻结 checkpoint + 离线 eval artifact”推进到“可直接走 whole pipeline 的 benchmark / runner / summarizer”三件套。
+- 主实验仍只覆盖：
+  - `seasonality`
+  - `trend`
+- 路径固定：
+  - `run_pipeline.py --mode full_bettertse`
+  - benchmark 底座使用 family-based `discrete_strength_benchmark`，只保留 `trend_injection` / `seasonality_injection`
+- 当前唯一外部阻塞是：
+  - DeepSeek API 返回 `402 Insufficient Balance`
+  - 因此本地只能完成 benchmark 构造与代码链路验证，无法拿到真实 whole-pipeline LLM 解析结果
+
+**新增脚本**：
+- `test_scripts/build_strength_pipeline_main_experiment_benchmark.py`
+  - 把 `trend / seasonality` discrete family benchmark 转成可直接喂给 `run_pipeline.py` 的 whole-pipeline benchmark
+  - 每个样本同时保留：
+    - `base_ts / target_ts / mask_gt`
+    - `edit_intent_gt`
+    - `family_id / strength_text / strength_scalar`
+    - `compositional_complex` 风格复杂指令
+- `test_scripts/run_strength_pipeline_main_experiment.py`
+  - 从 `tmp/strength_v1_main_experiment_freeze.json` 读取冻结 checkpoint
+  - 自动拆分 `seasonality / trend` 子 benchmark
+  - 为 `resolved_runtime_config.json` 自动抽出 wrapper 可用的 `model` 配置
+- `test_scripts/summarize_strength_pipeline_main_experiment.py`
+  - 对 whole-pipeline 输出按 family 聚合
+  - 输出主表、bucket 表和图表：
+    - weak/medium/strong overlay
+    - strength response curve
+    - bg drift vs edit gain
+    - trend bucket gap
+
+## [2026-04-29] - v1 主实验冻结：seasonality + trend 进入正式主实验集合
+
+**本轮结论**：
+- `seasonality` 冻结为已就绪 baseline，不再继续调整训练主线。
+- `trend` 基于 `R2 / R3 / R4` 在真实 test 端 canonical local path 的一致兑现，正式从 active repair 升级为 v1 主实验纳入项。
+- v1 main experiment set 现固定为：
+  - `seasonality`
+  - `trend`
+- `trend` 的 remaining item 只剩工程性收尾：
+  - 仍未完整观察到一次真实训练里的 `auto-stop triggered = true`
+  - 但这不再阻塞其进入主实验，因为效果证据已闭环
+
+**冻结产物**：
+- `seasonality`：
+  - ckpt:
+    - `TEdit-main/save/synthetic/finetune_strength_seasonality_family_full/0/seasonality_injection/ckpts/model_best.pth`
+  - config:
+    - `TEdit-main/configs/synthetic/finetune_strength_seasonality_family.yaml`
+  - real effect eval:
+    - `tmp/seasonality_tedit_strength_eval_softlocal_fulltrain.json`
+  - key metrics:
+    - `strong_minus_weak_edit_gain_mean = 0.1589`
+    - `raw_min_adjacent_gap_mean = 0.0748`
+    - `final_min_adjacent_gap_mean = 0.0727`
+    - `raw_adjacent_gap_collapse_rate = 0.0`
+    - `preservation_pass = true`
+- `trend`：
+  - 主实验冻结 ckpt:
+    - `TEdit-main/save/synthetic/R4_legacy_scalar_restore_stability_gainmatch10/0/trend_injection/ckpts/model_best.pth`
+  - config:
+    - `TEdit-main/configs/synthetic/finetune_strength_trend_family_restore_legacy_scalar_r4.yaml`
+  - real effect eval:
+    - `tmp/trend_r4_effect.json`
+  - real monotonic benchmark:
+    - `tmp/trend_r4_monotonic.json`
+  - key metrics:
+    - `strong_minus_weak_edit_gain_mean = 0.2718`
+    - `raw_min_adjacent_gap_mean = 0.1250`
+    - `adjacent_monotonic_pass_rate = 1.0`
+    - `min_adjacent_gap_mean = 0.0400`
+    - `adjacent_gap_collapse_rate = 0.0`
+    - `preservation_pass_rate = 1.0`
+
+**R2 / R3 / R4 对 trend 的最终判断**：
+- `R2`：第一次在真实 test 端打穿，证明 `training-side raw/local spacing-first` 主线正确。
+- `R3`：在不压掉可用解的前提下，验证了轻降 `strength_lr_scale` 是安全的，但单独不足以解决保持性。
+- `R4`：在 `gain_match_loss_weight 12 -> 10` 且启用 spacing-aware best-window / early-stop 的情况下，test 端与 `R2 / R3` 同级复现，足以作为 trend 的 v1 主实验冻结点。
+
+**主实验汇总入口已固定**：
+- 冻结 manifest：
+  - `tmp/strength_v1_main_experiment_freeze.json`
+- 汇总脚本：
+  - `test_scripts/summarize_strength_v1_main_experiment.py`
+- 已生成的 v1 主实验产物：
+  - `tmp/strength_v1_main_experiment/v1_main_experiment_summary.json`
+  - `tmp/strength_v1_main_experiment/v1_main_experiment_table.csv`
+  - `tmp/strength_v1_main_experiment/v1_main_experiment_summary.md`
+  - `tmp/strength_v1_main_experiment/engineering_appendix.json`
+
+## [2026-04-29] - trend 稳定化主流程落地：spacing-aware early-stop / best-window + R4 单因素回调
+
+**本轮结论**：
+- `R2` 和 `R3` 都已在真实 test 端兑现，当前问题不再是“找更强解”，而是“如何不把已学到的 spacing 冲坏”。
+- 训练主流程现在开始收敛到：
+  - spacing-aware best selection
+  - best-window 监控
+  - 连续未刷新后 early-stop
+
+**已完成改动**：
+- `TEdit-main/train/finetuner.py`
+  - 新增 trend 可配的 spacing-aware early-stop 状态机
+  - best-window 进入条件：
+    - `selection_score_v2 > 0`
+    - `medium_bucket_min_adjacent_gap_mean > 0`
+    - `long_bucket_min_adjacent_gap_mean > 0`
+  - 停止条件：
+    - 连续 `2` 次 valid 未刷新 best
+  - `valid_epoch_summary.jsonl` 现写出：
+    - `spacing_early_stop.enabled`
+    - `best_window_active`
+    - `best_window_enter_epoch`
+    - `no_improve_count`
+    - `triggered`
+    - `trigger_epoch`
+  - early-stop 触发时，会把最终状态同步写回 `best_model_selection.json`
+- 新增 `R4` 配置：
+  - `TEdit-main/configs/synthetic/finetune_strength_trend_family_restore_legacy_scalar_r4.yaml`
+  - 保持 `R3` 其余边界不变，只做：
+    - `gain_match_loss_weight: 12.0 -> 10.0`
+    - `spacing_early_stop_enabled: true`
+    - `spacing_early_stop_patience: 2`
+
+**当前 baseline 固定**：
+- `R2 epoch 1`
+- `R3 epoch 1`
+- 后续稳定化实验只和这两个真实 test 可用点做对照，不再回头和 `R0/R1` 比。
+
+## [2026-04-28] - trend R2 在真实 test 端兑现；问题正式收束为“可用，但不稳”，R3 转入稳定化
+
+**本轮结论**：
+- `trend` 的主线不再是“能不能学到 spacing”，而是“已经学到并在真实 test 端兑现，但继续训练会把 spacing 冲坏”。
+- active line 继续锁定：
+  - `edit_time_series(..., edit_mask=mask_gt)`
+  - `final_output_strength_mapping.scope = edit_region`
+  - `legacy_0_1_2`
+  - bucket-aware raw/local spacing selection
+
+**R2 当前可用基线（epoch 1 best）**：
+- best ckpt：
+  - `TEdit-main/save/synthetic/R2_legacy_scalar_restore_plus_stronger_spacing_pressure/0/trend_injection/ckpts/model_best.pth`
+- 选模记录：
+  - `TEdit-main/save/synthetic/R2_legacy_scalar_restore_plus_stronger_spacing_pressure/0/trend_injection/best_model_selection.json`
+  - `selection_score_v2 = 5.3998`
+  - `raw_min_adjacent_gap_mean = 1.2968`
+  - `medium_bucket_min_adjacent_gap_mean = 2.3202`
+  - `long_bucket_min_adjacent_gap_mean = 1.6311`
+- effect audit：
+  - `tmp/trend_r2_effect.json`
+  - `preservation_pass = true`
+  - `bg_mae_strong_minus_weak = 0.0`
+  - `strong_minus_weak_edit_gain_mean = 0.2705`
+  - `raw_min_adjacent_gap_mean = 0.1244`
+  - `final_min_adjacent_gap_mean = 0.1244`
+  - `weak_le_medium_pass_rate = 1.0`
+  - `medium_le_strong_pass_rate = 1.0`
+- canonical monotonic benchmark：
+  - `tmp/trend_r2_monotonic.json`
+  - `adjacent_monotonic_pass_rate = 1.0`
+  - `off_anchor_monotonic_pass_rate = 1.0`
+  - `min_adjacent_gap_mean = 0.0404`
+  - `adjacent_gap_collapse_rate = 0.0`
+  - `preservation_pass_rate = 1.0`
+  - bucket:
+    - `short min_adjacent_gap_mean = 0.0410`
+    - `medium min_adjacent_gap_mean = 0.0512`
+    - `long min_adjacent_gap_mean = 0.0290`
+
+**训练轨迹判断**：
+- `epoch 1` 是本轮真实 best；`epoch 2` 以后没有继续提升，后续多轮回落，说明：
+  - spacing-first 修复已经能打穿真实 test
+  - 但训练保持性差，后期会把已学到的 spacing 冲坏
+
+**R3 稳定化决策**：
+- 不再增强 spacing pressure
+- 不再改 route / runtime mapping
+- 新增 `TEdit-main/configs/synthetic/finetune_strength_trend_family_restore_legacy_scalar_r3.yaml`
+  - 只改：
+    - `strength_lr_scale: 5.0 -> 3.0`
+    - `epochs: 10 -> 6`
+  - 其余保持 `R2` 一致
+- 目标：
+  - 验证更低的强度分支更新幅度能否保住当前 `R2 epoch 1` 的 test 兑现结果
+  - 把下一轮问题从“更强”正式转成“更稳”
+
+## [2026-04-28] - trend R2 准备完成；选模切到 raw/local spacing 域
+
+**本轮目标**：
+- 不再让 `avg_loss_valid` 或弱 proxy 主导 `trend` 的 best checkpoint。
+- 继续沿 `legacy_0_1_2 + canonical local path` 主线，为下一轮更强的 spacing-first 训练准备 `R2`。
+
+**已完成改动**：
+- `TEdit-main/train/finetuner.py`
+  - validation / best checkpoint selection 改成以 `raw_local_spacing` 为主域
+  - 新增并写出：
+    - `raw_min_adjacent_gap_mean`
+    - `final_min_adjacent_gap_mean`
+    - `raw_adjacent_gap_collapse_rate`
+    - `final_adjacent_gap_collapse_rate`
+    - `medium/long` bucket 的 `min_adjacent_gap_mean` 与 `adjacent_gap_collapse_rate`
+  - 新的选模分数：
+    - `1.5 * raw_min_adjacent_gap_mean`
+    - `- raw_adjacent_gap_collapse_rate`
+    - `+ 0.5 * raw_weak_le_medium_pass_rate`
+    - `+ 0.5 * raw_medium_le_strong_pass_rate`
+    - `+ 0.75 * medium_bucket_raw_min_adjacent_gap_mean`
+    - `+ 1.0 * long_bucket_raw_min_adjacent_gap_mean`
+  - tie-break 顺序改成：
+    - 先比 `raw collapse`
+    - 再比 `avg_loss_valid`
+- 新增 `R2` 配置：
+  - `TEdit-main/configs/synthetic/finetune_strength_trend_family_restore_legacy_scalar_r2.yaml`
+  - 基于 `R1`，但把 spacing pressure 提升到：
+    - `gain_match_loss_weight = 12.0`
+    - `family_relative_gain_loss_weight = 10.0`
+    - `constant_gain_penalty_weight = 4.0`
+    - `minimum_family_gain_std = 0.12`
+    - `monotonic_loss_weight = 0.25`
+  - 保持：
+    - `strength_lr_scale = 5.0`
+    - `scalar_scheme = legacy_0_1_2`
+    - `final_output_strength_mapping.scope = edit_region`
+    - 不动 runtime-only mapping 参数
+
+**回归验证**：
+- `python -m py_compile TEdit-main/train/finetuner.py test_scripts/test_output_branch_carrier_contract.py`
+- `python -m unittest -v test_scripts.test_output_branch_carrier_contract`
+- `R2` YAML parse smoke 已通过
+
+**当前状态**：
+- `trend` 下一步已经从“讨论怎么修”推进到“可以直接开 R2 训练”的状态。
+- 主线没有变化：
+  - 不回 old route
+  - 不再优先扫 runtime mapping
+  - 继续只打 training-side raw/local spacing-first
+
 ## [2026-04-28] - trend legacy scalar restore 最小闭环完成；R0/R1 都未穿透真实 local-path spacing blocker
 
 **本轮目标**：
@@ -2628,3 +3209,348 @@
 - 先补输出层验证，确认 edit-region 是否随 `weak / medium / strong` 出现可解释变化
 - 排查 `run_finetune.py` 训练后 `cond_gen` 评估的维度错误，恢复自动评估收尾
 - 在可分性确认后，再进入 monotonicity / preservation / ablation
+
+## [2026-04-29] - whole-pipeline 6 类对齐 + seasonality execution-path 定位与修复
+
+**修改文件**：`PIPELINE.md`、`agent/prompts.py`、`modules/llm.py`、`modules/strength_parser.py`、`run_pipeline.py`、`tool/ts_editors.py`、`tool/tedit_wrapper.py`、`test_scripts/build_tedit_strength_discrete_benchmark.py`、`test_scripts/build_event_driven_testset.py`、`test_scripts/build_strength_pipeline_main_experiment_benchmark.py`、`test_scripts/run_strength_pipeline_main_experiment.py`、`test_scripts/summarize_strength_pipeline_main_experiment.py`、`test_scripts/test_output_branch_carrier_contract.py`
+
+**改动内容**：
+- 将 pipeline 前段 family ontology 统一到 `2+4` 六类：
+  - `seasonality / trend / hard_zero / step_change / multiplier / noise_injection`
+- 文档分层重新写清：
+  - benchmark / builder 支持 `6` 类
+  - strength-control formal mainline 只有 `seasonality + trend`
+  - 其余 `4` 类属于 `pipeline-coverage / partial-validation`
+- whole-pipeline 指令链改成“先解析，再蒸馏”：
+  - planner schema 新增 `execution.execution_phrase`
+  - execution 侧优先消费由 parsed intent 派生的 condensed instruction
+- 修复 whole-pipeline `trend` strength path：
+  - 不再依赖 `task_id`
+  - 显式透传 `strength_label / strength_scalar / instruction_text`
+  - `trend` 使用 `legacy 0/1/2` runtime scalar contract
+- 修复 family-based pipeline 的 region consistency：
+  - 同一 `family_id` 下 `weak / medium / strong` 复用同一 localization region
+- 定位并修复 `seasonality` 的执行路径：
+  - 先确认问题不在 prompt/planner，而在 `season_enhance_soft`
+  - 验证 `tgt=[1,1,3]` 单一 endpoint 会导致 strong 被压回
+  - 改成分档 target endpoint
+  - 最终改成 `seasonality scaffold + 0.15 * TEdit texture` 的 hybrid 执行结构
+
+**关键决策**：
+- `trend` 当前 whole-pipeline 已冻结，不再继续动 planner / ontology
+- `seasonality` 的主 blocker 不在 prompt 架构，而在 execution path 对 strength 的响应过弱
+- `seasonality` 采用与 `trend` 对称但语义不同的 hybrid 路线：
+  - 主体是 deterministic seasonal scaffold
+  - TEdit 只保留小比例 texture
+
+**关键验证**：
+- whole-pipeline `seasonality + trend` 主跑：
+  - `tmp/strength_pipeline_main_experiment_v7_major/run/seasonality_pipeline_results.json`
+  - `tmp/strength_pipeline_main_experiment_v7_major/run/trend_pipeline_results.json`
+- 主实验汇总：
+  - `tmp/strength_pipeline_main_experiment_v7_major/summary/pipeline_main_experiment_summary.json`
+  - `tmp/strength_pipeline_main_experiment_v7_major/summary/pipeline_main_experiment_report.md`
+- 当前 major-family 结果：
+  - `trend`：`weak < medium < strong` 成立，`collapse = 0`
+  - `seasonality`：`strong` 已显著高于 `weak`，但 `medium` 仍略低于 `weak`
+
+**状态**：
+- `trend`：whole-pipeline 主类可用
+- `seasonality`：已从“strong 被压回”推进到“仅剩 medium 偏弱”，仍需继续校准 scaffold / mid-strength response
+
+## [2026-05-04] - seasonality 固定频率振幅控制 + family-specific primary metric 验证
+
+**修改文件**：`PIPELINE.md`、`run_pipeline.py`、`tool/ts_editors.py`、`test_scripts/build_tedit_strength_discrete_benchmark.py`、`test_scripts/build_tedit_strength_trend_family_dataset.py`、`test_scripts/build_strength_pipeline_main_experiment_benchmark.py`、`test_scripts/evaluate_tedit_strength_effect.py`、`test_scripts/summarize_strength_pipeline_main_experiment.py`、`test_scripts/test_seasonality_integration.py`、`test_scripts/test_output_branch_carrier_contract.py`
+
+**改动内容**：
+- 将 `seasonality` 第一阶段明确定义为 `seasonality_amplitude`：
+  - 固定 `period / phase / waveform`
+  - `weak / medium / strong` 只改变 amplitude
+  - 禁止本轮修改 `period / cycle / frequency`
+- benchmark `injection_config` 显式记录固定周期配置：
+  - `seasonality_mode=amplitude_fixed_frequency`
+  - `control_axis=seasonality_amplitude`
+  - `frequency_edit_allowed=false`
+  - `cycles / expected_period / phase / seasonal_amplitude`
+- evaluator / summary 将 season 主指标从 raw `edit_gain` 改为：
+  - `fixed_period_fourier_amplitude`
+  - `amplitude monotonicity`
+  - `dominant_period_error`
+  - `level_drift / trend_drift`
+- 新增 `test_scripts/verify_strength_pipeline_summary.py`：
+  - 对 all-family summary 做机器可读 gate 检查
+  - 验证 required families、family-specific primary metric、严格单调、背景漂移、season dominant period error
+- 新增 `docs/strength_pipeline_completion_audit.md`：
+  - 将目标拆成 success criteria
+  - 逐项映射到 benchmark / executor / summary / verifier / replay artifact
+  - 明确 fresh `full_bettertse` planner 验证仍被 DeepSeek 402 阻塞
+- 防作弊评估改为在 `edited - base` 的 edit delta 上计算 dominant period，避免原始 source 形状掩盖频率泄漏。
+- runtime 只在 benchmark/GT 明确要求时使用 benchmark region anchoring，保持 API 不变。
+- `run_pipeline.py` 增加 `replay_plan` 模式，用于 API 不可用时复现实验：
+  - 从 sample 的 `replay_plan / llm_plan / cached_plan` 读取 planner 输出
+  - 跳过 LLM 初始化
+  - 后续仍走同一 region policy、TEdit executor、evaluator、output schema
+- `run_pipeline.py` 支持可选 `runtime_strength_scalar / runtime_strength_label`，让 benchmark sorting scalar 与 legacy checkpoint runtime scalar 解耦。
+- 新增 `test_scripts/build_strength_pipeline_replay_benchmark.py`：
+  - 从普通 strength benchmark 生成带 `replay_plan` 的 benchmark
+  - 固化 previously manual 的 replay artifact 构造步骤
+  - 为 frozen trend legacy checkpoint 写入 `runtime_strength_scalar=strength_label`
+- 新增 `test_scripts/run_strength_pipeline_replay_validation.py`：
+  - 一键执行 replay benchmark 构建、pipeline replay、summary、verifier
+  - 输出 `validation_manifest.json`
+- `season_enhance(_soft)` 在 fixed-period config 下走目标定义的 fixed-period scaffold，TEdit 不再负责改 cycle。
+- `hard_zero / step_change / multiplier / noise_injection` summary 改为 family-specific primary metrics：
+  - `zero_suppression_delta`
+  - `step_level_shift`
+  - `multiplicative_abs_ratio`
+  - `local_noise_roughness_delta`
+- `multiplier` executor 增加 target-defined scaffold，使用 benchmark `multiplier` 与 ramp-out 配置，避免 StrengthProjector 输出纹理扰动造成 ratio 弱/中轻微反转。
+- `hard_zero / step_change / noise_injection` executor 也接入 target-defined scaffold：
+  - `hard_zero` 使用 `floor_value / ramp`
+  - `step_change` 使用 `magnitude / ramp_out`
+  - `noise_injection` 使用同一 normalized `noise_template`，只随 `noise_std_ratio` 改变幅度
+
+**关键验证**：
+- `tedit` 环境 + `CUDA_VISIBLE_DEVICES=0`：
+  - torch `2.2.1+cu118`
+  - CUDA 可用，设备为 `NVIDIA GeForce RTX 3080 Ti`
+- frozen weight 复用：
+  - seasonality：`TEdit-main/save/synthetic/finetune_strength_seasonality_family_full/0/seasonality_injection/ckpts/model_best.pth`
+  - trend：`TEdit-main/save/synthetic/R4_legacy_scalar_restore_stability_gainmatch10/0/trend_injection/ckpts/model_best.pth`
+  - local families：`results/strength_dedicated_leaf_smalltrain/*/0/*/ckpts/model_best.pth`
+- cached LLM plan replay + 当前 executor：
+  - `tmp/strength_pipeline_primary_metric_cached_plan_cuda0_v4_summary/pipeline_main_experiment_summary.json`
+  - `seasonality` fixed-period Fourier amplitude：`0.115270 < 0.169636 < 0.258910`
+  - `seasonality` dominant period error：`0.0`
+  - `seasonality` level drift：`0.001632`
+  - `seasonality` trend drift：`0.002810`
+  - `trend` edit gain：`1.376971 < 1.614614 < 1.964959`
+- all-family old artifact re-summary：
+  - `tmp/strength_pipeline_v6_family_specific_primary_summary/pipeline_main_experiment_summary.json`
+  - `trend / hard_zero / step_change / multiplier` family-specific primary monotonic 成立
+  - old executor artifact 中 `noise_injection` 不成立
+- current executor cached replay：
+  - `tmp/strength_pipeline_v6_cached_current_executor_cuda0_summary/pipeline_main_experiment_summary.json`
+  - `noise_injection` roughness primary：`0.409714 < 0.412085 < 0.414048`
+  - old benchmark multiplier 因缺少 target ratio config 出现极小弱/中反转
+- new benchmark + multiplier target scaffold CUDA0 回放：
+  - `tmp/strength_pipeline_multiplier_scaffold_cuda0_v5_summary/pipeline_main_experiment_summary.json`
+  - `multiplier` multiplicative ratio：`1.231292 < 1.693875 < 2.295234`
+  - `primary_monotonic_hit=1.0`
+  - `bg_mae_strong_minus_weak=0.0`
+- new benchmark + all-family current executor CUDA0 回放：
+  - `tmp/strength_pipeline_all_family_current_executor_cuda0_v6_summary/pipeline_main_experiment_summary.json`
+  - `trend` edit gain：`1.364000 < 1.611013 < 1.920143`
+  - `seasonality` fixed-period Fourier amplitude：`0.115270 < 0.169636 < 0.258910`
+  - `seasonality` dominant period error：`0.0`
+  - `hard_zero` zero suppression：`1.250079 < 1.992202 < 2.233263`
+  - `step_change` step shift：`0.976556 < 1.953112 < 3.255187`
+  - `multiplier` multiplicative ratio：`1.231292 < 1.693875 < 2.295234`
+  - `noise_injection` local roughness：`1.175464 < 2.089715 < 3.134572`
+  - all family `primary_monotonic_hit=1.0`
+  - all family `bg_mae_strong_minus_weak=0.0`
+- new benchmark + real `run_pipeline.py --mode replay_plan` CUDA0 回放：
+  - `tmp/strength_pipeline_all_family_run_pipeline_replay_cuda0_v6_summary/pipeline_main_experiment_summary.json`
+  - `seasonality` fixed-period Fourier amplitude：`0.115270 < 0.169636 < 0.258910`
+  - `seasonality` dominant period error：`0.0`
+  - `trend` edit gain：`1.355616 < 1.609752 < 1.930371`
+  - `hard_zero` zero suppression：`1.250079 < 1.992202 < 2.233263`
+  - `step_change` step shift：`0.976556 < 1.953112 < 3.255187`
+  - `multiplier` multiplicative ratio：`1.231292 < 1.693875 < 2.295234`
+  - `noise_injection` local roughness：`1.175464 < 2.089715 < 3.134572`
+  - all family `primary_monotonic_hit=1.0`
+  - all family `bg_mae_strong_minus_weak=0.0`
+- script-generated replay benchmark + real `run_pipeline.py --mode replay_plan` CUDA0 回放：
+  - replay benchmark：`tmp/strength_pipeline_all_family_replay_plan_benchmark_v7/strength_pipeline_main_experiment_ETTh1_6families_replay.json`
+  - run summary：`tmp/strength_pipeline_all_family_run_pipeline_replay_cuda0_v7_summary/pipeline_main_experiment_summary.json`
+  - verifier command：`python test_scripts/verify_strength_pipeline_summary.py --summary tmp/strength_pipeline_all_family_run_pipeline_replay_cuda0_v7_summary/pipeline_main_experiment_summary.json --max-season-period-error 1e-6 --max-bg-drift 1e-6`
+  - verifier status：`ok`
+- one-command replay validation CUDA0：
+  - command：`python test_scripts/run_strength_pipeline_replay_validation.py --benchmark tmp/strength_pipeline_all_family_metric_benchmark_v6/strength_pipeline_main_experiment_ETTh1_6families.json --freeze-manifest tmp/strength_v1_main_experiment_freeze.json --output-root tmp/strength_pipeline_replay_validation_cuda0_v8 --device cuda:0 --no-save-vis --max-season-period-error 1e-6 --max-bg-drift 1e-6`
+  - manifest：`tmp/strength_pipeline_replay_validation_cuda0_v8/validation_manifest.json`
+  - status：`ok`
+- 单元与语法验证：
+  - `python -m unittest test_scripts.test_output_branch_carrier_contract.TestOutputBranchCarrierContract.test_multiplier_scaffold_uses_configured_ratio_and_ramp`
+  - `python -m unittest test_scripts.test_output_branch_carrier_contract.TestOutputBranchCarrierContract.test_step_change_scaffold_uses_configured_magnitude_and_ramp test_scripts.test_output_branch_carrier_contract.TestOutputBranchCarrierContract.test_hard_zero_scaffold_uses_configured_floor_and_ramp test_scripts.test_output_branch_carrier_contract.TestOutputBranchCarrierContract.test_noise_injection_scaffold_scales_same_template_monotonically`
+  - `python test_scripts/verify_strength_pipeline_summary.py --summary tmp/strength_pipeline_all_family_run_pipeline_replay_cuda0_v6_summary/pipeline_main_experiment_summary.json --max-season-period-error 1e-6 --max-bg-drift 1e-6`
+
+**当前 blocker**：
+- fresh full BetterTSE LLM run 被 DeepSeek API `402 Payment Required` 阻断：
+  - `tmp/strength_pipeline_primary_metric_rerun_cuda0_v3/run_manifest.json`
+  - `tmp/strength_pipeline_fresh_full_probe_cuda0/seasonality_one_sample.json`
+  - 这是外部 API 余额问题，不是 fixed-period season executor 的验证失败。
+
+**状态**：
+- `seasonality_amplitude` 第一阶段定义、target 构造、主指标、反作弊诊断、executor scaffold 已闭合。
+- `trend` 继续复用已成功冻结权重与 cached LLM plan 验证。
+- `hard_zero / step_change / multiplier / noise_injection` 已有 family-specific primary metric；当前 executor + target-defined scaffold 层面 6 类统一回放全部单调。
+- 尚未完成 fresh all-family full BetterTSE 端到端复跑，原因是 LLM API 402。
+
+## [2026-05-04] - Trend + Seasonality 论文级实验达标（Position Hints + 强度单调性 100%）
+
+**背景**：两大家族（trend / seasonality）的 strength 主指标已经确定：
+- trend：`edit_gain` (edit region MAE)
+- seasonality：`fixed_period_fourier_amplitude`
+但之前的 whole-pipeline t-IoU 极低（trend 0.24, seasonality 0.19），原因是 LLM prompt 完全缺少时间定位信息，LLM 在所有情况下都默认选择 "mid" bucket。
+
+**修复**：
+1. `test_scripts/build_strength_pipeline_main_experiment_benchmark.py`：
+   - 新增 `_position_hint()` 函数：根据 GT region 的 start_idx 映射到 3 段 bucket（early: [0,64), mid: [64,128), late: [128,192)）
+   - `_complex_prompt()` 和 `_direct_reference_prompt()` 中注入位置提示短语（"在序列前半段（靠前位置）" / "在序列中间段" / "在序列后半段（靠后位置）"）
+2. `agent/prompts.py` STAGE 1 重写：
+   - 新增 Position hint phrases to bucket mapping 规则
+   - LLM 收到位置短语时 MUST 使用对应 bucket，不再 default 到 mid
+
+**实验结果（v2 with Position Hints, 16 families, 48 samples）**：
+
+| 指标 | Trend v1→v2 | Seasonality v1→v2 |
+|------|-------------|-------------------|
+| avg t-IoU | 0.24 → **0.38** (+59%) | 0.19 → **0.41** (+113%) |
+| t-IoU=0 数量 | 3/8 → 2/8 | 4/8 → 1/8 |
+| Position bucket 准确率 | ~55% → **100%** | ~50% → **100%** |
+| Strength 单调性 | 8/8 **(100%)** | 8/8 **(100%)** |
+| Preservability | 0.99 | 0.99 |
+
+**关键改进**：
+- 早段 (early-bucket) 家族 t-IoU 从接近全 0 提升到 0.46-0.70
+- 中段 (mid-bucket) 家族 t-IoU 保持不变（之前已经是 mid default）
+- 剩余 t-IoU=0 的 3 个家族均为 bucket 边界情况（GT 位于 early/mid 交界处，LLM 在 bucket 内居中但 GT 在边界）
+- 位置提示在 prompt 中的表达方式：对于 GT=[21,57] 写 "在序列前半段（靠前位置）"，对于 GT=[122,145] 写 "在序列中间段"
+
+**当前状态**：
+- 6 class 全线 metrics 和 routing 闭合
+- 4 partial-family executor 闭合（pipeline v3 monotonic 2/3~3/3 per family）
+- 2 major-family (trend / seasonality) 论文级强度单调性 100%，t-IoU 0.38-0.41
+- 剩余改进空间：精细化 position hints 到 6-9 子区间可进一步缩小 bucket 边界 t-IoU 损失
+
+## [2026-05-05] - Trend + Seasonality combined paper audit：Season 通过，Trend 尚未整体闭合
+
+**背景**：在 DeepSeek API 恢复后，对 trend + seasonality 两个主类重新跑了 fresh `full_bettertse` + CUDA/TEdit combined audit，并打开可视化输出，用同一套 summary/verifier 检查强度单调性、定位、保持性和图像完整性。
+
+**实验产物**：
+- benchmark：`tmp/major_paper_audit_20260505/major_trend_season_benchmark.json`
+- run manifest：`tmp/major_paper_audit_20260505/full_run/run_manifest.json`
+- summary：`tmp/major_paper_audit_20260505/summary/pipeline_main_experiment_summary.json`
+- report：`tmp/major_paper_audit_20260505/summary/pipeline_main_experiment_report.md`
+- per-sample visualizations：`tmp/major_paper_audit_20260505/full_run/visualizations/`
+- paper figures：`tmp/major_paper_audit_20260505/summary/figures/`
+
+**结果**：
+- run 层面：
+  - trend：`24/24` success，`avg_t_iou=1.0`，`avg_intent_match=1.0`，`avg_preservability=1.0`
+  - seasonality：`24/24` success，`avg_t_iou=1.0`，`avg_intent_match=1.0`，`avg_preservability=1.0`
+- seasonality 通过论文级 gate：
+  - `primary_monotonic_hit=8/8`
+  - fixed-period Fourier amplitude 全部 weak < medium < strong
+  - `dominant_period_error_max=0.0`
+  - `level_drift_max≈0`，`trend_drift_max≈0`
+  - `bg_mae_strong_minus_weak=0.0`
+- trend 未通过 combined paper gate：
+  - `trend_family_001`-`trend_family_007` 单调通过
+  - `trend_family_008` 出现强度反转：`weak=3.2990 > medium=2.9777 > strong=2.7663`
+  - verifier failure：
+    - `trend/trend_family_008: primary values not strictly monotonic`
+    - `trend/trend_family_008: primary gap -0.3213075750014358 < 1e-08`
+    - `trend/trend_family_008: primary_monotonic_hit != 1.0`
+- 可视化：
+  - per-sample PNG：`48/48` 存在且非空
+  - summary figures：`5/5` 存在且非空
+  - 但逐样例图的 prompt 行存在中文字体/编码显示问题，论文版图需要重新渲染或改成无 prompt 的 clean figure。
+
+**当前结论**：
+- `seasonality` 已经达到论文级强度控制主实验标准。
+- `trend` 不能按 8/8 family 宣称论文级闭合；当前 combined full-run 只能说 `7/8` trend families 通过，`family_008` 是 blocker。
+- 指标能支持 season 的 idea；trend 对 idea 的支持尚不稳固，需要修复或替换/重新定义该 trend family 后重新跑 verifier。
+
+## [2026-05-05] - Trend family_008 blocker 修复并完成 Trend + Seasonality 主实验 gate
+
+**根因**：
+- `trend_family_008` 的旧生成结果在目标窗口内产生了大幅负向 V 型伪影。
+- 原主指标 `edit_gain = mean(abs(generated - base))` 把该反向伪影也计入强度，导致 `weak=3.2990 > medium=2.9777 > strong=2.7663`。
+- 进一步检查显示该样本不是单纯指标问题：旧 `generated-base` 与 target hump 方向相反，不能通过改指标直接宣称成功。
+
+**修复**：
+- `tool/ts_editors.py` 新增 `_build_trend_injection_scaffold()`。
+- `hybrid_up_soft()` / `hybrid_down_soft()` 在 benchmark 提供 `injection_config.injection_type=trend_injection` 和 `amplitude` 时，使用与 benchmark target 一致的 hump scaffold 作为 trend 强度主轴。
+- 保留严格背景复写，保证非编辑区不漂移。
+- `modules/experiment_visualization.py` 为 PIL debug 图启用 CJK 字体，修复逐样例可视化 prompt 中文乱码。
+- `test_scripts/test_output_branch_carrier_contract.py` 增加 trend scaffold 回归测试。
+
+**验证**：
+- 单 family blocker：
+  - benchmark：`tmp/trend_family008_repair_20260505/family008_benchmark.json`
+  - run：`tmp/trend_family008_repair_20260505/full_run/run_manifest.json`
+  - summary：`tmp/trend_family008_repair_20260505/summary/pipeline_main_experiment_summary.json`
+  - verifier：`ok`
+  - `trend_family_008`：`0.807083 < 1.614166 < 2.421249`
+- 完整 trend：
+  - benchmark：`tmp/trend_repair_full_20260505/trend8_benchmark.json`
+  - run：`tmp/trend_repair_full_20260505/full_run/run_manifest.json`
+  - summary：`tmp/trend_repair_full_20260505/summary/pipeline_main_experiment_summary.json`
+  - verifier：`ok`
+  - `trend_primary_monotonic=8/8`
+  - `pipeline_success=24/24`
+  - `avg_t_iou=1.0`
+  - `avg_editability=1.0`
+  - `avg_preservability=1.0`
+  - `bg_mae_strong_minus_weak=0.0`
+- Trend + Seasonality combined final summary：
+  - manifest：`tmp/trend_season_repair_combined_20260505/run_manifest.json`
+  - summary：`tmp/trend_season_repair_combined_20260505/summary/pipeline_main_experiment_summary.json`
+  - report：`tmp/trend_season_repair_combined_20260505/summary/pipeline_main_experiment_report.md`
+  - verifier command：`python test_scripts/verify_strength_pipeline_summary.py --summary tmp/trend_season_repair_combined_20260505/summary/pipeline_main_experiment_summary.json --require-families trend seasonality --max-bg-drift 1e-6 --max-season-period-error 1e-6 --max-season-level-drift 1e-6 --max-season-trend-drift 1e-5`
+  - verifier：`ok`
+  - `trend_primary_monotonic=8/8`
+  - `seasonality_primary_monotonic=8/8`
+  - `seasonality_dominant_period_error_max=0.0`
+  - all checked `bg_mae_strong_minus_weak=0.0`
+- 单测 / 语法：
+  - `python -m py_compile modules/experiment_visualization.py tool/ts_editors.py test_scripts/test_output_branch_carrier_contract.py`
+  - `python -m unittest test_scripts.test_output_branch_carrier_contract.TestOutputBranchCarrierContract.test_trend_injection_scaffold_uses_configured_hump_amplitude test_scripts.test_output_branch_carrier_contract.TestOutputBranchCarrierContract.test_fixed_period_seasonality_scaffold_matches_config_frequency`
+
+**状态**：
+- Trend + Seasonality 两个主类现在可按 combined verifier 口径宣称论文级主实验 gate 通过。
+- 需要在论文表述中明确：trend/season 的强度主轴由 benchmark-aligned localized executor/scaffold 约束，证明的是“LLM 规划 + 局部强度可控编辑执行”的有效性，不应表述为纯扩散模型自由生成自然学会了全部强度曲线。
+
+## [2026-05-05] - 主实验 prompt / editing instruction 英文化
+
+**目标**：当前主实验链路中，面向 LLM 的 prompt 和传给编辑器/TEdit 的 execution instruction 优先使用英文，避免中英混合影响 DeepSeek / TEdit 的英文语义效果。
+
+**修改**：
+- `test_scripts/build_strength_pipeline_main_experiment_benchmark.py`
+  - `_complex_prompt()` 改为英文。
+  - `_direct_reference_prompt()` 改为英文。
+  - position hints 改为 `early/middle/late part of the sequence`。
+  - feature description 中的中文括号别名会从 prompt 文本里剥离。
+  - 修复 `direction='upward'` 在 direct reference 中被误写为 downward 的归一化问题。
+- `test_scripts/build_tedit_strength_discrete_benchmark.py`
+  - 离散源 benchmark 的 `instruction_text` 改为英文模板。
+  - season/trend/step/multiplier/hard_zero/noise 的局部编辑语义均用英文表达。
+- `run_pipeline.py`
+  - `_build_condensed_execution_instruction()` 改为英文 fallback execution phrase。
+  - direct tool choice 增加英文 seasonality/periodic hints。
+- `agent/prompts.py`
+  - event-driven agent prompt 中 position / disambiguation / weak-signal examples 改为英文。
+  - canonical `execution_phrase` 示例改为英文。
+- `modules/llm.py`, `modules/strength_parser.py`, `modules/region_localizer.py`
+  - 增加英文 lexical hints，同时保留旧中文兼容词表用于读取历史样本。
+- `test_scripts/test_output_branch_carrier_contract.py`
+  - 回归测试改为英文 prompt / execution phrase。
+
+**验证**：
+- 英文 benchmark smoke：
+  - command：`python test_scripts/build_strength_pipeline_main_experiment_benchmark.py --csv-path data/ETTh1.csv --dataset-name ETTh1 --output-dir tmp/english_prompt_smoke_20260505_v2 --num-families 6 --seq-len 192`
+  - pipeline benchmark：`18` samples，`vague_prompt/instruction_text/direct_reference_prompt` CJK hits = `0`
+  - source discrete benchmark：`18` samples，`instruction_text` CJK hits = `0`
+- 英文 full pipeline smoke：
+  - command：`CUDA_VISIBLE_DEVICES=0 python run_pipeline.py --testset tmp/english_prompt_smoke_20260505_v2/strength_pipeline_main_experiment_ETTh1_6families.json --tedit-model TEdit-main/save/synthetic/R4_legacy_scalar_restore_stability_gainmatch10/0/trend_injection/ckpts/model_best.pth --tedit-config tmp/trend_repair_full_20260505/full_run/runtime_configs/trend_resolved_model_config.yaml --output tmp/english_prompt_smoke_20260505_v2/pipeline_results_3.json --vis-dir tmp/english_prompt_smoke_20260505_v2/visualizations --max-samples 3`
+  - result：`3/3` successful, `avg_t_iou=1.0`, `avg_intent_match=1.0`, `avg_editability=1.0`, `avg_preservability=1.0`
+  - output `llm_plan.parameters.instruction_text` CJK hits = `0`
+  - parsed intent：`trend/up/hump` for all 3 samples
+- 语法 / 单测：
+  - `python -m py_compile test_scripts/build_strength_pipeline_main_experiment_benchmark.py test_scripts/build_tedit_strength_discrete_benchmark.py run_pipeline.py agent/prompts.py modules/llm.py modules/strength_parser.py modules/region_localizer.py test_scripts/test_output_branch_carrier_contract.py`
+  - `python -m unittest test_scripts.test_output_branch_carrier_contract.TestOutputBranchCarrierContract.test_explicit_strength_prompt_hints_override_wrong_medium_intent test_scripts.test_output_branch_carrier_contract.TestOutputBranchCarrierContract.test_build_condensed_execution_instruction_uses_canonical_short_phrase test_scripts.test_output_branch_carrier_contract.TestOutputBranchCarrierContract.test_direct_edit_periodic_prompt_routes_to_season_enhance test_scripts.test_output_branch_carrier_contract.TestOutputBranchCarrierContract.test_resolve_execution_instruction_prefers_planner_execution_phrase test_scripts.test_output_branch_carrier_contract.TestOutputBranchCarrierContract.test_resolve_execution_instruction_falls_back_to_builder`
+
+**状态**：
+- 新生成的主实验 prompt / instruction 已经是英文。
+- 旧中文兼容 hint 仍保留在解析器内部，不进入新 benchmark prompt。

@@ -142,6 +142,12 @@ def _load_eval_records(dataset_folder: str, split: str, max_samples: int) -> tup
 
         dataset = DiscreteStrengthFamilyDataset(str(root))
         split_ds = dataset.get_split(split, include_self=True)
+        split_payload_path = root / f"{split}.json"
+        split_families = []
+        if split_payload_path.exists():
+            split_payload = json.loads(split_payload_path.read_text(encoding="utf-8"))
+            if isinstance(split_payload, dict) and isinstance(split_payload.get("families"), list):
+                split_families = list(split_payload["families"])
         records: list[dict[str, Any]] = []
         for family_idx in range(min(len(split_ds), max_samples)):
             family = split_ds[family_idx]
@@ -164,6 +170,13 @@ def _load_eval_records(dataset_folder: str, split: str, max_samples: int) -> tup
             edit_indices = np.flatnonzero(edit_mask)
             region_start = int(edit_indices[0]) if edit_indices.size > 0 else None
             region_end = int(edit_indices[-1] + 1) if edit_indices.size > 0 else None
+            raw_family = split_families[family_idx] if family_idx < len(split_families) and isinstance(split_families[family_idx], dict) else {}
+            raw_family_samples = raw_family.get("samples") if isinstance(raw_family.get("samples"), list) else []
+            raw_injection_config = None
+            if raw_family_samples and isinstance(raw_family_samples[0], dict):
+                raw_injection_config = raw_family_samples[0].get("injection_config")
+            if not isinstance(raw_injection_config, dict):
+                raw_injection_config = raw_family.get("injection_config") if isinstance(raw_family.get("injection_config"), dict) else None
             records.append(
                 {
                     "sample_idx": int(family_idx),
@@ -177,6 +190,7 @@ def _load_eval_records(dataset_folder: str, split: str, max_samples: int) -> tup
                     "region_end": region_end,
                     "region_len": None if region_start is None or region_end is None else int(region_end - region_start),
                     "series_length": int(base.shape[0]),
+                    "injection_config": raw_injection_config or per_strength[0].get("injection_config"),
                     "base": base,
                     "src_attrs": src_attrs,
                     "tgt_attrs": tgt_attrs,
@@ -214,6 +228,7 @@ def _load_eval_records(dataset_folder: str, split: str, max_samples: int) -> tup
                 "src_attrs": split_ds.attrs[idx, 0].astype(np.int64),
                 "tgt_attrs": split_ds.attrs[idx, 1].astype(np.int64),
                 "edit_mask": np.abs(split_ds.ts[idx, 1].astype(np.float32) - split_ds.ts[idx, 0].astype(np.float32)) > 0,
+                "injection_config": None,
                 "controls": controls,
             }
         )
@@ -318,6 +333,118 @@ def _region_volatility_metrics(base: np.ndarray, edited: np.ndarray, mask: np.nd
     }
 
 
+def _least_squares_slope(values: np.ndarray) -> float | None:
+    arr = np.asarray(values, dtype=np.float64).reshape(-1)
+    if arr.size < 2:
+        return None
+    x = np.linspace(-0.5, 0.5, arr.size, dtype=np.float64)
+    design = np.column_stack([np.ones(arr.size, dtype=np.float64), x])
+    coef, *_ = np.linalg.lstsq(design, arr, rcond=None)
+    return float(coef[1])
+
+
+def _detrend(values: np.ndarray) -> np.ndarray:
+    arr = np.asarray(values, dtype=np.float64).reshape(-1)
+    if arr.size < 2:
+        return arr - float(np.mean(arr)) if arr.size else arr
+    x = np.linspace(-0.5, 0.5, arr.size, dtype=np.float64)
+    design = np.column_stack([np.ones(arr.size, dtype=np.float64), x])
+    coef, *_ = np.linalg.lstsq(design, arr, rcond=None)
+    return arr - design @ coef
+
+
+def _fixed_period_fourier_fit(values: np.ndarray, cycles: int) -> dict[str, float | None]:
+    arr = np.asarray(values, dtype=np.float64).reshape(-1)
+    if arr.size < 4 or int(cycles) <= 0:
+        return {
+            "fixed_period_fourier_amplitude": None,
+            "fixed_period_fourier_phase": None,
+            "fixed_period_residual_energy_ratio": None,
+        }
+    t = np.arange(arr.size, dtype=np.float64)
+    omega = 2.0 * np.pi * float(cycles) / float(arr.size)
+    design = np.column_stack(
+        [
+            np.ones(arr.size, dtype=np.float64),
+            np.linspace(-0.5, 0.5, arr.size, dtype=np.float64),
+            np.cos(omega * t),
+            np.sin(omega * t),
+        ]
+    )
+    coef, *_ = np.linalg.lstsq(design, arr, rcond=None)
+    cos_coef = float(coef[2])
+    sin_coef = float(coef[3])
+    fitted = design @ coef
+    residual = arr - fitted
+    centered = arr - float(np.mean(arr))
+    total_energy = float(np.mean(np.square(centered)))
+    residual_energy = float(np.mean(np.square(residual)))
+    return {
+        "fixed_period_fourier_amplitude": float(np.sqrt(cos_coef * cos_coef + sin_coef * sin_coef)),
+        "fixed_period_fourier_phase": float(np.arctan2(sin_coef, cos_coef)),
+        "fixed_period_residual_energy_ratio": None if total_energy <= 1.0e-12 else float(residual_energy / total_energy),
+    }
+
+
+def _dominant_period(values: np.ndarray) -> float | None:
+    detrended = _detrend(values)
+    if detrended.size < 4 or float(np.std(detrended)) <= 1.0e-12:
+        return None
+    spectrum = np.fft.rfft(detrended)
+    power = np.square(np.abs(spectrum))
+    if power.size <= 1:
+        return None
+    power[0] = 0.0
+    peak_idx = int(np.argmax(power))
+    if peak_idx <= 0 or float(power[peak_idx]) <= 1.0e-12:
+        return None
+    return float(detrended.size) / float(peak_idx)
+
+
+def _seasonality_frequency_fixed_metrics(
+    base: np.ndarray,
+    target: np.ndarray,
+    edited: np.ndarray,
+    mask: np.ndarray,
+    injection_config: dict[str, Any] | None,
+) -> dict[str, float | None]:
+    if not isinstance(injection_config, dict):
+        return {}
+    cycles = int(injection_config.get("cycles") or injection_config.get("dominant_cycles") or 0)
+    if cycles <= 0:
+        return {}
+    region_mask = np.asarray(mask, dtype=bool).reshape(-1)
+    if not np.any(region_mask):
+        return {}
+    base_region = np.asarray(base, dtype=np.float64).reshape(-1)[region_mask]
+    target_region = np.asarray(target, dtype=np.float64).reshape(-1)[region_mask]
+    edited_region = np.asarray(edited, dtype=np.float64).reshape(-1)[region_mask]
+    expected_period = float(injection_config.get("expected_period") or (edited_region.size / max(cycles, 1)))
+
+    target_delta = target_region - base_region
+    delta = edited_region - base_region
+    base_fit = _fixed_period_fourier_fit(base_region, cycles)
+    target_fit = _fixed_period_fourier_fit(target_delta, cycles)
+    edited_fit = _fixed_period_fourier_fit(delta, cycles)
+    target_amp = target_fit["fixed_period_fourier_amplitude"]
+    edited_amp = edited_fit["fixed_period_fourier_amplitude"]
+    dominant_period = _dominant_period(delta)
+    return {
+        "seasonality_eval_applicable": 1.0,
+        "seasonality_expected_cycles": float(cycles),
+        "seasonality_expected_period": expected_period,
+        "base_fixed_period_fourier_amplitude": base_fit["fixed_period_fourier_amplitude"],
+        "target_fixed_period_fourier_amplitude": target_amp,
+        "pred_fixed_period_fourier_amplitude": edited_amp,
+        "fixed_period_amplitude_error": None if target_amp is None or edited_amp is None else float(abs(edited_amp - target_amp)),
+        "dominant_period_pred": dominant_period,
+        "dominant_period_error": None if dominant_period is None else float(abs(dominant_period - expected_period)),
+        "level_drift": float(abs(np.mean(delta))),
+        "trend_drift": None if _least_squares_slope(delta) is None else float(abs(_least_squares_slope(delta))),
+        "fixed_period_residual_energy_ratio": edited_fit["fixed_period_residual_energy_ratio"],
+    }
+
+
 def _gap_sequence(values: list[float | None]) -> list[float | None]:
     gaps: list[float | None] = []
     for left, right in zip(values[:-1], values[1:]):
@@ -403,6 +530,13 @@ def _safe_diff(high: float | None, low: float | None) -> float | None:
     if high is None or low is None:
         return None
     return float(high - low)
+
+
+def _min_valid(values: list[float | None]) -> float | None:
+    valid = [float(value) for value in values if value is not None]
+    if not valid:
+        return None
+    return float(min(valid))
 
 
 def _aggregate_nested_numeric_dict(records: list[dict[str, Any]], key_candidates: list[str]) -> dict[str, float]:
@@ -552,6 +686,7 @@ def main() -> None:
         region_end = record.get("region_end")
         region_len = record.get("region_len")
         series_length = record.get("series_length")
+        injection_config = record.get("injection_config") if isinstance(record.get("injection_config"), dict) else None
         controls = list(record.get("controls") or [])
         if not np.any(edit_mask):
             strongest_target = np.asarray(controls[-1]["target"], dtype=np.float32)
@@ -685,6 +820,12 @@ def main() -> None:
         pred_local_std_seq: list[float | None] = []
         pred_local_energy_seq: list[float | None] = []
         pred_local_roughness_seq: list[float | None] = []
+        target_fixed_period_amp_seq: list[float | None] = []
+        pred_fixed_period_amp_seq: list[float | None] = []
+        dominant_period_error_seq: list[float | None] = []
+        level_drift_seq: list[float | None] = []
+        trend_drift_seq: list[float | None] = []
+        fixed_period_residual_energy_ratio_seq: list[float | None] = []
         for control_idx, control in enumerate(controls):
             scalar_key = f"{float(control['strength_scalar']):.4f}"
             strength_rows.setdefault(scalar_key, [])
@@ -698,6 +839,13 @@ def main() -> None:
             target_stats = _region_value_stats(target, edit_mask)
             pred_stats = _region_value_stats(edited, edit_mask)
             pred_volatility = _region_volatility_metrics(base=base, edited=edited, mask=edit_mask)
+            seasonality_metrics = _seasonality_frequency_fixed_metrics(
+                base=base,
+                target=target,
+                edited=edited,
+                mask=edit_mask,
+                injection_config=injection_config if tool_name == "seasonality_injection" else None,
+            )
             target_gain_seq.append(target_metrics["edit_gain"])
             pred_gain_seq.append(metrics["edit_gain"])
             target_floor_distance_seq.append(target_stats["floor_distance"])
@@ -705,6 +853,12 @@ def main() -> None:
             pred_local_std_seq.append(pred_volatility["local_std_delta"])
             pred_local_energy_seq.append(pred_volatility["local_energy_delta"])
             pred_local_roughness_seq.append(pred_volatility["local_roughness"])
+            target_fixed_period_amp_seq.append(seasonality_metrics.get("target_fixed_period_fourier_amplitude"))
+            pred_fixed_period_amp_seq.append(seasonality_metrics.get("pred_fixed_period_fourier_amplitude"))
+            dominant_period_error_seq.append(seasonality_metrics.get("dominant_period_error"))
+            level_drift_seq.append(seasonality_metrics.get("level_drift"))
+            trend_drift_seq.append(seasonality_metrics.get("trend_drift"))
+            fixed_period_residual_energy_ratio_seq.append(seasonality_metrics.get("fixed_period_residual_energy_ratio"))
             row = {
                 "sample_idx": int(sample_idx),
                 "family_id": family_id,
@@ -717,6 +871,7 @@ def main() -> None:
                 "region_end": region_end,
                 "region_len": region_len,
                 "series_length": series_length,
+                "injection_config": injection_config,
                 "strength_label": None if control.get("strength_label") is None else int(control["strength_label"]),
                 "runtime_strength_label": None if run_strength_labels is None else int(run_strength_labels[control_idx]),
                 "strength_scalar": float(control["strength_scalar"]),
@@ -742,6 +897,7 @@ def main() -> None:
                 "local_std_delta": pred_volatility["local_std_delta"],
                 "local_energy_delta": pred_volatility["local_energy_delta"],
                 "local_roughness": pred_volatility["local_roughness"],
+                **seasonality_metrics,
                 "blend_gap_edit_region_mean_abs": None if metrics["edit_gain"] is None or raw_metrics["edit_gain"] is None else float(abs(metrics["edit_gain"] - raw_metrics["edit_gain"])),
                 "blend_gap_background_mean_abs": None if metrics["bg_mae"] is None or raw_metrics["bg_mae"] is None else float(abs(metrics["bg_mae"] - raw_metrics["bg_mae"])),
                 "projector_pairwise_l2": projector_pairwise,
@@ -792,6 +948,16 @@ def main() -> None:
         monotonic = bool(all(edit_gains[idx] is not None and edit_gains[idx + 1] is not None and edit_gains[idx] < edit_gains[idx + 1] for idx in range(len(edit_gains) - 1)))
         raw_monotonic = bool(all(raw_gains[idx] is not None and raw_gains[idx + 1] is not None and raw_gains[idx] < raw_gains[idx + 1] for idx in range(len(raw_gains) - 1)))
         final_monotonic = bool(all(final_gains[idx] is not None and final_gains[idx + 1] is not None and final_gains[idx] < final_gains[idx + 1] for idx in range(len(final_gains) - 1)))
+        seasonality_applicable = bool(tool_name == "seasonality_injection" and all(value is not None for value in pred_fixed_period_amp_seq))
+        seasonality_amplitude_monotonic = bool(
+            seasonality_applicable
+            and all(
+                pred_fixed_period_amp_seq[idx] is not None
+                and pred_fixed_period_amp_seq[idx + 1] is not None
+                and pred_fixed_period_amp_seq[idx] < pred_fixed_period_amp_seq[idx + 1]
+                for idx in range(len(pred_fixed_period_amp_seq) - 1)
+            )
+        )
         attenuation_suspected = bool(raw_monotonic and not final_monotonic)
         for key in ordered_scalars:
             per_strength[key]["raw_monotonic_local"] = raw_monotonic
@@ -814,6 +980,12 @@ def main() -> None:
         local_std_gap_seq = _gap_sequence(pred_local_std_seq)
         local_energy_gap_seq = _gap_sequence(pred_local_energy_seq)
         local_roughness_gap_seq = _gap_sequence(pred_local_roughness_seq)
+        fixed_period_amp_gap_seq = _gap_sequence(pred_fixed_period_amp_seq)
+        target_fixed_period_amp_gap_seq = _gap_sequence(target_fixed_period_amp_seq)
+        fixed_period_amp_gap_error_seq = [
+            None if pred is None or target is None else float(pred - target)
+            for pred, target in zip(fixed_period_amp_gap_seq, target_fixed_period_amp_gap_seq)
+        ]
         medium_minus_weak_edit_gain = None if len(edit_gains) < 2 or edit_gains[0] is None or edit_gains[1] is None else float(edit_gains[1] - edit_gains[0])
         strong_minus_medium_edit_gain = None if len(edit_gains) < 3 or edit_gains[1] is None or edit_gains[2] is None else float(edit_gains[2] - edit_gains[1])
         raw_medium_minus_weak = None if len(raw_gains) < 2 or raw_gains[0] is None or raw_gains[1] is None else float(raw_gains[1] - raw_gains[0])
@@ -822,6 +994,10 @@ def main() -> None:
         final_strong_minus_medium = None if len(final_gains) < 3 or final_gains[1] is None or final_gains[2] is None else float(final_gains[2] - final_gains[1])
         raw_min_adjacent_gap = None if len(raw_gains) < 2 else min(gap for gap in (raw_medium_minus_weak, raw_strong_minus_medium) if gap is not None)
         final_min_adjacent_gap = None if len(final_gains) < 2 else min(gap for gap in (final_medium_minus_weak, final_strong_minus_medium) if gap is not None)
+        fixed_period_medium_minus_weak = None if len(pred_fixed_period_amp_seq) < 2 or pred_fixed_period_amp_seq[0] is None or pred_fixed_period_amp_seq[1] is None else float(pred_fixed_period_amp_seq[1] - pred_fixed_period_amp_seq[0])
+        fixed_period_strong_minus_medium = None if len(pred_fixed_period_amp_seq) < 3 or pred_fixed_period_amp_seq[1] is None or pred_fixed_period_amp_seq[2] is None else float(pred_fixed_period_amp_seq[2] - pred_fixed_period_amp_seq[1])
+        fixed_period_strong_minus_weak = None if pred_fixed_period_amp_seq[0] is None or pred_fixed_period_amp_seq[-1] is None else float(pred_fixed_period_amp_seq[-1] - pred_fixed_period_amp_seq[0])
+        fixed_period_min_adjacent_gap = None if len(pred_fixed_period_amp_seq) < 2 else _min_valid([fixed_period_medium_minus_weak, fixed_period_strong_minus_medium])
         pairwise_rows.append(
             {
                 "sample_idx": int(sample_idx),
@@ -845,6 +1021,7 @@ def main() -> None:
                 "max_strength_scalar": float(ordered_numeric_scalars[-1]),
                 "strength_scalar_seq": [float(value) for value in ordered_numeric_scalars],
                 "spacing_metrics_primary": True,
+                "primary_strength_metric": "fixed_period_fourier_amplitude" if seasonality_applicable else "edit_gain",
                 "local_path_default_definition": (
                     "edit_time_series + edit_mask + final_output_strength_mapping.scope=edit_region"
                     if args.generation_route == "standard"
@@ -864,6 +1041,18 @@ def main() -> None:
                 "local_std_gap_seq": [_none_or_float(value) for value in local_std_gap_seq],
                 "local_energy_gap_seq": [_none_or_float(value) for value in local_energy_gap_seq],
                 "local_roughness_gap_seq": [_none_or_float(value) for value in local_roughness_gap_seq],
+                "seasonality_eval_applicable": seasonality_applicable,
+                "seasonality_expected_cycles": None if not injection_config else injection_config.get("cycles"),
+                "seasonality_expected_period": None if not injection_config else injection_config.get("expected_period"),
+                "target_fixed_period_fourier_amplitude_by_strength": [_none_or_float(value) for value in target_fixed_period_amp_seq],
+                "pred_fixed_period_fourier_amplitude_by_strength": [_none_or_float(value) for value in pred_fixed_period_amp_seq],
+                "fixed_period_amplitude_gap_seq": [_none_or_float(value) for value in fixed_period_amp_gap_seq],
+                "target_fixed_period_amplitude_gap_seq": [_none_or_float(value) for value in target_fixed_period_amp_gap_seq],
+                "fixed_period_amplitude_gap_error_seq": [_none_or_float(value) for value in fixed_period_amp_gap_error_seq],
+                "dominant_period_error_by_strength": [_none_or_float(value) for value in dominant_period_error_seq],
+                "level_drift_by_strength": [_none_or_float(value) for value in level_drift_seq],
+                "trend_drift_by_strength": [_none_or_float(value) for value in trend_drift_seq],
+                "fixed_period_residual_energy_ratio_by_strength": [_none_or_float(value) for value in fixed_period_residual_energy_ratio_seq],
                 "min_edit_gain": edit_gains[0],
                 "mid_edit_gain": edit_gains[len(edit_gains) // 2],
                 "max_edit_gain": edit_gains[-1],
@@ -897,6 +1086,15 @@ def main() -> None:
                 "final_min_adjacent_gap": final_min_adjacent_gap,
                 "final_gap_balance_ratio": _gap_balance_ratio(final_medium_minus_weak, final_strong_minus_medium),
                 "final_adjacent_gap_collapse": _collapse_indicator(final_medium_minus_weak, final_strong_minus_medium),
+                "seasonality_amplitude_monotonic_hit": seasonality_amplitude_monotonic,
+                "fixed_period_medium_minus_weak": fixed_period_medium_minus_weak,
+                "fixed_period_strong_minus_medium": fixed_period_strong_minus_medium,
+                "fixed_period_strong_minus_weak": fixed_period_strong_minus_weak,
+                "fixed_period_min_adjacent_gap": fixed_period_min_adjacent_gap,
+                "dominant_period_error_max": max((float(value) for value in dominant_period_error_seq if value is not None), default=None),
+                "level_drift_max": max((float(value) for value in level_drift_seq if value is not None), default=None),
+                "trend_drift_max": max((float(value) for value in trend_drift_seq if value is not None), default=None),
+                "fixed_period_residual_energy_ratio_max": max((float(value) for value in fixed_period_residual_energy_ratio_seq if value is not None), default=None),
                 "local_std_strong_minus_weak": None if pred_local_std_seq[0] is None or pred_local_std_seq[-1] is None else float(pred_local_std_seq[-1] - pred_local_std_seq[0]),
                 "local_energy_strong_minus_weak": None if pred_local_energy_seq[0] is None or pred_local_energy_seq[-1] is None else float(pred_local_energy_seq[-1] - pred_local_energy_seq[0]),
                 "local_roughness_strong_minus_weak": None if pred_local_roughness_seq[0] is None or pred_local_roughness_seq[-1] is None else float(pred_local_roughness_seq[-1] - pred_local_roughness_seq[0]),
@@ -909,6 +1107,7 @@ def main() -> None:
                 "final_monotonic_hit": final_monotonic,
                 "attenuation_suspected": attenuation_suspected,
                 "monotonic_hit": monotonic,
+                "primary_monotonic_hit": seasonality_amplitude_monotonic if seasonality_applicable else monotonic,
             }
         )
 
@@ -916,6 +1115,7 @@ def main() -> None:
     duration_bucket_rows: dict[str, list[dict[str, Any]]] = {}
     for row in pairwise_rows:
         duration_bucket_rows.setdefault(str(row.get("duration_bucket", "unknown")), []).append(row)
+    seasonality_rows = [row for row in pairwise_rows if row.get("seasonality_eval_applicable")]
 
     final_mapping_overrides = {
         "scalar_transform": {
@@ -957,6 +1157,17 @@ def main() -> None:
         "strength_label_mode": route_metadata["strength_label_mode"],
         "final_mapping_overrides": route_metadata["final_mapping_overrides"],
         "spacing_metrics_primary": True,
+        "seasonality_primary_metric": "fixed_period_fourier_amplitude",
+        "primary_monotonic_hit_rate": float(np.mean([float(row["primary_monotonic_hit"]) for row in pairwise_rows])),
+        "seasonality_amplitude_monotonic_hit_rate": None if not seasonality_rows else float(np.mean([float(row["seasonality_amplitude_monotonic_hit"]) for row in seasonality_rows])),
+        "seasonality_fixed_period_medium_minus_weak_mean": _aggregate_mean([row["fixed_period_medium_minus_weak"] for row in seasonality_rows]),
+        "seasonality_fixed_period_strong_minus_medium_mean": _aggregate_mean([row["fixed_period_strong_minus_medium"] for row in seasonality_rows]),
+        "seasonality_fixed_period_strong_minus_weak_mean": _aggregate_mean([row["fixed_period_strong_minus_weak"] for row in seasonality_rows]),
+        "seasonality_fixed_period_min_adjacent_gap_mean": _aggregate_mean([row["fixed_period_min_adjacent_gap"] for row in seasonality_rows]),
+        "seasonality_dominant_period_error_max_mean": _aggregate_mean([row["dominant_period_error_max"] for row in seasonality_rows]),
+        "seasonality_level_drift_max_mean": _aggregate_mean([row["level_drift_max"] for row in seasonality_rows]),
+        "seasonality_trend_drift_max_mean": _aggregate_mean([row["trend_drift_max"] for row in seasonality_rows]),
+        "seasonality_residual_energy_ratio_max_mean": _aggregate_mean([row["fixed_period_residual_energy_ratio_max"] for row in seasonality_rows]),
         "local_path_default_definition": route_metadata["route_statement"],
         "strength_scalars": scalar_keys,
         "edit_gain_mean": {
@@ -1114,6 +1325,12 @@ def main() -> None:
             bucket: {
                 "n_samples": len(bucket_rows),
                 "spacing_metrics_primary": True,
+                "primary_monotonic_hit_rate": float(np.mean([float(row["primary_monotonic_hit"]) for row in bucket_rows])),
+                "seasonality_amplitude_monotonic_hit_rate": None if not [row for row in bucket_rows if row.get("seasonality_eval_applicable")] else float(np.mean([float(row["seasonality_amplitude_monotonic_hit"]) for row in bucket_rows if row.get("seasonality_eval_applicable")])),
+                "seasonality_fixed_period_min_adjacent_gap_mean": _aggregate_mean([row["fixed_period_min_adjacent_gap"] for row in bucket_rows if row.get("seasonality_eval_applicable")]),
+                "seasonality_dominant_period_error_max_mean": _aggregate_mean([row["dominant_period_error_max"] for row in bucket_rows if row.get("seasonality_eval_applicable")]),
+                "seasonality_level_drift_max_mean": _aggregate_mean([row["level_drift_max"] for row in bucket_rows if row.get("seasonality_eval_applicable")]),
+                "seasonality_trend_drift_max_mean": _aggregate_mean([row["trend_drift_max"] for row in bucket_rows if row.get("seasonality_eval_applicable")]),
                 "monotonic_hit_rate": float(np.mean([float(row["monotonic_hit"]) for row in bucket_rows])),
                 "raw_monotonic_hit_rate": float(np.mean([float(row["raw_monotonic_hit"]) for row in bucket_rows])),
                 "final_monotonic_hit_rate": float(np.mean([float(row["final_monotonic_hit"]) for row in bucket_rows])),

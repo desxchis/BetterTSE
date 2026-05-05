@@ -42,8 +42,30 @@ SELECTOR_CONTROL_META = {
         "control_attr_ids": [0],
     },
     "seasonality_injection": {
-        "control_attr": ["season_cycles"],
-        "control_attr_ids": [2],
+        "control_attr": ["seasonality_amplitude"],
+        "control_attr_ids": [],
+        "control_definition": {
+            "axis": "seasonality_amplitude",
+            "fixed": ["period", "phase", "waveform"],
+            "varied": ["amplitude"],
+            "forbidden": ["period", "cycle", "frequency"],
+        },
+    },
+    "step_change": {
+        "control_attr": [],
+        "control_attr_ids": [],
+    },
+    "multiplier": {
+        "control_attr": [],
+        "control_attr_ids": [],
+    },
+    "hard_zero": {
+        "control_attr": [],
+        "control_attr_ids": [],
+    },
+    "noise_injection": {
+        "control_attr": [],
+        "control_attr_ids": [],
     },
 }
 
@@ -124,6 +146,7 @@ def build_family_dataset(
         {
             "control_attr": [],
             "control_attr_ids": [],
+            "control_definition": None,
         },
     )
 
@@ -135,6 +158,7 @@ def build_family_dataset(
         "attr_n_ops": [4, 2, 4],
         "control_attr": selector_meta["control_attr"],
         "control_attr_ids": selector_meta["control_attr_ids"],
+        "control_definition": selector_meta.get("control_definition"),
         "strength_bins": ["weak", "medium", "strong"],
         "scalar_scheme": str(scalar_scheme),
         "selector": resolved_selector,

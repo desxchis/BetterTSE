@@ -11,12 +11,19 @@ matplotlib.use("Agg")
 import matplotlib.font_manager as fm
 import matplotlib.pyplot as plt
 import numpy as np
+from PIL import Image, ImageDraw, ImageFont
 
 _CJK_FONT = "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"
 if Path(_CJK_FONT).exists():
     fm.fontManager.addfont(_CJK_FONT)
     matplotlib.rcParams["font.family"] = "Noto Sans CJK JP"
 matplotlib.rcParams["axes.unicode_minus"] = False
+
+
+def _pil_font(size: int = 11) -> ImageFont.ImageFont:
+    if Path(_CJK_FONT).exists():
+        return ImageFont.truetype(_CJK_FONT, size=size)
+    return ImageFont.load_default()
 
 
 def build_visualization_dir(output_path: str, explicit_dir: Optional[str] = None) -> Path:
@@ -57,69 +64,105 @@ def save_pipeline_visualization(
     save_path: Path,
     bg_fidelity: Optional[Dict[str, Any]] = None,
 ) -> None:
-    fig, axes = plt.subplots(3, 1, figsize=(14, 11), sharex=True)
+    base = np.asarray(base_ts, dtype=np.float32).reshape(-1)
+    target = np.asarray(target_ts, dtype=np.float32).reshape(-1)
+    generated = np.asarray(generated_ts, dtype=np.float32).reshape(-1)
+    delta = generated - base
 
-    fig.suptitle(
-        " | ".join(
-            [
-                f"Sample {sample_id}",
-                f"Tool {tool_name}",
-                f"Pred [{llm_start},{llm_end}]",
-                f"GT [{gt_start},{gt_end}]",
-            ]
-        )
-        + "\n"
-        + f"Prompt: {prompt[:140]}{'...' if len(prompt) > 140 else ''}",
-        fontsize=9,
+    width, height = 1400, 1100
+    margin_x = 80
+    panel_h = 260
+    panel_gap = 40
+    image = Image.new("RGB", (width, height), "white")
+    draw = ImageDraw.Draw(image)
+    font = _pil_font(11)
+    small_font = _pil_font(10)
+
+    title = " | ".join(
+        [
+            f"Sample {sample_id}",
+            f"Tool {tool_name}",
+            f"Pred [{llm_start},{llm_end}]",
+            f"GT [{gt_start},{gt_end}]",
+        ]
+    )
+    draw.text((20, 10), title, fill="black", font=font)
+    prompt_text = f"Prompt: {prompt[:120]}{'...' if len(prompt) > 120 else ''}"
+    draw.text((20, 30), prompt_text, fill="black", font=small_font)
+
+    def _panel_bounds(panel_idx: int) -> tuple[int, int, int, int]:
+        top = 70 + panel_idx * (panel_h + panel_gap)
+        return margin_x, top, width - 30, top + panel_h
+
+    def _normalize(vals: np.ndarray, top: int, bottom: int) -> list[float]:
+        vmin = float(np.min(vals))
+        vmax = float(np.max(vals))
+        if np.isclose(vmin, vmax):
+            vmax = vmin + 1.0
+        usable = bottom - top
+        return [bottom - ((float(v) - vmin) / (vmax - vmin)) * usable for v in vals]
+
+    def _draw_series_panel(panel_idx: int, title_text: str, series: list[tuple[np.ndarray, str, str]], shade_gt: bool, shade_pred: bool) -> None:
+        left, top, right, bottom = _panel_bounds(panel_idx)
+        draw.rectangle((left, top, right, bottom), outline="black", width=1)
+        draw.text((left, top - 18), title_text, fill="black", font=small_font)
+        n = max(len(arr) for arr, _, _ in series)
+        x_positions = [left + (i / max(1, n - 1)) * (right - left) for i in range(n)]
+        if shade_gt:
+            xs = left + (gt_start / max(1, n - 1)) * (right - left)
+            xe = left + (gt_end / max(1, n - 1)) * (right - left)
+            draw.rectangle((xs, top, xe, bottom), fill=(255, 242, 170))
+        if shade_pred:
+            xs = left + (llm_start / max(1, n - 1)) * (right - left)
+            xe = left + (llm_end / max(1, n - 1)) * (right - left)
+            draw.rectangle((xs, top, xe, bottom), fill=(232, 220, 255))
+        all_vals = np.concatenate([arr.astype(np.float32) for arr, _, _ in series], axis=0)
+        ys_by_series = {}
+        vmin = float(np.min(all_vals))
+        vmax = float(np.max(all_vals))
+        if np.isclose(vmin, vmax):
+            vmax = vmin + 1.0
+        for arr, label, color in series:
+            ys = [bottom - ((float(v) - vmin) / (vmax - vmin)) * (bottom - top) for v in arr]
+            xs = x_positions[: len(arr)]
+            pts = list(zip(xs, ys))
+            if len(pts) > 1:
+                draw.line(pts, fill=color, width=2)
+            for px, py in pts[:: max(1, len(pts) // 24)]:
+                draw.ellipse((px - 2, py - 2, px + 2, py + 2), fill=color, outline=color)
+            ys_by_series[label] = color
+        for idx, (label, color) in enumerate(ys_by_series.items()):
+            draw.text((right - 180, top + 8 + idx * 16), label, fill=color, font=small_font)
+
+    _draw_series_panel(
+        0,
+        "Base vs Target",
+        [(base, "Base", "#888888"), (target, "Target", "#C62828")],
+        shade_gt=True,
+        shade_pred=False,
+    )
+    _draw_series_panel(
+        1,
+        "Target vs Generated",
+        [(target, "Target", "#C62828"), (generated, "Generated", "#1565C0")],
+        shade_gt=True,
+        shade_pred=True,
+    )
+    _draw_series_panel(
+        2,
+        (
+            f"Edit Delta | t-IoU={metrics.get('t_iou', 0.0):.3f} | "
+            f"Editability={metrics.get('editability_score', 0.0):.3f} | "
+            f"Preservability={metrics.get('preservability_score', 0.0):.3f}"
+            + (f" | BG max err={bg_fidelity.get('max_err', 0.0):.2e}" if bg_fidelity is not None else "")
+        ),
+        [(delta, "Delta", "#EF6C00")],
+        shade_gt=True,
+        shade_pred=True,
     )
 
-    x = np.arange(len(base_ts))
-
-    def shade(ax: plt.Axes, start: int, end: int, color: str, alpha: float, label: str) -> None:
-        ax.axvspan(start, end, color=color, alpha=alpha, label=label)
-
-    ax = axes[0]
-    shade(ax, gt_start, gt_end, "gold", 0.28, f"GT [{gt_start},{gt_end}]")
-    ax.plot(x, base_ts, color="0.55", lw=1.5, ls="--", label="Base")
-    ax.plot(x, target_ts, color="crimson", lw=1.6, label="Target")
-    ax.set_ylabel("Value")
-    ax.set_title("Base vs Target")
-    ax.grid(True, alpha=0.3)
-    ax.legend(fontsize=8, loc="upper right")
-
-    ax = axes[1]
-    shade(ax, gt_start, gt_end, "gold", 0.28, f"GT [{gt_start},{gt_end}]")
-    shade(ax, llm_start, llm_end, "mediumpurple", 0.12, f"Pred [{llm_start},{llm_end}]")
-    ax.plot(x, target_ts, color="crimson", lw=1.6, ls="--", label="Target")
-    ax.plot(x, generated_ts, color="steelblue", lw=1.6, label="Generated")
-    ax.set_ylabel("Value")
-    ax.set_title("Target vs Generated")
-    ax.grid(True, alpha=0.3)
-    ax.legend(fontsize=8, loc="upper right")
-
-    ax = axes[2]
-    delta = generated_ts - base_ts
-    colors = np.where(delta >= 0, "tomato", "steelblue")
-    ax.bar(x, delta, color=colors, width=1.0, alpha=0.75)
-    shade(ax, gt_start, gt_end, "orange", 0.16, f"GT [{gt_start},{gt_end}]")
-    shade(ax, llm_start, llm_end, "mediumpurple", 0.10, f"Pred [{llm_start},{llm_end}]")
-    ax.axhline(0, color="black", lw=0.8)
-    ax.set_xlabel("Timestep")
-    ax.set_ylabel("Delta")
-    title = (
-        f"Edit Delta | t-IoU={metrics.get('t_iou', 0.0):.3f} | "
-        f"Editability={metrics.get('editability_score', 0.0):.3f} | "
-        f"Preservability={metrics.get('preservability_score', 0.0):.3f}"
-    )
-    if bg_fidelity is not None:
-        title += f" | BG max err={bg_fidelity.get('max_err', 0.0):.2e}"
-    ax.set_title(title)
-    ax.grid(True, alpha=0.3)
-    ax.legend(fontsize=8, loc="upper right")
-
-    plt.tight_layout()
-    fig.savefig(save_path, dpi=130, bbox_inches="tight")
-    plt.close(fig)
+    save_path.parent.mkdir(parents=True, exist_ok=True)
+    image.save(save_path)
 
 
 def save_forecast_revision_visualization(
